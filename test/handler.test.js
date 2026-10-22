@@ -50,7 +50,7 @@ function parseSse(chunks) {
   return events;
 }
 
-async function replay(text, toolNames) {
+async function replayRequest(text, toolNames, stream) {
   const res = new FakeResponse();
   const agent = {
     async run(_request, handlers) {
@@ -75,11 +75,15 @@ async function replay(text, toolNames) {
         type: 'function',
         function: { name, description: `${name} tool`, parameters: { type: 'object', properties: {} } },
       })),
-      stream: true,
+      stream,
     },
     { agent, store, log: () => {}, config: { defaultModel: 'deepseek-chat', toolMode: 'auto' } },
   );
-  return parseSse(res.chunks);
+  return stream ? parseSse(res.chunks) : JSON.parse(res.chunks.join(''));
+}
+
+async function replay(text, toolNames) {
+  return replayRequest(text, toolNames, true);
 }
 
 for (const [turn, expected] of Object.entries({
@@ -122,4 +126,14 @@ test('HTTP stream strips a degenerate empty DSML loop without fake tool calls', 
 
   const finish = events.filter((event) => event.choices[0]?.finish_reason).at(-1);
   assert.equal(finish.choices[0].finish_reason, 'stop');
+});
+
+test('HTTP non-stream strips a degenerate empty DSML loop without fake tool calls', async () => {
+  const body = await replayRequest(emptyDsml, ['Bash', 'Agent'], false);
+  const message = body.choices[0].message;
+  assert.equal(body.choices[0].finish_reason, 'stop');
+  assert.match(message.content, /^Slide 8's column text runs into the dividers/);
+  assert.doesNotMatch(message.content, /DSML/);
+  assert.ok(message.content.length < 200);
+  assert.equal(message.tool_calls, undefined);
 });
