@@ -8,6 +8,9 @@
  *   deepseek status          show bridge/extension status
  *   deepseek chat "hello"    send a chat message
  *   deepseek "hello"         shorthand for chat
+ *   deepseek --login         copy the browser session (extension or manual)
+ *   deepseek --logout        delete the terminal session
+ *   deepseek session         show session metadata
  *   deepseek key             print the API key
  *   deepseek extension       print the absolute extension folder
  *   deepseek logs            print the log path and the last lines
@@ -17,6 +20,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, paths } from '../src/config.js';
+import { clearSession, saveSession, sessionSummary } from '../src/session.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BRIDGE = path.join(HERE, 'ds-bridge.js');
@@ -26,7 +30,7 @@ const LOG = path.join(paths.CONFIG_DIR, 'bridge.log');
 
 const args = process.argv.slice(2);
 const first = args[0];
-const known = new Set(['start', 'serve', 'stop', 'status', 'chat', 'key', 'extension', 'logs', 'help']);
+const known = new Set(['start', 'serve', 'stop', 'status', 'chat', 'key', 'extension', 'logs', 'login', 'logout', 'session', 'help']);
 
 let command = 'start';
 let rest = args;
@@ -37,6 +41,8 @@ if (first && known.has(first)) {
   command = 'chat';
 }
 if (first === '--help' || first === '-h') command = 'help';
+if (first === '--login' || first === '-l') { command = 'login'; rest = args.slice(1); }
+if (first === '--logout') { command = 'logout'; rest = args.slice(1); }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const baseUrl = (port) => `http://127.0.0.1:${port}`;
@@ -78,6 +84,77 @@ async function waitForBridge(ms = 15000, child = null) {
   return null;
 }
 
+async function waitForExtension(cfg, ms = 15000) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    const health = await getHealth(cfg.port);
+    if (health?.extension) return true;
+    await sleep(300);
+  }
+  return false;
+}
+
+function readHidden(question) {
+  return new Promise((resolve) => {
+    const stdin = process.stdin;
+    const stdout = process.stdout;
+    stdout.write(question);
+    if (!stdin.isTTY) {
+      let data = '';
+      const onData = (chunk) => {
+        data += chunk.toString('utf8');
+        if (data.includes('\n')) {
+          stdin.removeListener('data', onData);
+          resolve(data.split(/\r?\n/)[0].trim());
+        }
+      };
+      stdin.on('data', onData);
+      stdin.resume();
+      return;
+    }
+
+    const wasRaw = stdin.isRaw;
+    stdin.setRawMode(true);
+    stdin.resume();
+    let value = '';
+    const cleanup = () => {
+      stdin.removeListener('data', onData);
+      stdin.setRawMode(Boolean(wasRaw));
+      stdin.pause();
+      stdout.write('\n');
+    };
+    const onData = (chunk) => {
+      const text = chunk.toString('utf8').replace(/\x1b\[[0-9;?]*[A-Za-z~]/g, '');
+      for (const char of text) {
+        if (char === '\r' || char === '\n') {
+          cleanup();
+          resolve(value.trim());
+          return;
+        }
+        if (char === '\u0003') {
+          cleanup();
+          process.exit(130);
+        }
+        if (char === '\u007f' || char === '\b') {
+          value = value.slice(0, -1);
+          continue;
+        }
+        value += char;
+      }
+    };
+    stdin.on('data', onData);
+  });
+}
+
+function printSessionSummary(summary, { prefix = '  ', showMode = true } = {}) {
+  if (showMode) console.log(`${prefix}Mode        direct${summary.available ? ' (Chrome not required)' : ' — run deepseek --login'}`);
+  if (!summary.available) return;
+  if (summary.user) console.log(`${prefix}Account     ${summary.user}`);
+  console.log(`${prefix}Cookies     ${summary.cookies}`);
+  if (summary.expiresAt) console.log(`${prefix}Expires     ${summary.expiresAt}`);
+  console.log(`${prefix}Session     ${summary.file}`);
+}
+
 function tailLog(lines = 30) {
   try {
     const text = fs.readFileSync(LOG, 'utf8').trim().split('\n');
@@ -117,23 +194,35 @@ async function ensureRunning(extraArgs = []) {
 }
 
 function printStatus(cfg, health, started = false) {
-  const ext = health?.extension ? 'connected' : 'NOT connected';
+  const session = sessionSummary();
+  const ext = health?.extension ? 'connected' : 'not connected';
   console.log(`
   deepseek-bridge ${started ? 'started in the background' : 'is running'}
 
   Base URL    http://127.0.0.1:${cfg.port}/v1
   API key     ${cfg.key}
-  Extension   ${ext}
+  Mode        ${session.available ? 'direct' : health?.extension ? 'extension' : 'not ready'}
+  Extension   ${ext}${session.available ? ' (optional in direct mode)' : ''}
   Extension folder
               ${EXTENSION}
   Config      ${paths.CONFIG_FILE}
   Log         ${LOG}
 `);
 
-  if (!health?.extension) {
-    console.log('Next: load that extension folder in Chrome (chrome://extensions → Developer mode → Load unpacked),');
-    console.log('open the popup and enter the port/key above, then sign in at https://chat.deepseek.com.');
+  if (session.available) {
+    printSessionSummary(session, { showMode: false });
+    return;
   }
+
+  if (health?.extension) {
+    console.log('Extension mode is ready. Run `deepseek --login` to copy the session into the terminal');
+    console.log('and stop paying the Chrome RAM cost on every request.');
+    return;
+  }
+
+  console.log('Next: load that extension folder in Chrome (chrome://extensions → Developer mode → Load unpacked),');
+  console.log('open the popup and enter the port/key above, sign in at https://chat.deepseek.com,');
+  console.log('then run `deepseek --login` to copy the session into the terminal.');
 }
 
 function runForeground(script, scriptArgs = []) {
@@ -233,6 +322,144 @@ function printLogs() {
   }
 }
 
+async function manualLogin() {
+  console.log('');
+  console.log('  Manual login (no extension needed)');
+  console.log('');
+  console.log('  1. Open https://chat.deepseek.com in Chrome and sign in.');
+  console.log('  2. Open DevTools (F12) → Console, paste this and press Enter:');
+  console.log('');
+  console.log("       copy((()=>{const v=localStorage.getItem('userToken');try{const p=JSON.parse(v);return typeof p==='string'?p:p.value}catch{return v}})())");
+  console.log('');
+  console.log('  3. Paste the copied token below. It will not be echoed.');
+  console.log('');
+  const token = (await readHidden('  userToken: '))
+    .replace(/^["']|["']$/g, '')
+    .replace(/^Bearer\s+/i, '')
+    .trim();
+  if (!token || token.length < 20) {
+    console.error('That does not look like a DeepSeek user token.');
+    process.exit(1);
+  }
+  saveSession({ token, cookies: [] });
+  const { cfg } = await ensureRunning();
+  let verified = false;
+  let warning = null;
+  try {
+    const res = await fetch(`${baseUrl(cfg.port)}/v1/bridge/session/verify`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${cfg.key}` },
+      signal: AbortSignal.timeout(30000),
+    });
+    const data = await res.json().catch(() => ({}));
+    verified = res.ok;
+    if (!res.ok) warning = data?.error?.message || `HTTP ${res.status}`;
+  } catch (err) {
+    warning = err?.message || String(err);
+  }
+  console.log('');
+  console.log('  DeepSeek session saved');
+  console.log('');
+  printSessionSummary(sessionSummary());
+  if (!verified && warning) {
+    console.log('');
+    console.log(`  Warning: ${warning}`);
+  }
+  console.log('');
+  if (verified) {
+    console.log('  Chrome is not needed for requests. Re-run this command when the session expires.');
+  } else {
+    console.log('  The token was saved, but DeepSeek did not confirm it.');
+    console.log('  If requests fail, run `deepseek --login` again.');
+  }
+}
+
+async function login() {
+  if (rest.includes('--manual')) return manualLogin();
+  const { cfg } = await ensureRunning();
+  const health = await getHealth(cfg.port);
+  if (!health?.extension) {
+    console.log('Waiting for the DeepSeek Bridge extension in Chrome...');
+    if (!(await waitForExtension(cfg, 35000))) {
+      console.error('Chrome is not connected to the bridge.');
+      console.error('Open Chrome, load the extension folder below, sign in at https://chat.deepseek.com, then retry:');
+      console.error(`  ${EXTENSION}`);
+      console.error('  deepseek --login');
+      console.error('  Or use the no-extension manual flow: deepseek --login --manual');
+      process.exit(1);
+    }
+  }
+
+  console.log('Copying chat.deepseek.com cookies and user token from Chrome...');
+  let res;
+  try {
+    res = await fetch(`${baseUrl(cfg.port)}/v1/bridge/session/export`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${cfg.key}` },
+      signal: AbortSignal.timeout(50000),
+    });
+  } catch (err) {
+    console.error(`Login failed: ${err?.message || err}`);
+    process.exit(1);
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    console.error(`Login failed: ${data?.error?.message || `HTTP ${res.status}`}`);
+    process.exit(1);
+  }
+
+  console.log('');
+  console.log('  DeepSeek session copied to the terminal');
+  console.log('');
+  printSessionSummary(data);
+  if (data.verified === false) {
+    if (data.warning) {
+      console.log('');
+      console.log(`  Warning: ${data.warning}`);
+    }
+    console.log('');
+    console.log('  The session was saved, but DeepSeek did not confirm it yet.');
+    console.log('  If requests fail, run `deepseek --login` again.');
+  } else {
+    console.log('');
+    console.log('  Chrome and the extension are no longer needed for requests.');
+    console.log('  If DeepSeek asks you to sign in again, run: deepseek --login');
+  }
+}
+
+async function logout() {
+  const cfg = loadConfig();
+  const health = await getHealth(cfg.port);
+  let cleared = false;
+  if (health?.ok) {
+    try {
+      const res = await fetch(`${baseUrl(cfg.port)}/v1/bridge/session`, {
+        method: 'DELETE',
+        headers: { authorization: `Bearer ${cfg.key}` },
+        signal: AbortSignal.timeout(3000),
+      });
+      cleared = res.ok;
+    } catch {
+      cleared = false;
+    }
+  }
+  if (!cleared) clearSession();
+  console.log('DeepSeek terminal session removed.');
+}
+
+function printSession() {
+  const summary = sessionSummary();
+  console.log('');
+  if (!summary.available) {
+    console.log('  Mode        extension / not configured');
+    console.log('  Run         deepseek --login');
+    console.log('');
+    return;
+  }
+  printSessionSummary(summary);
+  console.log('');
+}
+
 function printHelp() {
   console.log(`deepseek-bridge — OpenAI-compatible API for chat.deepseek.com
 
@@ -244,6 +471,10 @@ Usage:
   deepseek status          Show the bridge and extension status
   deepseek chat "hello"    Send a chat message (starts the bridge if needed)
   deepseek "hello"         Shorthand for deepseek chat "hello"
+  deepseek --login         Copy the chat.deepseek.com session from Chrome once
+  deepseek --login --manual  Paste userToken from DevTools (no extension needed)
+  deepseek --logout        Delete the terminal session (fall back to extension)
+  deepseek session         Show the stored terminal session
   deepseek key             Print the API key
   deepseek extension       Print the absolute extension folder
   deepseek logs            Print the log path and the last lines
@@ -283,6 +514,12 @@ if (command === 'help') {
     printStatus(cfg, health, false);
     if (status) console.log(`Queue: ${JSON.stringify(status)}`);
   }
+} else if (command === 'login') {
+  await login();
+} else if (command === 'logout') {
+  await logout();
+} else if (command === 'session') {
+  printSession();
 } else if (command === 'chat') {
   await ensureRunning();
   runForeground(CHAT, rest);

@@ -1,44 +1,47 @@
 # deepseek-bridge
 
-An OpenAI-compatible local API for **chat.deepseek.com**. A small Node server
-listens on loopback, a Chrome extension reuses your signed-in web session, and
-any OpenAI client can talk to the model without a DeepSeek API key.
+An OpenAI-compatible local API for **chat.deepseek.com**.
 
-```
-terminal / agent / SDK
-        │  OpenAI HTTP + SSE
-        ▼
-  deepseek-bridge  (127.0.0.1:8787)
-        │  WebSocket
-        ▼
-  extension service worker  ──►  content script on chat.deepseek.com
-                                      │  same-origin fetch + cookies
-                                      ▼
-                              POST /api/v0/chat/completion
+`deepseek --login` copies your logged-in web session out of Chrome **once**.
+After that the bridge talks to DeepSeek directly from Node. Chrome and the
+extension can be closed or removed, and there is no browser RAM cost for
+normal requests.
+
+```text
+┌──────────────────┐   OpenAI HTTP + SSE   ┌──────────────────────┐
+│ terminal / agent │ ────────────────────► │  deepseek-bridge     │
+│ SDK / ZCode      │ ◄──────────────────── │  127.0.0.1:8787      │
+└──────────────────┘                       └──────────┬───────────┘
+                                                      │ HTTPS + cookies
+                                                      │ + PoW
+                                                      ▼
+                                           chat.deepseek.com/api/v0
 ```
 
-The extension runs on the real origin, so the site's cookies, `userToken`, and
-proof-of-work checks work normally. It creates a chat session, solves the PoW
-challenge, and translates the site's patch-based SSE stream into OpenAI chunks.
-No DeepSeek API key and no scraping proxy are involved.
+The extension mode is still available as a fallback. It does the same HTTP and
+PoW work inside a `chat.deepseek.com` tab, which is useful when you do not want
+to store a terminal session or when a new web build temporarily breaks direct
+mode.
 
 ## Features
 
-- OpenAI-compatible `POST /v1/chat/completions` with streaming SSE.
-- `deepseek` command that starts the local server, shows status, and stops it.
+- **Direct mode:** no Chrome process, extension, or open tab needed at runtime.
+- **One-command login:** `deepseek --login` copies only `chat.deepseek.com`
+  cookies and the site's `userToken` into a `0600` session file.
+- **Extension fallback:** the original same-origin extension path remains.
+- OpenAI-compatible `POST /v1/chat/completions`, streaming and non-streaming.
 - Image, file, and PDF input through OpenAI content parts.
 - Emulated tool calling, including parallel calls, in native OpenAI format.
 - Thinking on/off through `deepseek-chat` and `deepseek-reasoner`.
-- Session reuse for multi-turn conversations.
-- No npm runtime dependencies.
+- Multi-turn session reuse and no npm runtime dependencies.
 
 ## Requirements
 
 | Component | Requirement |
 | --- | --- |
 | Node.js | 18 or newer (`node --version`) |
-| Browser | Chrome or Chromium 116+ |
 | Account | A DeepSeek account signed in at <https://chat.deepseek.com> |
+| Browser | Chrome or Chromium 116+ **for `deepseek --login` only** (or for extension mode) |
 | OS | Linux, macOS, or Windows 10/11 |
 
 The bridge is pure JavaScript. It has no native modules, compilers, Python, or
@@ -124,42 +127,137 @@ node bin/ds-chat.js "hello"   # one chat message
 The old POSIX `bin/ds` wrapper is still present and forwards to the Node
 launcher, but `deepseek` is the cross-platform command.
 
-## First run
+## One-time login (recommended)
 
-```bash
-deepseek
-```
+The terminal cannot read Chrome's live cookie jar directly. The extension is
+therefore used **once** as a narrow exporter: it asks `chat.deepseek.com` for
+its own cookies and `localStorage.userToken`, then hands both to the local
+bridge over the authenticated loopback connection. It does not copy other
+sites' cookies.
 
-On first use this creates:
-
-- `~/.config/deepseek-bridge/config.json` (API key, port, defaults)
-- `~/.config/deepseek-bridge/state.json` (cached chat sessions)
-- `~/.config/deepseek-bridge/bridge.log` (background server log)
-
-On Windows the base directory is
-`%USERPROFILE%\.config\deepseek-bridge`. Set `DS_BRIDGE_HOME` to use a different
-directory on any OS.
-
-The command prints the base URL, API key, extension folder, and log path. Then:
-
-1. Open `chrome://extensions` in Chrome/Chromium.
-2. Enable **Developer mode**.
-3. Click **Load unpacked** and select the printed extension folder
-   (the `extension/` directory in this repository).
-4. Open the extension popup. Set the port (`8787` by default) and paste the API
-   key printed by `deepseek`.
-5. Sign in at <https://chat.deepseek.com> in a normal tab and keep that tab
-   available. The content script needs the site origin.
-6. Check the connection:
+1. Start the bridge:
 
    ```bash
-   deepseek status
+   deepseek
    ```
 
-   `Extension: connected` means the bridge is ready.
+2. Load the extension once (skip if it is already loaded):
 
-The bridge listens on `127.0.0.1` only. If port 8787 is busy, it picks the next
-free port and saves it in the config; update the extension popup to the new port.
+   - Open `chrome://extensions`.
+   - Enable **Developer mode**.
+   - Click **Load unpacked** and select the `extension/` folder printed by
+     `deepseek`.
+   - Open the extension popup, enter the port (default `8787`) and the API key
+     printed by `deepseek`.
+
+3. Sign in at <https://chat.deepseek.com> in a normal Chrome tab.
+
+4. Run:
+
+   ```bash
+   deepseek --login
+   ```
+
+   Expected output:
+
+   ```text
+   DeepSeek session copied to the terminal
+
+     Mode        direct (Chrome not required)
+     Cookies     1
+     Session     ~/.config/deepseek-bridge/session.json
+
+     Chrome and the extension are no longer needed for requests.
+   ```
+
+5. Test it with Chrome closed:
+
+   ```bash
+   deepseek chat "Reply with exactly: DIRECT_OK"
+   ```
+
+`deepseek --login` prints no token or cookie values. The session file is
+created with mode `0600` on Linux/macOS and lives under your user profile on
+Windows.
+
+### No extension at all (manual token)
+
+If you do not want to install the extension even once, use the manual flow:
+
+1. Open <https://chat.deepseek.com> in Chrome and sign in.
+2. Open DevTools (`F12`) → **Console**, paste this, and press Enter:
+
+   ```js
+   copy((()=>{const v=localStorage.getItem('userToken');try{const p=JSON.parse(v);return typeof p==='string'?p:p.value}catch{return v}})())
+   ```
+
+3. Run:
+
+   ```bash
+   deepseek --login --manual
+   ```
+
+4. Paste the token at the hidden prompt.
+
+This stores only `userToken`; the bridge acquires and updates any DeepSeek
+cookies it needs. It is fully extension-independent, but the copy step is
+manual. The extension flow above is automatic and can reuse the browser login
+you already have.
+
+### Session lifetime
+
+The web session can expire, be revoked, or require a new login. When that
+happens, requests fail with `not_signed_in` and a message telling you to run:
+
+```bash
+deepseek --login
+```
+
+To delete the terminal session and go back to extension mode:
+
+```bash
+deepseek --logout
+```
+
+To inspect the stored session metadata without printing credentials:
+
+```bash
+deepseek session
+```
+
+### What gets copied
+
+- Cookies returned by `chrome.cookies.getAll({ url: "https://chat.deepseek.com/" })`.
+- The `userToken` value from `chat.deepseek.com` localStorage.
+- The browser's user agent string, so the copied cookies have the same client
+  identity they were issued to.
+
+Nothing else. Cookies for Google, GitHub, banking, or any other site are never
+read or stored.
+
+## Extension mode (fallback)
+
+If no `session.json` exists, the bridge uses the original extension path:
+
+```text
+terminal / agent / SDK
+        │ OpenAI HTTP + SSE
+        ▼
+  deepseek-bridge (127.0.0.1:8787)
+        │ WebSocket (authenticated)
+        ▼
+  extension service worker ──► content script on chat.deepseek.com
+                                   │ same-origin fetch + cookies
+                                   ▼
+                           POST /api/v0/chat/completion
+```
+
+In this mode Chrome must stay open with a signed-in `chat.deepseek.com` tab.
+The extension creates the chat session, solves the PoW challenge, and
+translates the site's patch-based SSE stream into OpenAI chunks.
+
+`deepseek --logout` switches back to this mode if the extension is connected.
+Direct mode takes precedence whenever `session.json` exists.
 
 ## CLI reference
 
@@ -169,7 +267,11 @@ free port and saves it in the config; update the extension popup to the new port
 | `deepseek start` | Same as `deepseek` |
 | `deepseek serve` | Run the bridge in the foreground; logs stream to the terminal |
 | `deepseek stop` | Stop the background bridge using its PID file |
-| `deepseek status` | Show base URL, extension state, config, and log path |
+| `deepseek status` | Show base URL, mode, session/extension state, config, and log path |
+| `deepseek --login` | Copy the Chrome web session into the terminal (once per login) |
+| `deepseek --login --manual` | Paste `userToken` from DevTools; no extension needed |
+| `deepseek --logout` | Delete the terminal session and fall back to extension mode |
+| `deepseek session` | Show stored session metadata, never the token |
 | `deepseek chat "hello"` | Send one chat message (starts the bridge if needed) |
 | `deepseek "hello"` | Shorthand for `deepseek chat "hello"` |
 | `deepseek --repl` | Interactive chat |
@@ -185,6 +287,10 @@ deepseek start --port 9000
 deepseek serve --port 9000
 ```
 
+The bridge listens on `127.0.0.1` only. If port 8787 is busy, it picks the next
+free port and saves it in the config; update the extension popup if you use
+extension mode.
+
 ## API
 
 Base URL: `http://127.0.0.1:8787/v1`
@@ -196,10 +302,14 @@ printed at startup and stored in the config file.
 | --- | --- | --- |
 | `POST` | `/v1/chat/completions` | Chat, streaming or non-streaming |
 | `GET` | `/v1/models` | Model list |
-| `GET` | `/v1/bridge/status` | Extension connection and queue |
+| `GET` | `/v1/bridge/status` | Mode, direct session, extension state, queue |
+| `GET` | `/v1/bridge/session` | Stored session metadata (no credentials) |
+| `POST` | `/v1/bridge/session/export` | Ask Chrome for a fresh session (used by `--login`) |
+| `POST` | `/v1/bridge/session/verify` | Verify the stored session with a small authenticated call |
+| `DELETE` | `/v1/bridge/session` | Delete the stored terminal session |
 | `GET` | `/v1/conversations` | Cached session map |
 | `DELETE` | `/v1/conversations` | Forget cached sessions |
-| `GET` | `/health` | Liveness and extension flag (no auth) |
+| `GET` | `/health` | Liveness, mode, and extension flag (no auth) |
 | `GET` | `/` | HTML status page |
 
 ### curl
@@ -285,8 +395,8 @@ request body override the model defaults. `/v1/models` reports
 
 Send ordinary OpenAI content parts. The bridge fetches remote URLs (http/https,
 20 s timeout), decodes data URLs, caps at **10 MB per file / 20 MB total / 12
-files**, uploads each file through the content script, and passes the returned
-ids as `ref_file_ids`:
+files**, uploads each file through the same upload endpoint, and passes the
+returned ids as `ref_file_ids`:
 
 ```json
 {
@@ -358,18 +468,20 @@ ZCode → **Model settings** → **Add provider**, then:
 | Capabilities | leave structured output / native search / mid-conversation system messages off |
 
 Tool calls work through the emulation above (parallel calls supported), and
-multi-turn agent loops reuse the same DeepSeek session. Keep a signed-in
-`chat.deepseek.com` tab open.
+multi-turn agent loops reuse the same DeepSeek session. In direct mode you no
+longer need a signed-in tab; in extension mode keep one open.
 
 ## How it works
 
-- **Extension, not scraping.** The content script runs on the real origin, so
-  the site's cookies, `userToken`, and WAF expectations apply unchanged.
+- **Direct session.** `deepseek --login` asks the extension for the
+  `chat.deepseek.com` cookies and `localStorage.userToken`, then stores them in
+  `session.json` (`0600`). The Node client sends those values as an ordinary
+  `Cookie` header and `Authorization: Bearer <userToken>`.
 - **Proof of work.** `create_pow_challenge` returns a hash challenge; the site
   hashes `salt_expireAt_nonce` with a Keccak-f[1600] sponge that differs from
   stock SHA3-256 (round constants 1..23, and a rho step that swaps lane halves
-  for offsets ≥ 32). `extension/pow.js` is a byte-accurate port and solves in
-  ~1.2 s at the usual difficulty. A solved challenge is single-use, so a fresh
+  for offsets ≥ 32). `src/pow.js` (and the extension copy) is a byte-accurate port and solves
+  in ~1.2 s at the usual difficulty. A solved challenge is single-use, so a fresh
   challenge is requested per completion.
 - **Stream translation.** The site sends patch events (`{v}`, `{p,o,v}` with
   `SET`/`APPEND`/`BATCH`, index `-1` = last element). The accumulator rebuilds
@@ -383,27 +495,48 @@ multi-turn agent loops reuse the same DeepSeek session. Keep a signed-in
   transcripts and sends only the new tail with `parent_message_id`. This keeps
   context and tool results consistent without resending the whole conversation
   to the website on every turn.
+- **Fallback.** If `session.json` is absent, the bridge pushes the same job to
+  the extension over its authenticated loopback WebSocket. The extension
+  executes it in the real site origin.
+
+## Security
+
+- The session file is `~/.config/deepseek-bridge/session.json` and is written
+  with mode `0600` on Linux/macOS (under your user profile on Windows). The
+  config directory is `0700` where POSIX modes apply.
+- Only `deepseek.com` cookies are copied. The extension never enumerates or
+  exports cookies for other sites.
+- The bridge prints only a truncated API key in the HTML status page and never
+  prints the DeepSeek token or cookie values.
+- The bridge listens on `127.0.0.1` only. The API key protects the loopback
+  HTTP API; anyone with both local access and that key can use your session.
+- `deepseek --logout` deletes the session file. Deleting it does not log out
+  your browser; use DeepSeek's own logout for that.
+- Copied web sessions are personal credentials. Do not commit `session.json`,
+  paste it in issues, or share it. The repository's `.gitignore` excludes it.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 | --- | --- |
-| `extension disconnected` / `extension_offline` | Open the extension popup, check the port and key, and keep a `chat.deepseek.com` tab open. Run `deepseek status`. |
-| `not_signed_in` | Log in at chat.deepseek.com and reload the tab. |
-| `INVALID_POW_RESPONSE` | Solved challenges are single-use; restart the bridge (`deepseek stop && deepseek`) so a fresh challenge is fetched. |
+| `deepseek --login` says Chrome is not connected | Open Chrome, load/reload the extension from the folder printed by `deepseek`, and keep the popup port/key correct. Sign in at chat.deepseek.com. Then retry; Chrome may need up to 30 s to wake the extension worker. |
+| `not_signed_in` / session expired | Run `deepseek --login` again. Direct mode does not fall back automatically, so an expired stored session is reported clearly. |
+| `deepseek --login` says Chrome returned an incomplete session | The content script was stale. Reload the extension in `chrome://extensions`, refresh the `chat.deepseek.com` tab, then retry. |
+| `extension disconnected` / `extension_offline` | You are in extension mode (no `session.json`) or you requested `--login` with Chrome closed. Start Chrome and keep a signed-in `chat.deepseek.com` tab open. |
+| `INVALID_POW_RESPONSE` | Solved challenges are single-use. Retry; if it persists, restart with `deepseek stop && deepseek` so a fresh challenge is requested. |
 | Empty completion, `HTTP 200` | The site returned a JSON error body instead of SSE. The bridge surfaces it as an error; retry usually clears it. |
 | `401 invalid_api_key` | Use the key from `deepseek key`. |
 | `deepseek: command not found` | Add npm's global bin directory to `PATH` (`npm prefix -g`), or use `node bin/deepseek.js`. |
 | `EACCES` during `npm install -g .` | Use `npm install -g . --prefix "$HOME/.local"` and add `~/.local/bin` to `PATH`; do not use `sudo`. |
 | PowerShell blocks `npm.ps1` | Use `npm.cmd install -g .`, or run in `cmd.exe`. |
-| Port already in use | The bridge picks the next free port and saves it. Update the extension popup to the new port, or start with `deepseek start --port 9000`. |
+| Port already in use | The bridge picks the next free port and saves it. Update the extension popup if used, or start with `deepseek start --port 9000`. |
 | Extension stops receiving jobs | MV3 workers sleep. The extension keeps a 30 s alarm and reconnects automatically; reload the extension or the tab as a last resort. |
 | `extension_outdated` or old behavior after an update | Chrome does not hot-reload unpacked extensions. Open `chrome://extensions`, press **Reload** on DeepSeek Bridge, then refresh the `chat.deepseek.com` tab once. |
 | Chrome shows `WebSocket connection ... ERR_CONNECTION_REFUSED` | The bridge was stopped while the extension was retrying. Current extension builds probe `GET /health` before opening the WebSocket, so a stopped bridge no longer creates this error. Reload the extension, press **Clear all** on the Errors page to remove old entries, then start the bridge with `deepseek`. |
 | Tool call appears as text / no tool executes | Restart the bridge after updating `src/`. It holds DSML, malformed DSML, and plain `json` fences until they can be parsed. If the old malformed text is already in the transcript, continue in a new turn or start a fresh session. |
-| Hundreds of empty `<｜｜DSML｜｜>` tags | This is a degenerate model response after a tool-result turn. The bridge now strips the markup, removes the loop, and returns the surrounding prose without fake tool calls. Retry the turn or start a fresh session; the regression fixture is `test/fixtures/empty-dsml.txt`. |
+| Hundreds of empty `<｜｜DSML｜｜>` tags | This is a degenerate model response after a tool-result turn. The bridge strips the markup, removes the loop, and returns the surrounding prose without fake tool calls. Retry the turn or start a fresh session; the regression fixture is `test/fixtures/empty-dsml.txt`. |
 | Windows firewall prompt | Allow Node.js on **private networks** only. The bridge binds to `127.0.0.1`, not the LAN. |
-| WSL | Run the bridge inside WSL and use `http://127.0.0.1:8787/v1` from Windows; WSL 2 forwards loopback. If it does not, use the WSL IP or `netsh interface portproxy`. The Chrome extension must run in a browser that can reach the WSL port. |
+| WSL | Run the bridge inside WSL and use `http://127.0.0.1:8787/v1` from Windows; WSL 2 forwards loopback. If it does not, use the WSL IP or `netsh interface portproxy`. For `--login`, the Chrome extension must be able to reach the bridge port. |
 
 ### Logs
 
@@ -412,7 +545,9 @@ deepseek logs
 ```
 
 The background log is `bridge.log` next to the config. A foreground run
-(`deepseek serve`) prints the same lines directly.
+(`deepseek serve`) prints the same lines directly. Chat log lines include
+`mode=direct` or `mode=extension`, so you can confirm which path served a
+request.
 
 ## Development
 
@@ -420,9 +555,10 @@ The background log is `bridge.log` next to the config. A foreground run
 npm test
 ```
 
-The suite covers the PoW vector, prompt/tool parsing, the streaming guard, and a
-full HTTP replay of every accepted tool-call format, including the failing
-ZCode rollout payloads and the empty-DSML loop.
+The suite covers the PoW vector, session storage and cookie filtering,
+prompt/tool parsing, the streaming guard, and a full HTTP replay of every
+accepted tool-call format, including the failing ZCode rollout payloads and the
+empty-DSML loop.
 
 End-to-end harness (throwaway Chrome profile; it injects a token into
 localStorage and never touches your real profile):
@@ -433,8 +569,14 @@ node scripts/live-test.mjs --token '<userToken>' --prompt 'Reply with exactly: O
 node scripts/live-test.mjs --token '<userToken>' --model deepseek-reasoner --debug
 ```
 
-The harness scripts are POSIX development helpers. The bridge itself and the
-`deepseek` command are cross-platform.
+Live direct-mode smoke test with the stored session:
+
+```bash
+curl -s http://127.0.0.1:8787/v1/chat/completions \
+  -H "authorization: Bearer $(deepseek key)" \
+  -H 'content-type: application/json' \
+  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"Reply with exactly DIRECT_OK"}]}'
+```
 
 After editing `extension/content.js` or `sw.js`, reload the unpacked extension
 and the DeepSeek tab. Once a build that understands the reload message is
@@ -452,8 +594,10 @@ because the previous worker does not know that message.
 
 - Personal-use bridge: it rides your own web session. Bulk or commercial use
   will hit account rate limits and the site's terms.
-- One account, one browser profile. Concurrent requests are serialised by the
-  site's per-session stream; separate conversations can still overlap.
+- One account, one session. Direct-mode requests share the copied web session
+  with that browser login; running both paths with the same account is fine,
+  but they are not isolated accounts.
+- The session file is a credential. Treat it like a browser cookie export.
 - Image/file attachments are supported through the web upload endpoint, with a
   bridge cap of 10 MB per file and 20 MB total per request. The site itself
   allows larger files.
@@ -462,8 +606,8 @@ because the previous worker does not know that message.
   returned in one turn.
 - `reasoning_effort` is accepted but the web gateway ignores numeric effort;
   only thinking on/off is real. `low`/`max` add a small prompt hint.
-- The bridge is not a security boundary. Anyone who can reach the port and has
-  the key can use your DeepSeek session. Keep it on loopback.
+- The bridge is not a security boundary. Keep it on loopback and protect the
+  API key and `session.json`.
 
 ## License
 

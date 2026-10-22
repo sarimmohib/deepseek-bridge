@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { createServer } from '../src/server.js';
 import { loadConfig, saveConfig, Store, paths } from '../src/config.js';
+import { sessionSummary } from '../src/session.js';
 import { MODELS } from '../src/openai.js';
 
 const args = process.argv.slice(2);
@@ -25,8 +26,8 @@ if (flag('--help') || flag('-h')) {
 Usage:
   ds-bridge [--port 8787] [--reset-key] [--verbose]
 
-The bridge listens on 127.0.0.1 only. Load extension/ in Chrome, paste the
-port and API key into the extension popup, then call:
+The bridge listens on 127.0.0.1 only. Run 'deepseek --login' once to copy the
+browser session into the terminal; extension/ is the optional fallback. Then call:
 
   curl http://127.0.0.1:8787/v1/chat/completions \\
     -H "authorization: Bearer $DS_BRIDGE_KEY" \\
@@ -46,6 +47,7 @@ if (value('--port')) config = saveConfig({ port: Number(value('--port')) });
 
 const store = new Store();
 store.startAutosave();
+const session = sessionSummary();
 const { server, close } = createServer({ config, store, log });
 
 const listen = (port, attempts = 10) =>
@@ -88,15 +90,15 @@ console.log(`
   API key    ${config.key}
   Models     ${MODELS.map((m) => m.id).join(', ')}
 
+  Mode       ${session.available ? 'direct (terminal session)' : 'extension / not configured'}
+  Session    ${session.available ? session.file : 'run `deepseek --login` to copy it from Chrome'}
+
   Next steps
-   1. Chrome → chrome://extensions → Developer mode → Load unpacked
-      → select ${extensionDir}
-   2. Open the extension popup, set port ${config.port} and paste the API key.
-   3. Sign in at https://chat.deepseek.com in a normal tab.
-   4. Test:  deepseek chat "hello" --model deepseek-reasoner
+${session.available ? '   1. Test:  deepseek chat "hello"' : '   1. Extension: chrome://extensions → Developer mode → Load unpacked\n      → select ' + extensionDir + '\n   2. Open the extension popup, set port ' + config.port + ' and paste the API key.\n   3. Sign in at https://chat.deepseek.com in a normal tab.\n   4. Run:  deepseek --login'}
 
   Config     ${paths.CONFIG_FILE}
   State      ${paths.STATE_FILE}
+  Log        ${paths.CONFIG_DIR}/bridge.log
 `);
 
 log(`listening on ${base} (loopback only)`);

@@ -453,6 +453,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true, url: location.href, signedIn: !!getToken() });
     return false;
   }
+  if (msg?.type === 'ds.session') {
+    sendResponse({ token: getToken(), url: location.href });
+    return false;
+  }
   if (msg?.type === 'ds.job') {
     runJob(msg.job);
     sendResponse({ ok: true });

@@ -9,6 +9,7 @@ const CONFIG_DIR =
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 const STATE_FILE = path.join(CONFIG_DIR, 'state.json');
 const PID_FILE = path.join(CONFIG_DIR, 'bridge.pid');
+const SESSION_FILE = path.join(CONFIG_DIR, 'session.json');
 
 function readJSON(file, fallback) {
   try {
@@ -95,4 +96,4 @@ export class Store {
   }
 }
 
-export const paths = { CONFIG_DIR, CONFIG_FILE, STATE_FILE, PID_FILE };
+export const paths = { CONFIG_DIR, CONFIG_FILE, STATE_FILE, PID_FILE, SESSION_FILE };

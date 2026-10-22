@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { digestHex, solveChallenge } from '../extension/pow.js';
+import { digestHex, solveChallenge } from '../src/pow.js';
+import { digestHex as extensionDigestHex } from '../extension/pow.js';
 
 // Real challenge/answer pair captured from chat.deepseek.com.
 const CHALLENGE = {
@@ -26,6 +27,10 @@ test('hash vector for a fixed input is stable', () => {
     digestHex('deadbeefcafe0123456789_1792685705706_0'),
     'be5dcc1d3633314f98e46b0fb9a1fab36c2765f978dd8b2b3887df9b81fcf256',
   );
+});
+
+test('the extension copy hashes identically to the Node copy', () => {
+  assert.equal(extensionDigestHex('deadbeefcafe0123456789_1792685705706_0'), digestHex('deadbeefcafe0123456789_1792685705706_0'));
 });
 
 test('solveChallenge finds the captured answer', () => {

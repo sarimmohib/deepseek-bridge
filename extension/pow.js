@@ -1,5 +1,9 @@
 /*
- * DeepSeekHashV1 proof-of-work.
+ * DeepSeekHashV1 proof-of-work (the extension copy).
+ *
+ * Keep this file in sync with src/pow.js. The extension cannot import outside
+ * its own directory, so the browser and the terminal client each carry a copy
+ * of the solver.
  *
  * The site hashes `salt + "_" + expire_at + "_" + nonce` with a Keccak-f[1600]
  * sponge (rate 136, SHA3 padding, 32-byte output) and looks for a digest equal

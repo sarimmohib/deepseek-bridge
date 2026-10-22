@@ -34,7 +34,7 @@ async function refresh() {
   }
   if (!status.config?.hasKey) {
     setDot('wait');
-    statusBox.textContent = 'No API key yet.\nRun: node bin/ds-bridge.js\nThen paste the key above and press Save & connect.';
+    statusBox.textContent = 'No API key yet.\nRun: deepseek\nThen paste the key above and press Save & connect.';
     return;
   }
   if (status.connected) {
@@ -44,7 +44,7 @@ async function refresh() {
     setDot('bad');
     statusBox.textContent = `not connected to ws://${status.config.host}:${status.config.port}/agent\n${
       status.lastError ? `last error: ${status.lastError}\n` : ''
-    }Is ds-bridge running?`;
+    }Is deepseek running?`;
   }
 
   // Is the DeepSeek tab signed in?

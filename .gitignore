@@ -6,3 +6,4 @@ npm-debug.log*
 Thumbs.db
 .env
 .env.*
+session.json

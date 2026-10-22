@@ -13,6 +13,7 @@ export class Agent {
     this.log = log;
     this.connections = new Set();
     this.jobs = new Map();
+    this.sessionRequests = new Map();
     this.lastHello = null;
   }
 
@@ -59,6 +60,16 @@ export class Agent {
         return;
       }
       if (msg.type === 'pong') return;
+      if (msg.type === 'session.exported' || msg.type === 'session.export_error') {
+        const request = this.sessionRequests.get(msg.id);
+        if (!request) return;
+        if (msg.type === 'session.exported') {
+          request.finish(null, msg);
+        } else {
+          request.finish(new BridgeError(msg.message || 'Could not export the browser session.', msg.code || 'session_export_failed'));
+        }
+        return;
+      }
       const job = msg.id ? this.jobs.get(msg.id) : null;
       if (!job) return;
       job.onEvent(msg);
@@ -71,11 +82,62 @@ export class Agent {
       for (const job of this.jobs.values()) {
         if (job.conn === conn) job.fail(new Error('extension disconnected'));
       }
+      for (const request of this.sessionRequests.values()) {
+        if (request.conn === conn) request.finish(new BridgeError('Extension disconnected during session export.', 'extension_offline'));
+      }
     });
   }
 
   broadcast(obj) {
     for (const conn of this.connections) conn.sendJSON(obj);
+  }
+
+  /**
+   * Ask the extension to copy the logged-in chat.deepseek.com cookies and
+   * localStorage user token. This is the only operation that needs Chrome.
+   */
+  exportSession({ timeout = 30000, signal } = {}) {
+    if (!this.connected) {
+      return Promise.reject(
+        new BridgeError(
+          'The DeepSeek Bridge extension is not connected. Open Chrome, sign in at https://chat.deepseek.com, then retry `deepseek --login`.',
+          'extension_offline',
+        ),
+      );
+    }
+
+    const id = `session_${crypto.randomBytes(8).toString('hex')}`;
+    const conn = [...this.connections].at(-1);
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        settled = true;
+        clearTimeout(timer);
+        this.sessionRequests.delete(id);
+        signal?.removeEventListener?.('abort', onAbort);
+      };
+      const finish = (err, data) => {
+        if (settled) return;
+        cleanup();
+        if (err) reject(err);
+        else resolve(data);
+      };
+      const onAbort = () => finish(new BridgeError('Session export cancelled.', 'cancelled', 499));
+      const timer = setTimeout(
+        () => finish(new BridgeError('Chrome did not answer the session export request.', 'extension_timeout')),
+        timeout,
+      );
+      timer.unref?.();
+
+      this.sessionRequests.set(id, { id, conn, finish });
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      signal?.addEventListener?.('abort', onAbort, { once: true });
+      conn.sendJSON({ type: 'session.export', id });
+    });
   }
 
   /**

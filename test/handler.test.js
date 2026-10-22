@@ -137,3 +137,39 @@ test('HTTP non-stream strips a degenerate empty DSML loop without fake tool call
   assert.ok(message.content.length < 200);
   assert.equal(message.tool_calls, undefined);
 });
+
+test('uses the direct runner when a terminal session exists', async () => {
+  const res = new FakeResponse();
+  let used = '';
+  const agent = {
+    async run() {
+      used = 'extension';
+      throw new Error('extension path should not be used');
+    },
+  };
+  const direct = {
+    reloadSession: () => ({ token: 'test-token' }),
+    async run(_request, handlers) {
+      used = 'direct';
+      handlers.onReady({ sessionId: 'sess_direct', messageId: 'msg_direct' });
+      handlers.onDelta({ kind: 'content', text: 'DIRECT_OK' });
+      return {
+        usage: { completion: 1 },
+        finish: 'stop',
+        sessionId: 'sess_direct',
+        messageId: 'msg_direct',
+      };
+    },
+  };
+  const store = { getConversation: () => null, setConversation: () => {} };
+  await handleChatCompletions(
+    {},
+    res,
+    { model: 'deepseek-chat', messages: [{ role: 'user', content: 'hello' }], stream: false },
+    { agent, direct, store, log: () => {}, config: { defaultModel: 'deepseek-chat', toolMode: 'auto' } },
+  );
+  const body = JSON.parse(res.chunks.join(''));
+  assert.equal(used, 'direct');
+  assert.equal(body.choices[0].message.content, 'DIRECT_OK');
+  assert.equal(body.choices[0].finish_reason, 'stop');
+});

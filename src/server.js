@@ -2,7 +2,9 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import { attachWebSocket, WsConnection } from './ws.js';
 import { Agent, BridgeError } from './agent.js';
+import { DirectClient } from './direct.js';
 import { handleChatCompletions, sendError, MODELS } from './openai.js';
+import { clearSession, loadSession, saveSession, sessionSummary } from './session.js';
 import { paths } from './config.js';
 
 const MAX_BODY = 40 * 1024 * 1024;
@@ -43,6 +45,7 @@ function readBody(req) {
 
 export function createServer({ config, store, log = () => {} }) {
   const agent = new Agent({ log });
+  const direct = new DirectClient({ log });
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`);
@@ -65,16 +68,27 @@ export function createServer({ config, store, log = () => {} }) {
 
     try {
       if (url.pathname === '/health') {
-        json(res, 200, { ok: true, extension: agent.connected });
+        const directSession = loadSession();
+        json(res, 200, {
+          ok: true,
+          extension: agent.connected,
+          direct: Boolean(directSession),
+          mode: directSession ? 'direct' : agent.connected ? 'extension' : 'offline',
+        });
         return;
       }
 
       if (url.pathname === '/' && req.method === 'GET') {
         const status = agent.status;
+        const session = sessionSummary();
+        const mode = session.available ? 'direct' : status.connected ? 'extension' : 'offline';
         const html = `<!doctype html><meta charset="utf-8"><title>deepseek-bridge</title>
 <style>body{font:14px/1.5 ui-monospace,monospace;max-width:720px;margin:40px auto;padding:0 20px;background:#0b0f14;color:#c9d1d9}
 b{color:#7ee787}.bad{color:#ff7b72}.k{color:#79c0ff}code{background:#161b22;padding:2px 6px;border-radius:4px}</style>
 <h2>deepseek-bridge</h2>
+<p>Mode: <b class="${mode === 'offline' ? 'bad' : ''}">${mode}</b></p>
+<p>Direct session: <b class="${session.available ? '' : 'bad'}">${session.available ? (session.user || 'signed in') : 'not configured'}</b>
+${session.available ? ` (${session.cookies} cookies)` : ' — run <code>deepseek --login</code>'}</p>
 <p>Extension: <b class="${status.connected ? '' : 'bad'}">${status.connected ? 'connected' : 'not connected'}</b>
  (${status.connections} socket(s)${status.lastHello ? `, version ${status.lastHello.version || '?'}` : ''})</p>
 <p>Active jobs: ${status.activeJobs}</p>
@@ -88,7 +102,7 @@ b{color:#7ee787}.bad{color:#ff7b72}.k{color:#79c0ff}code{background:#161b22;padd
       }
 
       if (!authorized) {
-        sendError(res, 401, 'Invalid or missing API key. Use the key printed by `ds-bridge` in the Authorization header.', 'invalid_api_key');
+        sendError(res, 401, 'Invalid or missing API key. Run `deepseek key` and send it in the Authorization header.', 'invalid_api_key');
         return;
       }
 
@@ -98,9 +112,17 @@ b{color:#7ee787}.bad{color:#ff7b72}.k{color:#79c0ff}code{background:#161b22;padd
       }
 
       if (url.pathname === '/v1/bridge/status' && req.method === 'GET') {
+        const session = sessionSummary();
         json(res, 200, {
           ok: true,
           ...agent.status,
+          mode: session.available ? 'direct' : agent.connected ? 'extension' : 'offline',
+          direct: session,
+          extension: {
+            connected: agent.connected,
+            connections: agent.connections.size,
+            lastHello: agent.lastHello,
+          },
           config: { port: config.port, host: config.host, model: config.defaultModel },
           capabilities: {
             vision: true,
@@ -110,6 +132,58 @@ b{color:#7ee787}.bad{color:#ff7b72}.k{color:#79c0ff}code{background:#161b22;padd
             contextWindow: 890880,
           },
         });
+        return;
+      }
+
+      if (url.pathname === '/v1/bridge/session' && req.method === 'GET') {
+        json(res, 200, { ok: true, ...sessionSummary() });
+        return;
+      }
+
+      if (url.pathname === '/v1/bridge/session/export' && req.method === 'POST') {
+        const data = await agent.exportSession({ timeout: 45000 });
+        if (!data?.token || !Array.isArray(data.cookies)) {
+          throw new BridgeError('Chrome returned an incomplete session.', 'session_export_failed');
+        }
+        saveSession({
+          token: data.token,
+          cookies: data.cookies,
+          userAgent: data.userAgent,
+          user: data.user || agent.lastHello?.user || null,
+        });
+        direct.reloadSession();
+        let verified = false;
+        let warning = null;
+        try {
+          await direct.verify();
+          verified = true;
+        } catch (err) {
+          warning = err?.message || String(err);
+          log(`session verification failed: ${warning}`);
+        }
+        json(res, 200, {
+          ok: true,
+          verified,
+          warning,
+          ...sessionSummary(),
+        });
+        return;
+      }
+
+      if (url.pathname === '/v1/bridge/session/verify' && req.method === 'POST') {
+        direct.reloadSession();
+        if (!direct.available) {
+          throw new BridgeError('No terminal DeepSeek session. Run `deepseek --login` first.', 'not_signed_in', 401);
+        }
+        const user = await direct.verify();
+        json(res, 200, { ok: true, user, ...sessionSummary() });
+        return;
+      }
+
+      if (url.pathname === '/v1/bridge/session' && (req.method === 'DELETE' || req.method === 'POST')) {
+        const cleared = clearSession();
+        direct.reloadSession();
+        json(res, 200, { ok: true, cleared, ...sessionSummary() });
         return;
       }
 
@@ -150,7 +224,7 @@ b{color:#7ee787}.bad{color:#ff7b72}.k{color:#79c0ff}code{background:#161b22;padd
           sendError(res, 400, 'Body is not valid JSON', 'invalid_json');
           return;
         }
-        await handleChatCompletions(req, res, body, { agent, store, config, log });
+        await handleChatCompletions(req, res, body, { agent, direct, store, config, log });
         return;
       }
 

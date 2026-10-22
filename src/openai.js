@@ -330,6 +330,10 @@ export async function handleChatCompletions(req, res, body, ctx) {
     sse(res, chunk({ id, created, model, delta: { role: 'assistant', content: '' } }));
   }
 
+  const directSession = ctx.direct?.reloadSession?.();
+  const runner = directSession ? ctx.direct : agent;
+  const mode = directSession ? 'direct' : 'extension';
+
   const started = Date.now();
   let content = '';
   let reasoning = '';
@@ -359,7 +363,7 @@ export async function handleChatCompletions(req, res, body, ctx) {
   };
 
   try {
-    const result = await agent.run(
+    const result = await runner.run(
       {
         prompt: plan.prompt,
         continuation: plan.continuation,
@@ -497,11 +501,11 @@ export async function handleChatCompletions(req, res, body, ctx) {
       log(`sse debug: ${result.debugLines.length} events`);
       for (const line of result.debugLines) log(`sse ${line}`);
     } else {
-      log('sse debug: none (extension did not return debugLines)');
+      log(`sse debug: none (${mode} runner did not return debugLines)`);
     }
 
     log(
-      `chat ok model=${model} thinking=${opts.thinking} effort=${opts.effort ?? '-'} search=${opts.search} ` +
+      `chat ok mode=${mode} model=${model} thinking=${opts.thinking} effort=${opts.effort ?? '-'} search=${opts.search} ` +
         `cont=${plan.continuation} att=${attachments.length} session=${sessionId || '?'} msg=${messageId || '?'} ` +
         `out=${content.length}c/${reasoning.length}c ${Date.now() - started}ms`,
     );

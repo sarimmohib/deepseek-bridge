@@ -131,6 +131,7 @@ async function connect() {
       }
       if (msg.type === 'job') handleJob(msg);
       if (msg.type === 'job.cancel') cancelJob(msg.id);
+      if (msg.type === 'session.export') exportSession(msg.id);
       if (msg.type === 'reload-extension') reloadExtension();
     };
 
@@ -228,6 +229,34 @@ function cancelJob(id) {
   chrome.tabs.query({ url: 'https://chat.deepseek.com/*' }).then((tabs) => {
     for (const t of tabs) chrome.tabs.sendMessage(t.id, { type: 'ds.cancel', id }).catch(() => {});
   });
+}
+
+/* ------------------------------------------------------- session export --- */
+
+async function exportSession(id) {
+  try {
+    const tabId = await ensureTab();
+    const session = await chrome.tabs.sendMessage(tabId, { type: 'ds.session' });
+    if (!session?.token) {
+      throw new Error('Not signed in on chat.deepseek.com. Log in in that tab, then retry `deepseek --login`.');
+    }
+    const cookies = await chrome.cookies.getAll({ url: 'https://chat.deepseek.com/' });
+    send({
+      type: 'session.exported',
+      id,
+      token: session.token,
+      cookies,
+      userAgent: navigator.userAgent,
+      url: session.url || null,
+    });
+  } catch (err) {
+    send({
+      type: 'session.export_error',
+      id,
+      code: 'session_export_failed',
+      message: String(err?.message || err),
+    });
+  }
 }
 
 /* ---------------------------------------------------------- dev reload --- */
