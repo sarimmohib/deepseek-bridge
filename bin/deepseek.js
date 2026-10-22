@@ -174,13 +174,23 @@ async function stopBridge() {
     /* no pid file */
   }
 
-  if (!pid) {
-    if (health?.ok) {
-      console.error('The bridge is running, but there is no PID file. Stop it with Ctrl+C in its terminal.');
-      process.exit(1);
+  if (!health?.ok) {
+    // The server is already down. Remove a stale PID instead of risking a
+    // signal to an unrelated process that reused the PID.
+    if (pid) {
+      try {
+        fs.unlinkSync(paths.PID_FILE);
+      } catch {
+        /* already gone */
+      }
     }
     console.log('deepseek-bridge is not running.');
     return;
+  }
+
+  if (!pid) {
+    console.error('The bridge is running, but there is no PID file. Stop it with Ctrl+C in its terminal.');
+    process.exit(1);
   }
 
   try {
