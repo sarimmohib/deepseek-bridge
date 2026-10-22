@@ -1,0 +1,42 @@
+{
+  "name": "deepseek-bridge",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenAI-compatible local API for chat.deepseek.com, driven by a Chrome extension that reuses your logged-in web session.",
+  "license": "Unlicense",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sarimmohib/deepseek-bridge.git"
+  },
+  "homepage": "https://github.com/sarimmohib/deepseek-bridge",
+  "bugs": {
+    "url": "https://github.com/sarimmohib/deepseek-bridge/issues"
+  },
+  "keywords": [
+    "deepseek",
+    "openai",
+    "openai-api",
+    "chrome-extension",
+    "bridge",
+    "llm",
+    "zcode"
+  ],
+  "bin": {
+    "deepseek": "./bin/deepseek.js",
+    "deepseek-bridge": "./bin/ds-bridge.js",
+    "deepseek-chat": "./bin/ds-chat.js",
+    "ds": "./bin/deepseek.js",
+    "ds-bridge": "./bin/ds-bridge.js",
+    "ds-chat": "./bin/ds-chat.js"
+  },
+  "scripts": {
+    "start": "node bin/ds-bridge.js",
+    "serve": "node bin/deepseek.js serve",
+    "chat": "node bin/ds-chat.js",
+    "test": "node test/pow.test.js && node test/prompt.test.js && node test/guard.test.js && node test/handler.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

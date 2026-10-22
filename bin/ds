@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# POSIX convenience wrapper. The cross-platform command is `bin/deepseek.js`
+# (installed as `deepseek` by `npm install -g .`).
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec node "$DIR/bin/deepseek.js" "$@"

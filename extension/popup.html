@@ -1,0 +1,104 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>DeepSeek Bridge</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0b0f14;
+        --panel: #121820;
+        --line: #233042;
+        --text: #c9d1d9;
+        --dim: #7d8590;
+        --ok: #3fb950;
+        --bad: #f85149;
+        --accent: #58a6ff;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        width: 340px;
+        background: var(--bg);
+        color: var(--text);
+        font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 12px 14px;
+        border-bottom: 1px solid var(--line);
+      }
+      header h1 { font-size: 13px; margin: 0; font-weight: 600; letter-spacing: 0.2px; }
+      #dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); box-shadow: 0 0 8px currentColor; }
+      #dot.ok { background: var(--ok); }
+      #dot.wait { background: #d29922; }
+      main { padding: 12px 14px 14px; display: grid; gap: 10px; }
+      label { display: grid; gap: 4px; font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.4px; }
+      input {
+        font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        color: var(--text);
+        padding: 7px 8px;
+        outline: none;
+      }
+      input:focus { border-color: var(--accent); }
+      .row { display: grid; grid-template-columns: 90px 1fr; gap: 8px; }
+      .buttons { display: flex; gap: 6px; }
+      button {
+        flex: 1;
+        font: inherit;
+        font-size: 12px;
+        padding: 7px 8px;
+        border-radius: 6px;
+        border: 1px solid var(--line);
+        background: var(--panel);
+        color: var(--text);
+        cursor: pointer;
+      }
+      button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+      button:hover { filter: brightness(1.12); }
+      .status {
+        font: 11px/1.5 ui-monospace, monospace;
+        color: var(--dim);
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 8px;
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: 120px;
+        overflow: auto;
+      }
+      .hint { font-size: 11px; color: var(--dim); }
+      .hint b { color: var(--text); font-weight: 600; }
+      a { color: var(--accent); }
+    </style>
+  </head>
+  <body>
+    <header>
+      <span id="dot"></span>
+      <h1>DeepSeek Bridge</h1>
+    </header>
+    <main>
+      <div class="row">
+        <label>Host<input id="host" value="127.0.0.1" spellcheck="false" /></label>
+        <label>Port<input id="port" value="8787" inputmode="numeric" spellcheck="false" /></label>
+      </div>
+      <label>API key<input id="key" placeholder="sk-ds-…" spellcheck="false" /></label>
+      <div class="buttons">
+        <button id="save" class="primary">Save &amp; connect</button>
+        <button id="open">Open DeepSeek</button>
+      </div>
+      <div class="status" id="status">checking…</div>
+      <div class="hint">
+        Run <b>ds-bridge</b> in a terminal, paste the key it prints, then use
+        <b>http://127.0.0.1:PORT/v1</b> from any OpenAI client.
+      </div>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
