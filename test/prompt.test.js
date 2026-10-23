@@ -61,10 +61,10 @@ test('tool results are labelled for the model', () => {
 test('conversation key is stable across turns but not across conversations', () => {
   const a = msgs({ role: 'system', content: 's' }, { role: 'user', content: 'first' });
   const b = msgs({ role: 'system', content: 's' }, { role: 'user', content: 'first' }, { role: 'assistant', content: 'x' }, { role: 'user', content: 'second' });
-  assert.equal(conversationKey(a, 'deepseek-chat'), conversationKey(b, 'deepseek-chat'));
+  assert.equal(conversationKey(a, 'deepseek-reasoner'), conversationKey(b, 'deepseek-reasoner'));
 
   const c = msgs({ role: 'system', content: 's' }, { role: 'user', content: 'other' });
-  assert.notEqual(conversationKey(a, 'deepseek-chat'), conversationKey(c, 'deepseek-chat'));
+  assert.notEqual(conversationKey(a, 'deepseek-reasoner'), conversationKey(c, 'deepseek-reasoner'));
 });
 
 test('transcript digest detects edited history', () => {

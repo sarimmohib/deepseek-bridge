@@ -15,26 +15,10 @@ import {
 
 export const MODELS = [
   {
-    id: 'deepseek-chat',
-    object: 'model',
-    owned_by: 'deepseek',
-    description: 'DeepSeek V4.1 Flash (web Instant), thinking off, text/image/file input',
-    context_window: 890880,
-    max_output_tokens: 131072,
-  },
-  {
     id: 'deepseek-reasoner',
     object: 'model',
     owned_by: 'deepseek',
-    description: 'DeepSeek V4.1 Flash (web Instant), DeepThink on, reasoning_content populated',
-    context_window: 890880,
-    max_output_tokens: 131072,
-  },
-  {
-    id: 'deepseek-expert',
-    object: 'model',
-    owned_by: 'deepseek',
-    description: 'DeepSeek expert model type (may be disabled on your account)',
+    description: 'DeepSeek V4.1 Flash (web Reasoner), reasoning enabled, reasoning_content populated',
     context_window: 890880,
     max_output_tokens: 131072,
   },
@@ -42,7 +26,7 @@ export const MODELS = [
     id: 'deepseek-search',
     object: 'model',
     owned_by: 'deepseek',
-    description: 'DeepSeek V4.1 Flash web chat with web search enabled',
+    description: 'DeepSeek V4.1 Flash (web Search), reasoning and web search enabled',
     context_window: 890880,
     max_output_tokens: 131072,
   },
@@ -72,42 +56,34 @@ function effortHint(effort) {
   return '';
 }
 
-export function resolveModel(name = 'deepseek-chat', body = {}) {
+export function normalizeModelId(name) {
   const n = String(name || '').toLowerCase();
-  let modelType = 'default';
-  let thinking = false;
-  let search = false;
+  return n.includes('search') ? 'deepseek-search' : 'deepseek-reasoner';
+}
+
+export function resolveModel(name = 'deepseek-reasoner', body = {}) {
+  const model = normalizeModelId(name);
+  const modelType = 'default';
+  // Both advertised models always reason. The search model always searches.
+  // Body flags cannot turn either capability off, so a legacy client cannot
+  // silently fall back to an instant chat mode.
+  const thinking = true;
+  const search = model === 'deepseek-search';
   let effort = null;
   let effortExplicit = false;
 
-  if (n.includes('expert') || n.includes('v4') || n.includes('pro')) {
-    modelType = 'expert';
-    thinking = true;
-  } else if (n.includes('reason') || n.includes('think') || n.includes('r1')) {
-    thinking = true;
-  } else if (n.includes('search')) {
-    search = true;
-  }
-
-  if (typeof body.thinking_enabled === 'boolean') thinking = body.thinking_enabled;
-  if (typeof body.thinking === 'boolean') thinking = body.thinking;
-  if (typeof body.search_enabled === 'boolean') search = body.search_enabled;
-
-  if (body.thinking && typeof body.thinking === 'object') {
-    const type = String(body.thinking.type || '').toLowerCase();
-    if (['disabled', 'none', 'off'].includes(type)) thinking = false;
-    else if (type) thinking = true;
-    if (body.thinking.effort != null) {
-      effort = normalizeEffort(body.thinking.effort);
-      effortExplicit = true;
-    }
+  if (body.thinking && typeof body.thinking === 'object' && body.thinking.effort != null) {
+    effort = normalizeEffort(body.thinking.effort);
+    effortExplicit = true;
   }
   if (body.reasoning_effort != null) {
     effort = normalizeEffort(body.reasoning_effort);
     effortExplicit = true;
   }
-  if (effort === 0) thinking = false;
-  else if (effort != null) thinking = true;
+  if (effort === 0) {
+    effort = null;
+    effortExplicit = false;
+  }
 
   return { modelType, thinking, search, effort, effortExplicit };
 }
@@ -254,7 +230,8 @@ export async function handleChatCompletions(req, res, body, ctx) {
     return sendError(res, 400, 'messages must be a non-empty array', 'invalid_request');
   }
 
-  const model = body.model || ctx.config.defaultModel;
+  const requestedModel = body.model || ctx.config.defaultModel;
+  const model = normalizeModelId(requestedModel);
   const messages = normalizeMessages(body.messages);
   const { system, rest } = splitMessages(messages);
   const opts = resolveModel(model, body);
@@ -269,6 +246,18 @@ export async function handleChatCompletions(req, res, body, ctx) {
   const key = conversationKey(messages, model);
   const prev = store.getConversation(key);
   const digest = transcriptDigest(rest);
+
+  const fullPlan = () => {
+    const head = [system.map((m) => m.content).join('\n\n'), preamble, hint].filter(Boolean).join('\n\n');
+    const transcript = flattenTurns(rest);
+    return {
+      continuation: false,
+      sessionId: null,
+      parentMessageId: null,
+      prompt: head ? `${head}\n\n${transcript}` : transcript,
+      baseTurns: 0,
+    };
+  };
 
   let plan;
   let sourceMessages;
@@ -291,21 +280,15 @@ export async function handleChatCompletions(req, res, body, ctx) {
   }
   if (!plan) {
     sourceMessages = rest;
-    const head = [system.map((m) => m.content).join('\n\n'), preamble, hint].filter(Boolean).join('\n\n');
-    const transcript = flattenTurns(rest);
-    plan = {
-      continuation: false,
-      sessionId: null,
-      parentMessageId: null,
-      prompt: head ? `${head}\n\n${transcript}` : transcript,
-      baseTurns: 0,
-    };
+    plan = fullPlan();
   }
 
   // Images and files travel separately from the text prompt: the content
   // script uploads the bytes and passes the resulting ids as ref_file_ids.
   const rawAttachments = collectAttachments(sourceMessages);
-  const attachments = rawAttachments.length ? await resolveAttachments(rawAttachments, { log }) : [];
+  // `let` so the invalid-parent fallback below can add attachments from the
+  // earlier turns that the continuation tail never covered.
+  let attachments = rawAttachments.length ? await resolveAttachments(rawAttachments, { log }) : [];
   if (!plan.prompt.trim() && attachments.length) plan.prompt = 'Please analyze the attached file(s).';
 
   const stream = body.stream === true;
@@ -318,6 +301,7 @@ export async function handleChatCompletions(req, res, body, ctx) {
     if (!res.writableEnded) controller.abort();
   });
 
+  let keepalive = null;
   if (stream) {
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
@@ -328,6 +312,21 @@ export async function handleChatCompletions(req, res, body, ctx) {
     });
     res.write(': connected\n\n');
     sse(res, chunk({ id, created, model, delta: { role: 'assistant', content: '' } }));
+
+    // DeepSeek can pause for a while between a tool call and the next token.
+    // Keep intermediaries from treating the silent SSE connection as dead.
+    keepalive = setInterval(() => {
+      if (!res.writableEnded) {
+        try {
+          res.write(': keepalive\n\n');
+        } catch {
+          /* client disconnected */
+        }
+      }
+    }, 15_000);
+    keepalive.unref?.();
+    res.on?.('finish', () => clearInterval(keepalive));
+    res.on?.('close', () => clearInterval(keepalive));
   }
 
   const directSession = ctx.direct?.reloadSession?.();
@@ -363,31 +362,72 @@ export async function handleChatCompletions(req, res, body, ctx) {
   };
 
   try {
-    const result = await runner.run(
-      {
-        prompt: plan.prompt,
-        continuation: plan.continuation,
-        sessionId: plan.sessionId,
-        parentMessageId: plan.parentMessageId,
-        modelType: opts.modelType,
-        thinking: opts.thinking,
-        search: opts.search,
-        attachments: attachments.map(({ name, mime, dataBase64 }) => ({ name, mime, dataBase64 })),
-        debug: body.debug === true,
-        requestId: id,
-      },
-      {
-        onReady: (msg) => {
-          if (msg.sessionId) sessionId = msg.sessionId;
-          if (msg.messageId) messageId = msg.messageId;
+    let activePlan = plan;
+    const runPlan = (currentPlan) =>
+      runner.run(
+        {
+          prompt: currentPlan.prompt,
+          continuation: currentPlan.continuation,
+          sessionId: currentPlan.sessionId,
+          parentMessageId: currentPlan.parentMessageId,
+          modelType: opts.modelType,
+          thinking: opts.thinking,
+          search: opts.search,
+          attachments: attachments.map(({ name, mime, dataBase64 }) => ({ name, mime, dataBase64 })),
+          debug: body.debug === true,
+          requestId: id,
         },
-        onDelta: (msg) => {
-          if (msg.kind === 'reasoning') emitReasoning(msg.text);
-          else emitContent(msg.text);
+        {
+          onReady: (msg) => {
+            if (msg.sessionId) sessionId = msg.sessionId;
+            if (msg.messageId) messageId = msg.messageId;
+          },
+          onDelta: (msg) => {
+            if (msg.kind === 'reasoning') emitReasoning(msg.text);
+            else emitContent(msg.text);
+          },
         },
-      },
-      { signal: controller.signal },
-    );
+        { signal: controller.signal },
+      );
+
+    let result;
+    try {
+      result = await runPlan(activePlan);
+    } catch (err) {
+      // A failed request can leave a dangling user message in the saved
+      // DeepSeek session. The next continuation then fails with
+      // "invalid message id"; recover by starting a fresh session with the
+      // full transcript. Only safe before any answer text was streamed.
+      const invalidParent =
+        err?.code === 'invalid_parent' ||
+        /invalid message id|message not found|invalid parent|not a leaf/i.test(String(err?.message || ''));
+      if (activePlan.continuation && invalidParent && !content && !reasoning) {
+        log('saved DeepSeek parent was rejected; retrying from a fresh session');
+        store.deleteConversation?.(key);
+        // The fresh prompt replays the whole transcript, but `attachments` was
+        // collected from the continuation tail only. Resolve what earlier turns
+        // contributed, skipping bytes the tail already covered.
+        const headAttachments = collectAttachments(rest.slice(0, rest.length - sourceMessages.length));
+        if (headAttachments.length) {
+          const attKey = (a) => `${a.dataBase64.length}:${a.dataBase64.slice(0, 128)}`;
+          const known = new Set(attachments.map(attKey));
+          for (const att of await resolveAttachments(headAttachments, { log })) {
+            if (!known.has(attKey(att))) {
+              known.add(attKey(att));
+              attachments.push(att);
+            }
+          }
+        }
+        activePlan = fullPlan();
+        plan = activePlan;
+        sessionId = null;
+        messageId = null;
+        result = await runPlan(activePlan);
+      } else {
+        throw err;
+      }
+    }
+    plan = activePlan;
 
     usage = result.usage;
     finish = result.finish || 'stop';

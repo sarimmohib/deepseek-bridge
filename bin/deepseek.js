@@ -23,7 +23,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, paths, saveConfig } from '../src/config.js';
-import { clearSession, saveSession, sessionSummary } from '../src/session.js';
+import { clearSession, loadSession, saveSession, sessionSummary } from '../src/session.js';
 import {
   ROOT,
   VERSION,
@@ -115,41 +115,91 @@ async function waitForExtension(cfg, ms = 15000) {
   return false;
 }
 
+function cleanToken(value) {
+  return String(value || '')
+    .replace(/\r/g, '')
+    .split('\n')[0]
+    .trim()
+    .replace(/^["']|["']$/g, '')
+    .replace(/^Bearer\s+/i, '')
+    .trim();
+}
+
+function readAllStdin(timeoutMs = 30_000) {
+  return new Promise((resolve) => {
+    const stdin = process.stdin;
+    let data = '';
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      stdin.removeListener('data', onData);
+      stdin.removeListener('end', finish);
+      stdin.removeListener('error', finish);
+      stdin.pause();
+      resolve(data);
+    };
+    const onData = (chunk) => {
+      data += chunk.toString('utf8');
+      if (/[\r\n]/.test(data)) finish();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    timer.unref?.();
+    stdin.on('data', onData);
+    stdin.on('end', finish);
+    stdin.on('error', finish);
+    stdin.resume();
+  });
+}
+
 function readHidden(question) {
   return new Promise((resolve) => {
     const stdin = process.stdin;
     const stdout = process.stdout;
     stdout.write(question);
     if (!stdin.isTTY) {
-      let data = '';
-      const onData = (chunk) => {
-        data += chunk.toString('utf8');
-        if (data.includes('\n')) {
-          stdin.removeListener('data', onData);
-          resolve(data.split(/\r?\n/)[0].trim());
-        }
-      };
-      stdin.on('data', onData);
-      stdin.resume();
+      readAllStdin().then((data) => resolve(cleanToken(data)));
       return;
     }
 
     const wasRaw = stdin.isRaw;
-    stdin.setRawMode(true);
+    let raw = false;
+    try {
+      stdin.setRawMode(true);
+      raw = true;
+    } catch {
+      // Some Windows terminals do not support raw mode. Canonical input still
+      // works; it just echoes the token while it is being pasted.
+    }
     stdin.resume();
     let value = '';
+    let done = false;
     const cleanup = () => {
+      if (done) return;
+      done = true;
       stdin.removeListener('data', onData);
-      stdin.setRawMode(Boolean(wasRaw));
+      stdin.removeListener('end', finish);
+      if (raw) {
+        try {
+          stdin.setRawMode(Boolean(wasRaw));
+        } catch {
+          /* ignore */
+        }
+      }
       stdin.pause();
       stdout.write('\n');
+    };
+    const finish = () => {
+      const token = value.trim();
+      cleanup();
+      resolve(token);
     };
     const onData = (chunk) => {
       const text = chunk.toString('utf8').replace(/\x1b\[[0-9;?]*[A-Za-z~]/g, '');
       for (const char of text) {
         if (char === '\r' || char === '\n') {
-          cleanup();
-          resolve(value.trim());
+          finish();
           return;
         }
         if (char === '\u0003') {
@@ -164,7 +214,38 @@ function readHidden(question) {
       }
     };
     stdin.on('data', onData);
+    stdin.on('end', finish);
   });
+}
+
+function tokenFromArgs(args) {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--token' || arg === '-t') return args[++i] || '';
+    if (arg.startsWith('--token=')) return arg.slice('--token='.length);
+    if (arg === '--token-file' || arg === '-f') {
+      const file = args[++i];
+      if (!file) throw new Error('--token-file needs a path');
+      return fs.readFileSync(file, 'utf8');
+    }
+    if (arg.startsWith('--token-file=')) {
+      return fs.readFileSync(arg.slice('--token-file='.length), 'utf8');
+    }
+  }
+  return args.find((arg) => arg !== '--manual' && !arg.startsWith('-')) || '';
+}
+
+async function readManualToken(args) {
+  const explicit = tokenFromArgs(args);
+  if (explicit) return cleanToken(explicit);
+  const envToken = process.env.DEEPSEEK_TOKEN || process.env.DEEPSEEK_USER_TOKEN;
+  if (envToken) return cleanToken(envToken);
+  if (!process.stdin.isTTY) {
+    const piped = await readAllStdin();
+    if (piped.trim()) return cleanToken(piped);
+    return '';
+  }
+  return cleanToken(await readHidden('  userToken (hidden): '));
 }
 
 function printSessionSummary(summary, { prefix = '  ', showMode = true } = {}) {
@@ -554,20 +635,30 @@ async function manualLogin() {
   console.log('');
   console.log("       copy((()=>{const v=localStorage.getItem('userToken');try{const p=JSON.parse(v);return typeof p==='string'?p:p.value}catch{return v}})())");
   console.log('');
-  console.log('  3. Paste the copied token below. It will not be echoed.');
+  console.log('  3. Paste the copied token below (input is hidden), or pass it directly.');
   console.log('');
-  const token = (await readHidden('  userToken: '))
-    .replace(/^["']|["']$/g, '')
-    .replace(/^Bearer\s+/i, '')
-    .trim();
-  if (!token || token.length < 20) {
-    console.error('That does not look like a DeepSeek user token.');
+  console.log('     deepseek --login --manual --token <userToken>');
+  console.log('     deepseek --login --manual --token-file token.txt');
+  console.log('     DEEPSEEK_TOKEN=<userToken> deepseek --login --manual');
+  console.log('');
+  let token = '';
+  try {
+    token = await readManualToken(rest);
+  } catch (err) {
+    console.error(`Could not read the token: ${err?.message || err}`);
     process.exit(1);
   }
+  if (!token || token.length < 20) {
+    console.error('No usable DeepSeek user token was provided.');
+    console.error('Use --token, --token-file, DEEPSEEK_TOKEN, or paste it at the hidden prompt.');
+    process.exit(1);
+  }
+  const previous = loadSession();
   saveSession({ token, cookies: [] });
   const { cfg } = await ensureRunning();
   let verified = false;
   let warning = null;
+  let errCode = '';
   try {
     const res = await fetch(`${baseUrl(cfg.port)}/v1/bridge/session/verify`, {
       method: 'POST',
@@ -576,10 +667,35 @@ async function manualLogin() {
     });
     const data = await res.json().catch(() => ({}));
     verified = res.ok;
+    errCode = String(data?.error?.code || data?.error?.type || '');
     if (!res.ok) warning = data?.error?.message || `HTTP ${res.status}`;
   } catch (err) {
     warning = err?.message || String(err);
   }
+
+  // Rejection messages vary (WAF HTML page, bare "token expired"), so trust the
+  // structured code first and keep the message regex as a fallback.
+  const rejected =
+    !verified && warning && (errCode === 'not_signed_in' || /invalid token|authorization failed|not signed|invalid_session|401/i.test(warning));
+  if (rejected) {
+    if (previous) {
+      saveSession({
+        token: previous.token,
+        cookies: previous.cookies,
+        userAgent: previous.userAgent,
+        user: previous.user,
+      });
+    } else {
+      clearSession();
+    }
+    console.log('');
+    console.log('  DeepSeek rejected that token.');
+    console.log(previous ? '  Your previous session was left unchanged.' : '  No session was saved.');
+    if (warning) console.log(`  ${warning}`);
+    console.log('  Copy a fresh userToken from chat.deepseek.com and try again.');
+    process.exit(1);
+  }
+
   console.log('');
   console.log('  DeepSeek session saved');
   console.log('');
@@ -598,7 +714,18 @@ async function manualLogin() {
 }
 
 async function login() {
-  if (rest.includes('--manual')) return manualLogin();
+  if (
+    rest.includes('--manual') ||
+    rest.includes('--token') ||
+    rest.includes('-t') ||
+    rest.includes('--token-file') ||
+    rest.includes('-f') ||
+    rest.some((arg) => arg.startsWith('--token=') || arg.startsWith('--token-file=')) ||
+    process.env.DEEPSEEK_TOKEN ||
+    process.env.DEEPSEEK_USER_TOKEN
+  ) {
+    return manualLogin();
+  }
   const { cfg } = await ensureRunning();
   const health = await getHealth(cfg.port);
   if (!health?.extension) {
@@ -696,6 +823,9 @@ Usage:
   deepseek "hello"         Shorthand for deepseek chat "hello"
   deepseek --login         Copy the chat.deepseek.com session from Chrome once
   deepseek --login --manual  Paste userToken from DevTools (no extension needed)
+  deepseek --login --manual --token-file token.txt
+  deepseek --login --manual --token <userToken>
+  DEEPSEEK_TOKEN=<userToken> deepseek --login --manual
   deepseek --logout        Delete the terminal session (fall back to extension)
   deepseek session         Show the stored terminal session
   deepseek version         Show local and GitHub versions

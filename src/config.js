@@ -19,6 +19,11 @@ function readJSON(file, fallback) {
   }
 }
 
+export function normalizeDefaultModel(value) {
+  const v = String(value || '').toLowerCase();
+  return v === 'deepseek-search' ? 'deepseek-search' : 'deepseek-reasoner';
+}
+
 function writeJSON(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const tmp = `${file}.${process.pid}.tmp`;
@@ -29,17 +34,26 @@ function writeJSON(file, value) {
 export function loadConfig() {
   const saved = readJSON(CONFIG_FILE, {});
   const cfg = {
+    ...saved,
     host: saved.host || '127.0.0.1',
     port: Number(saved.port) || 8787,
     key: saved.key || `sk-ds-${crypto.randomBytes(24).toString('hex')}`,
-    defaultModel: saved.defaultModel || 'deepseek-chat',
+    defaultModel: normalizeDefaultModel(saved.defaultModel),
     toolMode: saved.toolMode || 'auto', // auto | off
-    ...saved,
     autoUpdate: saved.autoUpdate !== false,
     lastUpdateCheck: Number(saved.lastUpdateCheck) || 0,
     lastUpdateVersion: saved.lastUpdateVersion || null,
   };
-  if (!saved.key) writeJSON(CONFIG_FILE, cfg);
+  if (!saved.key || saved.defaultModel !== cfg.defaultModel) {
+    try {
+      writeJSON(CONFIG_FILE, cfg);
+    } catch {
+      // Read-only config dir must not crash every CLI invocation.
+      if (!saved.key) {
+        console.error(`Warning: config directory ${CONFIG_DIR} is not writable; the generated API key is temporary and will change between runs.`);
+      }
+    }
+  }
   return cfg;
 }
 

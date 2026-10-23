@@ -32,7 +32,7 @@ console.log('firing request…');
 const res = await fetch(`http://127.0.0.1:${config.port}/v1/chat/completions`, {
   method: 'POST',
   headers: { 'content-type': 'application/json', authorization: `Bearer ${config.key}` },
-  body: JSON.stringify({ model: 'deepseek-chat', stream: true, messages: [{ role: 'user', content: 'Reply with exactly: PROBE' }] }),
+  body: JSON.stringify({ model: 'deepseek-reasoner', stream: true, messages: [{ role: 'user', content: 'Reply with exactly: PROBE' }] }),
 });
 console.log('HTTP', res.status);
 const text = await res.text();

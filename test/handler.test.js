@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { handleChatCompletions } from '../src/openai.js';
+import { normalizeMessages, splitMessages, transcriptDigest } from '../src/prompt.js';
 
 const failingRollout = JSON.parse(
   fs.readFileSync(new URL('./fixtures/failing-rollout.json', import.meta.url), 'utf8'),
@@ -69,7 +70,7 @@ async function replayRequest(text, toolNames, stream) {
     {},
     res,
     {
-      model: 'deepseek-chat',
+      model: 'deepseek-reasoner',
       messages: [{ role: 'user', content: 'use a tool' }],
       tools: toolNames.map((name) => ({
         type: 'function',
@@ -77,7 +78,7 @@ async function replayRequest(text, toolNames, stream) {
       })),
       stream,
     },
-    { agent, store, log: () => {}, config: { defaultModel: 'deepseek-chat', toolMode: 'auto' } },
+    { agent, store, log: () => {}, config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto' } },
   );
   return stream ? parseSse(res.chunks) : JSON.parse(res.chunks.join(''));
 }
@@ -165,11 +166,131 @@ test('uses the direct runner when a terminal session exists', async () => {
   await handleChatCompletions(
     {},
     res,
-    { model: 'deepseek-chat', messages: [{ role: 'user', content: 'hello' }], stream: false },
-    { agent, direct, store, log: () => {}, config: { defaultModel: 'deepseek-chat', toolMode: 'auto' } },
+    { model: 'deepseek-reasoner', messages: [{ role: 'user', content: 'hello' }], stream: false },
+    { agent, direct, store, log: () => {}, config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto' } },
   );
   const body = JSON.parse(res.chunks.join(''));
   assert.equal(used, 'direct');
   assert.equal(body.choices[0].message.content, 'DIRECT_OK');
+  assert.equal(body.choices[0].finish_reason, 'stop');
+});
+
+test('restarts from the full transcript when a saved parent message is invalid', async () => {
+  const res = new FakeResponse();
+  const messages = [
+    { role: 'user', content: 'first question' },
+    { role: 'assistant', content: 'first answer' },
+    { role: 'user', content: 'second question' },
+  ];
+  const normalized = normalizeMessages(messages);
+  const { rest } = splitMessages(normalized);
+  const history = transcriptDigest(rest.slice(0, 2));
+  let deleted = false;
+  let calls = 0;
+  const store = {
+    getConversation: () => ({ sessionId: 'sess_old', parentId: 2, turns: 2, digest: history }),
+    setConversation: () => {},
+    deleteConversation: (key) => {
+      deleted = key;
+    },
+  };
+  const agent = {
+    async run(request, handlers) {
+      calls++;
+      if (calls === 1) {
+        assert.equal(request.continuation, true);
+        const err = new Error('DeepSeek /chat/completion: invalid message id');
+        err.code = 'invalid_parent';
+        throw err;
+      }
+      assert.equal(request.continuation, false);
+      assert.match(request.prompt, /USER:\nfirst question/);
+      assert.match(request.prompt, /USER:\nsecond question/);
+      handlers.onReady({ sessionId: 'sess_new', messageId: 3 });
+      handlers.onDelta({ kind: 'content', text: 'AFTER_RESET' });
+      return {
+        usage: { completion: 1 },
+        finish: 'stop',
+        sessionId: 'sess_new',
+        messageId: 3,
+      };
+    },
+  };
+
+  await handleChatCompletions(
+    {},
+    res,
+    { model: 'deepseek-reasoner', messages, stream: false },
+    { agent, store, log: () => {}, config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto' } },
+  );
+
+  const body = JSON.parse(res.chunks.join(''));
+  assert.equal(calls, 2);
+  assert.ok(deleted);
+  assert.equal(body.choices[0].message.content, 'AFTER_RESET');
+  assert.equal(body.choices[0].finish_reason, 'stop');
+});
+
+test('resolves earlier-turn attachments when restarting from a fresh session', async () => {
+  const res = new FakeResponse();
+  const imageB64 = Buffer.from('early-turn-image-bytes').toString('base64');
+  const dataUrl = `data:image/png;base64,${imageB64}`;
+  const messages = [
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: 'first question' },
+        { type: 'image_url', image_url: { url: dataUrl } },
+      ],
+    },
+    { role: 'assistant', content: 'first answer' },
+    { role: 'user', content: 'second question' },
+  ];
+  const normalized = normalizeMessages(messages);
+  const { rest } = splitMessages(normalized);
+  const history = transcriptDigest(rest.slice(0, 2));
+  const store = {
+    getConversation: () => ({ sessionId: 'sess_old', parentId: 2, turns: 2, digest: history }),
+    setConversation: () => {},
+    deleteConversation: () => {},
+  };
+  const seenAttachments = [];
+  let calls = 0;
+  const agent = {
+    async run(request, handlers) {
+      calls++;
+      seenAttachments.push(request.attachments);
+      if (calls === 1) {
+        assert.equal(request.continuation, true);
+        assert.deepEqual(request.attachments, []);
+        const err = new Error('DeepSeek /chat/completion: invalid message id');
+        err.code = 'invalid_parent';
+        throw err;
+      }
+      assert.equal(request.continuation, false);
+      assert.match(request.prompt, /USER:\nfirst question/);
+      assert.match(request.prompt, /USER:\nsecond question/);
+      assert.deepEqual(request.attachments, [{ name: 'image-1.png', mime: 'image/png', dataBase64: imageB64 }]);
+      handlers.onReady({ sessionId: 'sess_new', messageId: 3 });
+      handlers.onDelta({ kind: 'content', text: 'AFTER_RESET' });
+      return {
+        usage: { completion: 1 },
+        finish: 'stop',
+        sessionId: 'sess_new',
+        messageId: 3,
+      };
+    },
+  };
+
+  await handleChatCompletions(
+    {},
+    res,
+    { model: 'deepseek-reasoner', messages, stream: false },
+    { agent, store, log: () => {}, config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto' } },
+  );
+
+  const body = JSON.parse(res.chunks.join(''));
+  assert.equal(calls, 2);
+  assert.equal(body.choices[0].message.content, 'AFTER_RESET');
   assert.equal(body.choices[0].finish_reason, 'stop');
 });

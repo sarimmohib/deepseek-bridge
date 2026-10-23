@@ -21,7 +21,7 @@ const take = (name, fallback) => {
 
 const config = loadConfig();
 const base = take('--url', `http://${config.host}:${config.port}`).replace(/\/$/, '');
-const model = take('--model', 'deepseek-chat');
+const model = take('--model', 'deepseek-reasoner');
 const repl = args.includes('--repl');
 const prompt = args.filter((a) => !a.startsWith('--')).join(' ').trim();
 

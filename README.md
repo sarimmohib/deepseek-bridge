@@ -29,13 +29,16 @@ mode.
 - **One-command login:** `deepseek --login` copies only `chat.deepseek.com`
   cookies and the site's `userToken` into a `0600` session file.
 - **Extension fallback:** the original same-origin extension path remains.
+- **Transient-failure recovery:** network errors, server-busy replies, WAF
+  challenges, and truncated SSE streams are retried; an interrupted reply is
+  resumed with DeepSeek's continue endpoint and de-duplicated.
 - **OpenCode provider:** a ready-to-use `deepseek-bridge/*` provider config.
 - **Versioned self-update:** `deepseek version` checks GitHub, and
   `deepseek update` fast-forwards a clean git checkout.
 - OpenAI-compatible `POST /v1/chat/completions`, streaming and non-streaming.
 - Image, file, and PDF input through OpenAI content parts.
 - Emulated tool calling, including parallel calls, in native OpenAI format.
-- Thinking on/off through `deepseek-chat` and `deepseek-reasoner`.
+- Reasoning-only models: `deepseek-reasoner` and `deepseek-search` (reasoning + web search).
 - Multi-turn session reuse and no npm runtime dependencies.
 
 ## Requirements
@@ -210,18 +213,24 @@ If you do not want to install the extension even once, use the manual flow:
    copy((()=>{const v=localStorage.getItem('userToken');try{const p=JSON.parse(v);return typeof p==='string'?p:p.value}catch{return v}})())
    ```
 
-3. Run:
+3. Run one of:
 
    ```bash
    deepseek --login --manual
+   deepseek --login --manual --token-file token.txt
+   deepseek --login --manual --token <userToken>
+   DEEPSEEK_TOKEN=<userToken> deepseek --login --manual
    ```
 
-4. Paste the token at the hidden prompt.
+4. At the hidden prompt, paste the token and press Enter. The prompt reads from
+   a terminal, piped stdin, or the explicit options above; it does not require a
+   trailing newline when input is piped.
 
-This stores only `userToken`; the bridge acquires and updates any DeepSeek
-cookies it needs. It is fully extension-independent, but the copy step is
-manual. The extension flow above is automatic and can reuse the browser login
-you already have.
+`--token` can expose the value in your shell history, so prefer
+`--token-file`, `DEEPSEEK_TOKEN`, or the hidden prompt. This stores only
+`userToken`; the bridge acquires and updates the DeepSeek cookies it needs. It
+is fully extension-independent, but the copy step is manual. The extension flow
+above is automatic and can reuse the browser login you already have.
 
 ### Session lifetime
 
@@ -288,7 +297,7 @@ Direct mode takes precedence whenever `session.json` exists.
 | `deepseek stop` | Stop the background bridge using its PID file |
 | `deepseek status` | Show base URL, mode, session/extension state, config, and log path |
 | `deepseek --login` | Copy the Chrome web session into the terminal (once per login) |
-| `deepseek --login --manual` | Paste `userToken` from DevTools; no extension needed |
+| `deepseek --login --manual` | Paste `userToken` from DevTools (or use `--token`, `--token-file`, `DEEPSEEK_TOKEN`); no extension needed |
 | `deepseek --logout` | Delete the terminal session and fall back to extension mode |
 | `deepseek session` | Show stored session metadata, never the token |
 | `deepseek version` | Show the local version, commit, and GitHub `main` version |
@@ -395,16 +404,6 @@ Add this to `~/.config/opencode/opencode.jsonc` (the file is normally mode
         "reasoningField": "reasoning_content"
       },
       "models": {
-        "deepseek-chat": {
-          "name": "DeepSeek V4.1 Flash (web)",
-          "capabilities": {
-            "tools": true,
-            "input": ["text", "image"],
-            "output": ["text"],
-            "reasoning": { "supported": false }
-          },
-          "limit": { "context": 890880, "output": 131072 }
-        },
         "deepseek-reasoner": {
           "name": "DeepSeek V4.1 Flash Reasoner (web)",
           "capabilities": {
@@ -413,7 +412,19 @@ Add this to `~/.config/opencode/opencode.jsonc` (the file is normally mode
             "output": ["text"],
             "reasoning": {
               "supported": true,
-              "toggle": true,
+              "effort": ["low", "high", "max"]
+            }
+          },
+          "limit": { "context": 890880, "output": 131072 }
+        },
+        "deepseek-search": {
+          "name": "DeepSeek V4.1 Flash Search (web)",
+          "capabilities": {
+            "tools": true,
+            "input": ["text", "image"],
+            "output": ["text"],
+            "reasoning": {
+              "supported": true,
               "effort": ["low", "high", "max"]
             }
           },
@@ -425,13 +436,11 @@ Add this to `~/.config/opencode/opencode.jsonc` (the file is normally mode
 }
 ```
 
-The `deepseek-expert` and `deepseek-search` models use the same provider;
-add them by copying one model entry (the installed config on this machine
-already includes all four). Verify and use it:
+Both models use the same provider. Verify and use it:
 
 ```bash
 opencode models | grep deepseek-bridge
-opencode run --model deepseek-bridge/deepseek-chat "Reply with exactly: OK"
+opencode run --model deepseek-bridge/deepseek-reasoner "Reply with exactly: OK"
 ```
 
 Select it for an interactive session with `/models`, or make it the default for
@@ -439,7 +448,7 @@ new sessions:
 
 ```jsonc
 {
-  "model": "deepseek-bridge/deepseek-chat"
+  "model": "deepseek-bridge/deepseek-reasoner"
 }
 ```
 
@@ -490,7 +499,7 @@ PowerShell:
 ```powershell
 $key = deepseek key
 $body = @{
-  model = "deepseek-chat"
+  model = "deepseek-reasoner"
   messages = @(@{ role = "user"; content = "17*23?" })
 } | ConvertTo-Json -Depth 10
 
@@ -513,7 +522,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="deepseek-chat",
+    model="deepseek-reasoner",
     messages=[{"role": "user", "content": "Explain quicksort in one paragraph."}],
 )
 print(response.choices[0].message.content)
@@ -527,25 +536,27 @@ loop.
 The web app currently serves **DeepSeek-V4.1-Flash**, a multimodal MoE with a
 552B backbone, a 1,048,576-token model context, and continuous reasoning effort.
 The web session reports an **890,880-token** history/file budget and up to
-**100 MB per uploaded file**. The bridge exposes four stable IDs:
+**100 MB per uploaded file**. The bridge exposes two stable IDs:
 
 | Model | Site mode |
 | --- | --- |
-| `deepseek-chat` | Default (Instant), thinking off |
-| `deepseek-reasoner` | Default (Instant), thinking on; emits `reasoning_content` |
-| `deepseek-expert` | `model_type: expert` (may be disabled on your account) |
-| `deepseek-search` | Default, web search on |
+| `deepseek-reasoner` | Reasoning on; emits `reasoning_content` |
+| `deepseek-search` | Reasoning on and web search enabled |
 
-`thinking_enabled`, `search_enabled`, `thinking`, and `reasoning_effort` in the
-request body override the model defaults. `/v1/models` reports
-`context_window: 890880` and `max_output_tokens: 131072` for each entry.
+Both models always reason; the instant modes were removed. The `search` model
+always sends `search_enabled: true`. For compatibility, legacy IDs
+(`deepseek-chat`, `deepseek-expert`, or an unknown model) are normalized to
+`deepseek-reasoner` instead of silently selecting an instant mode.
+`/v1/models` reports `context_window: 890880` and
+`max_output_tokens: 131072` for each entry.
 
 > **Thinking effort is only partially controllable.** The web client sends only
 > `thinking_enabled`; it has no 1–100 effort field. The bridge accepts
-> `reasoning_effort` for OpenAI compatibility (`none` turns thinking off,
-> `low`/`high`/`max` turn it on) and adds a short prompt hint for low/max, but
-> live tests showed the web gateway ignores numeric effort fields. Real numeric
-> effort control requires the official DeepSeek API, not the web session.
+> `reasoning_effort` for OpenAI compatibility and adds a short prompt hint for
+> low/max, but live tests showed the web gateway ignores numeric effort fields.
+> `reasoning_effort: "none"` is accepted but does not disable reasoning in this
+> reasoning-only build. Real numeric effort control requires the official
+> DeepSeek API, not the web session.
 
 ### Images, files, and PDFs
 
@@ -617,7 +628,7 @@ ZCode → **Model settings** → **Add provider**, then:
 | Base URL | `http://127.0.0.1:8787/v1` |
 | API format | **Chat completions (`/chat/completions`)** — not Anthropic |
 | API key | the `sk-ds-…` key from `deepseek key` |
-| Model ID | `deepseek-chat` (add `deepseek-reasoner` as a second model) |
+| Model ID | `deepseek-reasoner` (add `deepseek-search` as a second model) |
 | Context window | `890880` |
 | Max output tokens | `65536` (the model supports more; the web session caps it server-side) |
 | Input types | **Text + Image** (add PDF/file if your client supports it) |
@@ -679,8 +690,9 @@ longer need a signed-in tab; in extension mode keep one open.
 | `not_signed_in` / session expired | Run `deepseek --login` again. Direct mode does not fall back automatically, so an expired stored session is reported clearly. |
 | `deepseek --login` says Chrome returned an incomplete session | The content script was stale. Reload the extension in `chrome://extensions`, refresh the `chat.deepseek.com` tab, then retry. |
 | `extension disconnected` / `extension_offline` | You are in extension mode (no `session.json`) or you requested `--login` with Chrome closed. Start Chrome and keep a signed-in `chat.deepseek.com` tab open. |
-| `INVALID_POW_RESPONSE` | Solved challenges are single-use. Retry; if it persists, restart with `deepseek stop && deepseek` so a fresh challenge is requested. |
-| Empty completion, `HTTP 200` | The site returned a JSON error body instead of SSE. The bridge surfaces it as an error; retry usually clears it. |
+| `INVALID_POW_RESPONSE` | Solved challenges are single-use. The bridge automatically requests a fresh challenge and retries. If it persists, restart with `deepseek stop && deepseek`. |
+| Empty completion, `HTTP 200` | The site returned a JSON error body instead of SSE. The bridge retries transient errors; if it still fails, retry the request or run `deepseek --login` again. |
+| Reply stops midway / `stream_interrupted` | The bridge detects a missing stream terminator, asks DeepSeek to continue the same assistant message, and appends only the missing text. If DeepSeek refuses to continue, the error is surfaced instead of silently truncating. |
 | `401 invalid_api_key` | Use the key from `deepseek key`. |
 | `deepseek: command not found` | Add npm's global bin directory to `PATH` (`npm prefix -g`), or use `node bin/deepseek.js`. |
 | `EACCES` during `npm install -g .` | Use `npm install -g . --prefix "$HOME/.local"` and add `~/.local/bin` to `PATH`; do not use `sudo`. |
@@ -731,7 +743,7 @@ Live direct-mode smoke test with the stored session:
 curl -s http://127.0.0.1:8787/v1/chat/completions \
   -H "authorization: Bearer $(deepseek key)" \
   -H 'content-type: application/json' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"Reply with exactly DIRECT_OK"}]}'
+  -d '{"model":"deepseek-reasoner","messages":[{"role":"user","content":"Reply with exactly DIRECT_OK"}]}'
 ```
 
 After editing `extension/content.js` or `sw.js`, reload the unpacked extension
@@ -760,8 +772,8 @@ because the previous worker does not know that message.
 - The tool-call protocol is an adapter convention, not a native web-chat
   feature. Native DSML output is parsed as a fallback, and parallel calls are
   returned in one turn.
-- `reasoning_effort` is accepted but the web gateway ignores numeric effort;
-  only thinking on/off is real. `low`/`max` add a small prompt hint.
+- Both advertised models always reason. `reasoning_effort` is accepted but the
+  web gateway ignores numeric effort; `low`/`max` add a small prompt hint.
 - The bridge is not a security boundary. Keep it on loopback and protect the
   API key and `session.json`.
 

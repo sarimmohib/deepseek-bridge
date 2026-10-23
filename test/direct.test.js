@@ -76,7 +76,7 @@ test('direct client creates a session, solves PoW, and parses the patch stream',
       parentMessageId: null,
       prompt: 'say OK!',
       modelType: 'default',
-      thinking: false,
+      thinking: true,
       attachments: [],
     },
     { onDelta: (delta) => deltas.push(delta) },
@@ -84,7 +84,7 @@ test('direct client creates a session, solves PoW, and parses the patch stream',
 
   assert.equal(completionBody.chat_session_id, 'sess_test');
   assert.equal(completionBody.prompt, 'say OK!');
-  assert.equal(completionBody.thinking_enabled, false);
+  assert.equal(completionBody.thinking_enabled, true);
   assert.deepEqual(deltas, [
     { kind: 'content', text: 'OK' },
     { kind: 'content', text: '!' },
@@ -92,4 +92,262 @@ test('direct client creates a session, solves PoW, and parses the patch stream',
   assert.equal(result.sessionId, 'sess_test');
   assert.equal(result.messageId, 2);
   assert.equal(result.finish, 'stop');
+});
+
+function streamResponse(events) {
+  return new Response(events.join(''), {
+    status: 200,
+    headers: { 'content-type': 'text/event-stream' },
+  });
+}
+
+function baseFetch(onCompletion, onContinue) {
+  return async (url, init = {}) => {
+    const target = String(url);
+    if (target.endsWith('/chat_session/create')) {
+      return jsonResponse({
+        code: 0,
+        data: { biz_code: 0, biz_data: { chat_session: { id: 'sess_test' } } },
+      });
+    }
+    if (target.endsWith('/chat/create_pow_challenge')) {
+      return jsonResponse({ code: 0, data: { biz_code: 0, biz_data: { challenge } } });
+    }
+    if (target.endsWith('/chat/completion')) return onCompletion(init);
+    if (target.endsWith('/chat/continue')) return onContinue(init);
+    throw new Error(`unexpected URL ${target}`);
+  };
+}
+
+test('resumes a truncated stream with /chat/continue without duplicating content', async () => {
+  saveSession({ token, cookies: [] });
+  const client = new DirectClient({ retryDelays: [0, 0, 0] });
+  let continueBody = null;
+  let completionCalls = 0;
+
+  globalThis.fetch = baseFetch(
+    () => {
+      completionCalls++;
+      return streamResponse([
+        'event: ready\n',
+        'data: {"request_message_id":1,"response_message_id":2}\n\n',
+        'data: {"v":{"response":{"fragments":[{"type":"RESPONSE","content":"Hello"}]}}}\n\n',
+        // No event: close. This is what a dropped or truncated connection
+        // looks like and must not be treated as a successful completion.
+      ]);
+    },
+    (init) => {
+      continueBody = JSON.parse(init.body);
+      return streamResponse([
+        'data: {"v":{"response":{"fragments":[{"type":"RESPONSE","content":"Hello world"}]}}}\n\n',
+        'event: close\n',
+        'data: {}\n\n',
+      ]);
+    },
+  );
+
+  const deltas = [];
+  const result = await client.run(
+    { prompt: 'say hello', thinking: true, search: false, attachments: [] },
+    { onDelta: (delta) => deltas.push(delta) },
+  );
+
+  assert.equal(completionCalls, 1);
+  assert.deepEqual(continueBody, {
+    chat_session_id: 'sess_test',
+    message_id: 2,
+    fallback_to_resume: true,
+  });
+  assert.deepEqual(deltas, [
+    { kind: 'content', text: 'Hello' },
+    { kind: 'content', text: ' world' },
+  ]);
+  assert.equal(result.messageId, 2);
+});
+
+test('retries a server-busy completion before any output', async () => {
+  saveSession({ token, cookies: [] });
+  const client = new DirectClient({ retryDelays: [0, 0, 0] });
+  let completionCalls = 0;
+
+  globalThis.fetch = baseFetch(
+    () => {
+      completionCalls++;
+      if (completionCalls === 1) {
+        return new Response(JSON.stringify({ code: 0, data: { biz_code: 500, biz_msg: 'Server is busy' } }), {
+          status: 503,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return streamResponse([
+        'event: ready\n',
+        'data: {"request_message_id":1,"response_message_id":2}\n\n',
+        'data: {"v":{"response":{"fragments":[{"type":"RESPONSE","content":"OK"}]}}}\n\n',
+        'event: close\n',
+        'data: {}\n\n',
+      ]);
+    },
+    () => {
+      throw new Error('continue should not be needed');
+    },
+  );
+
+  const deltas = [];
+  const result = await client.run(
+    { prompt: 'say OK', thinking: true, search: false, attachments: [] },
+    { onDelta: (delta) => deltas.push(delta) },
+  );
+
+  assert.equal(completionCalls, 2);
+  assert.deepEqual(deltas, [{ kind: 'content', text: 'OK' }]);
+  assert.equal(result.messageId, 2);
+});
+
+test('retries a network failure before any output', async () => {
+  saveSession({ token, cookies: [] });
+  const client = new DirectClient({ retryDelays: [0, 0, 0] });
+  let completionCalls = 0;
+
+  globalThis.fetch = baseFetch(
+    () => {
+      completionCalls++;
+      if (completionCalls === 1) throw new TypeError('fetch failed');
+      return streamResponse([
+        'event: ready\n',
+        'data: {"request_message_id":1,"response_message_id":2}\n\n',
+        'data: {"v":{"response":{"fragments":[{"type":"RESPONSE","content":"NET_OK"}]}}}\n\n',
+        'event: close\n',
+        'data: {}\n\n',
+      ]);
+    },
+    () => {
+      throw new Error('continue should not be needed');
+    },
+  );
+
+  const deltas = [];
+  const result = await client.run(
+    { prompt: 'network test', thinking: true, search: false, attachments: [] },
+    { onDelta: (delta) => deltas.push(delta) },
+  );
+
+  assert.equal(completionCalls, 2);
+  assert.deepEqual(deltas, [{ kind: 'content', text: 'NET_OK' }]);
+  assert.equal(result.messageId, 2);
+});
+
+test('accepts a full-message response from /chat/continue', async () => {
+  saveSession({ token, cookies: [] });
+  const client = new DirectClient({ retryDelays: [0, 0, 0] });
+
+  globalThis.fetch = baseFetch(
+    () =>
+      streamResponse([
+        'event: ready\n',
+        'data: {"request_message_id":1,"response_message_id":2}\n\n',
+        'data: {"v":{"response":{"fragments":[{"type":"RESPONSE","content":"FULL"}]}}}\n\n',
+      ]),
+    () =>
+      jsonResponse({
+        code: 0,
+        data: {
+          biz_code: 22,
+          biz_msg: '',
+          biz_data: {
+            message: {
+              id: 2,
+              fragments: [{ type: 'RESPONSE', content: 'FULL MESSAGE' }],
+            },
+          },
+        },
+      }),
+  );
+
+  const deltas = [];
+  const result = await client.run(
+    { prompt: 'full message', thinking: true, search: false, attachments: [] },
+    { onDelta: (delta) => deltas.push(delta) },
+  );
+
+  assert.deepEqual(deltas, [
+    { kind: 'content', text: 'FULL' },
+    { kind: 'content', text: ' MESSAGE' },
+  ]);
+  assert.equal(result.messageId, 2);
+});
+
+test('retries a truncated continuation and keeps only the missing suffix', async () => {
+  saveSession({ token, cookies: [] });
+  const client = new DirectClient({ retryDelays: [0, 0, 0] });
+  let continueCalls = 0;
+
+  globalThis.fetch = baseFetch(
+    () =>
+      streamResponse([
+        'event: ready\n',
+        'data: {"request_message_id":1,"response_message_id":2}\n\n',
+        'data: {"v":{"response":{"fragments":[{"type":"RESPONSE","content":"Hello"}]}}}\n\n',
+      ]),
+    () => {
+      continueCalls++;
+      if (continueCalls === 1) {
+        return streamResponse([
+          'data: {"v":{"response":{"fragments":[{"type":"RESPONSE","content":"Hello wor"}]}}}\n\n',
+        ]);
+      }
+      return streamResponse([
+        'data: {"v":{"response":{"fragments":[{"type":"RESPONSE","content":"Hello world"}]}}}\n\n',
+        'event: close\n',
+        'data: {}\n\n',
+      ]);
+    },
+  );
+
+  const deltas = [];
+  const result = await client.run(
+    { prompt: 'resume twice', thinking: true, search: false, attachments: [] },
+    { onDelta: (delta) => deltas.push(delta) },
+  );
+
+  assert.equal(continueCalls, 2);
+  assert.deepEqual(deltas, [
+    { kind: 'content', text: 'Hello' },
+    { kind: 'content', text: ' wor' },
+    { kind: 'content', text: 'ld' },
+  ]);
+  assert.equal(result.messageId, 2);
+});
+
+test('surfaces a pre-ready error event without retrying', async () => {
+  saveSession({ token, cookies: [] });
+  const client = new DirectClient({ retryDelays: [0, 0, 0] });
+  let completionCalls = 0;
+
+  globalThis.fetch = baseFetch(
+    () => {
+      completionCalls++;
+      return streamResponse([
+        'event: error\n',
+        'data: {"msg":"Content flagged by moderation"}\n\n',
+      ]);
+    },
+    () => {
+      throw new Error('continue should not be needed');
+    },
+  );
+
+  const deltas = [];
+  await assert.rejects(
+    client.run(
+      { prompt: 'flagged prompt', thinking: true, search: false, attachments: [] },
+      { onDelta: (delta) => deltas.push(delta) },
+    ),
+    (err) => {
+      assert.equal(err.code, 'stream_error');
+      assert.match(err.message, /Content flagged by moderation/);
+      return true;
+    },
+  );
+  assert.deepEqual(deltas, []);
+  assert.equal(completionCalls, 1);
 });
