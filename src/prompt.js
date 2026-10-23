@@ -561,12 +561,25 @@ function callFromItem(item, { allowDirect = true, requireArgs = false, toolNames
     }
   }
   if (typeof args === 'string') {
+    // The OpenAI protocol requires `arguments` to be the stringified JSON
+    // *object* of the call. Passing through text that is not a JSON object
+    // (unparseable model output, scalars, arrays) makes strict clients reject
+    // the whole tool call — opencode's openai-compatible stream parser fails
+    // the finalize step with "Invalid JSON input for tool call <name>" and the
+    // user sees the call bounce as a format error. Mirror extractDsml and wrap
+    // every non-object payload in { value: ... } so the wire stays valid JSON.
+    let normalized = null;
     try {
       const parsed = JSON.parse(args);
-      args = parsed && typeof parsed === 'object' ? parsed : args;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) normalized = parsed;
+      else normalized = { value: parsed ?? null };
     } catch {
-      /* keep the string; the OpenAI layer will pass it through */
+      normalized = { value: args };
     }
+    args = normalized;
+  } else if (args !== null && (Array.isArray(args) || typeof args !== 'object')) {
+    // Same protocol rule for arguments supplied as a literal array/scalar.
+    args = { value: args };
   }
   return {
     id: item.id || `call_${crypto.randomBytes(6).toString('hex')}`,

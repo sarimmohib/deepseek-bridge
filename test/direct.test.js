@@ -101,7 +101,7 @@ function streamResponse(events) {
   });
 }
 
-function baseFetch(onCompletion, onContinue) {
+function baseFetch(onCompletion, onContinue, onResume) {
   return async (url, init = {}) => {
     const target = String(url);
     if (target.endsWith('/chat_session/create')) {
@@ -114,15 +114,20 @@ function baseFetch(onCompletion, onContinue) {
       return jsonResponse({ code: 0, data: { biz_code: 0, biz_data: { challenge } } });
     }
     if (target.endsWith('/chat/completion')) return onCompletion(init);
+    if (target.endsWith('/chat/resume_stream')) {
+      if (!onResume) throw new Error('resume_stream should not be needed');
+      return onResume(init);
+    }
     if (target.endsWith('/chat/continue')) return onContinue(init);
     throw new Error(`unexpected URL ${target}`);
   };
 }
 
-test('resumes a truncated stream with /chat/continue without duplicating content', async () => {
+test('resumes a truncated stream with /chat/resume_stream without duplicating content', async () => {
   saveSession({ token, cookies: [] });
   const client = new DirectClient({ retryDelays: [0, 0, 0] });
-  let continueBody = null;
+  let resumeBody = null;
+  let continueCalls = 0;
   let completionCalls = 0;
 
   globalThis.fetch = baseFetch(
@@ -136,12 +141,21 @@ test('resumes a truncated stream with /chat/continue without duplicating content
         // looks like and must not be treated as a successful completion.
       ]);
     },
+    () => {
+      continueCalls++;
+      throw new Error('continue should not be needed');
+    },
     (init) => {
-      continueBody = JSON.parse(init.body);
+      resumeBody = JSON.parse(init.body);
+      // Live-verified replay: a full-state snapshot repeating everything
+      // generated before the disconnect, then APPEND deltas for the rest.
       return streamResponse([
-        'data: {"v":{"response":{"fragments":[{"type":"RESPONSE","content":"Hello world"}]}}}\n\n',
+        'event: ready\n',
+        'data: {"response_message_id":2}\n\n',
+        'data: {"v":{"response":{"message_id":2,"status":"WIP","fragments":[{"type":"RESPONSE","content":"Hello"}]}}}\n\n',
+        'data: {"p":"response/fragments/-1/content","o":"APPEND","v":" world"}\n\n',
         'event: close\n',
-        'data: {}\n\n',
+        'data: {"click_behavior":"none","auto_resume":false}\n\n',
       ]);
     },
   );
@@ -153,11 +167,8 @@ test('resumes a truncated stream with /chat/continue without duplicating content
   );
 
   assert.equal(completionCalls, 1);
-  assert.deepEqual(continueBody, {
-    chat_session_id: 'sess_test',
-    message_id: 2,
-    fallback_to_resume: true,
-  });
+  assert.equal(continueCalls, 0);
+  assert.deepEqual(resumeBody, { chat_session_id: 'sess_test', message_id: 2 });
   assert.deepEqual(deltas, [
     { kind: 'content', text: 'Hello' },
     { kind: 'content', text: ' world' },
@@ -236,9 +247,10 @@ test('retries a network failure before any output', async () => {
   assert.equal(result.messageId, 2);
 });
 
-test('accepts a full-message response from /chat/continue', async () => {
+test('accepts a full-message response from /chat/resume_stream', async () => {
   saveSession({ token, cookies: [] });
   const client = new DirectClient({ retryDelays: [0, 0, 0] });
+  let continueCalls = 0;
 
   globalThis.fetch = baseFetch(
     () =>
@@ -247,17 +259,23 @@ test('accepts a full-message response from /chat/continue', async () => {
         'data: {"request_message_id":1,"response_message_id":2}\n\n',
         'data: {"v":{"response":{"fragments":[{"type":"RESPONSE","content":"FULL"}]}}}\n\n',
       ]),
+    () => {
+      continueCalls++;
+      throw new Error('continue should not be needed');
+    },
     () =>
+      // Live shape: the message finished minutes ago, so resume_stream answers
+      // with a biz_code 22 JSON wrapper carrying the finished message.
       jsonResponse({
         code: 0,
+        msg: '',
         data: {
           biz_code: 22,
-          biz_msg: '',
+          biz_msg: 'invalid message status',
           biz_data: {
-            message: {
-              id: 2,
-              fragments: [{ type: 'RESPONSE', content: 'FULL MESSAGE' }],
-            },
+            id: 2,
+            status: 'FINISHED',
+            fragments: [{ type: 'RESPONSE', content: 'FULL MESSAGE' }],
           },
         },
       }),
@@ -269,6 +287,7 @@ test('accepts a full-message response from /chat/continue', async () => {
     { onDelta: (delta) => deltas.push(delta) },
   );
 
+  assert.equal(continueCalls, 0);
   assert.deepEqual(deltas, [
     { kind: 'content', text: 'FULL' },
     { kind: 'content', text: ' MESSAGE' },
@@ -279,7 +298,9 @@ test('accepts a full-message response from /chat/continue', async () => {
 test('retries a truncated continuation and keeps only the missing suffix', async () => {
   saveSession({ token, cookies: [] });
   const client = new DirectClient({ retryDelays: [0, 0, 0] });
+  let resumeCalls = 0;
   let continueCalls = 0;
+  let continueBody = null;
 
   globalThis.fetch = baseFetch(
     () =>
@@ -288,17 +309,19 @@ test('retries a truncated continuation and keeps only the missing suffix', async
         'data: {"request_message_id":1,"response_message_id":2}\n\n',
         'data: {"v":{"response":{"fragments":[{"type":"RESPONSE","content":"Hello"}]}}}\n\n',
       ]),
-    () => {
+    (init) => {
       continueCalls++;
-      if (continueCalls === 1) {
-        return streamResponse([
-          'data: {"v":{"response":{"fragments":[{"type":"RESPONSE","content":"Hello wor"}]}}}\n\n',
-        ]);
-      }
+      continueBody = JSON.parse(init.body);
       return streamResponse([
         'data: {"v":{"response":{"fragments":[{"type":"RESPONSE","content":"Hello world"}]}}}\n\n',
         'event: close\n',
         'data: {}\n\n',
+      ]);
+    },
+    () => {
+      resumeCalls++;
+      return streamResponse([
+        'data: {"v":{"response":{"fragments":[{"type":"RESPONSE","content":"Hello wor"}]}}}\n\n',
       ]);
     },
   );
@@ -309,11 +332,75 @@ test('retries a truncated continuation and keeps only the missing suffix', async
     { onDelta: (delta) => deltas.push(delta) },
   );
 
-  assert.equal(continueCalls, 2);
+  assert.equal(resumeCalls, 1);
+  assert.equal(continueCalls, 1);
+  assert.deepEqual(continueBody, {
+    chat_session_id: 'sess_test',
+    message_id: 2,
+    fallback_to_resume: true,
+  });
   assert.deepEqual(deltas, [
     { kind: 'content', text: 'Hello' },
     { kind: 'content', text: ' wor' },
     { kind: 'content', text: 'ld' },
+  ]);
+  assert.equal(result.messageId, 2);
+});
+
+test('falls back to /chat/continue when /chat/resume_stream cannot resume', async () => {
+  saveSession({ token, cookies: [] });
+  const client = new DirectClient({ retryDelays: [0, 0, 0] });
+  const calls = [];
+  let resumeBody = null;
+  let continueBody = null;
+
+  globalThis.fetch = baseFetch(
+    () =>
+      streamResponse([
+        'event: ready\n',
+        'data: {"request_message_id":1,"response_message_id":2}\n\n',
+        'data: {"v":{"response":{"fragments":[{"type":"RESPONSE","content":"Hello"}]}}}\n\n',
+      ]),
+    (init) => {
+      calls.push('continue');
+      continueBody = JSON.parse(init.body);
+      return streamResponse([
+        'data: {"v":{"response":{"fragments":[{"type":"RESPONSE","content":"Hello world"}]}}}\n\n',
+        'event: close\n',
+        'data: {}\n\n',
+      ]);
+    },
+    (init) => {
+      calls.push('resume_stream');
+      resumeBody = JSON.parse(init.body);
+      // Live shape: an id resume_stream refuses comes back as biz_code 26
+      // with no biz_data, which must not end recovery — /chat/continue
+      // still succeeds for the same message.
+      return jsonResponse({
+        code: 0,
+        msg: '',
+        data: { biz_code: 26, biz_msg: 'invalid message id', biz_data: null },
+      });
+    },
+  );
+
+  const deltas = [];
+  const result = await client.run(
+    { prompt: 'resume fallback', thinking: true, search: false, attachments: [] },
+    { onDelta: (delta) => deltas.push(delta) },
+  );
+
+  assert.deepEqual(calls, ['resume_stream', 'continue']);
+  assert.deepEqual(resumeBody, { chat_session_id: 'sess_test', message_id: 2 });
+  assert.deepEqual(continueBody, {
+    chat_session_id: 'sess_test',
+    message_id: 2,
+    fallback_to_resume: true,
+  });
+  // /chat/continue replays the full message; only the suffix may be re-sent.
+  assert.deepEqual(deltas, [
+    { kind: 'content', text: 'Hello' },
+    { kind: 'content', text: ' world' },
   ]);
   assert.equal(result.messageId, 2);
 });

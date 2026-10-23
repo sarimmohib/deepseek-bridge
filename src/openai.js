@@ -409,7 +409,7 @@ export async function handleChatCompletions(req, res, body, ctx) {
         // contributed, skipping bytes the tail already covered.
         const headAttachments = collectAttachments(rest.slice(0, rest.length - sourceMessages.length));
         if (headAttachments.length) {
-          const attKey = (a) => `${a.dataBase64.length}:${a.dataBase64.slice(0, 128)}`;
+          const attKey = (a) => crypto.createHash('sha256').update(a.dataBase64).digest('hex');
           const known = new Set(attachments.map(attKey));
           for (const att of await resolveAttachments(headAttachments, { log })) {
             if (!known.has(attKey(att))) {

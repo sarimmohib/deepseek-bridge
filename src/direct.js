@@ -676,7 +676,16 @@ export class DirectClient {
     const bizCode = data?.biz_code;
     const bizMsg = data?.biz_msg || json?.msg || '';
     let code = 'recovery_failed';
-    if (bizCode === 24 || /locked|still generating|try again/i.test(String(bizMsg))) {
+    // 24: the message is still generating, so /chat/continue is locked. 22:
+    // the message is not in a state this endpoint can resume (it usually just
+    // finished; readRecoveryResponse absorbs the attached full-message
+    // biz_data, this is the safety net for a bare rejection). Both are
+    // transient: the next attempt uses the other recovery endpoint.
+    if (
+      bizCode === 24 ||
+      bizCode === 22 ||
+      /locked|still generating|try again|invalid message status/i.test(String(bizMsg))
+    ) {
       code = 'continue_locked';
     } else if ([7, 8, 23, 26].includes(bizCode)) {
       code = 'recovery_unavailable';
@@ -880,23 +889,25 @@ export class DirectClient {
       if (signal?.aborted) throw cancelledError();
       if (Date.now() >= deadline) throw timeoutError();
 
+      // resume_stream first: while the message is still generating it replays
+      // a full-state snapshot where /chat/continue only answers
+      // continue_locked. Later attempts use the proven /chat/continue path.
+      const endpoint = i === 0 ? '/chat/resume_stream' : '/chat/continue';
       const attempt = createAttempt({ signal, deadline, idleTimeout: STREAM_IDLE_TIMEOUT });
       const collected = { content: '', reasoning: '' };
       let failure = null;
       try {
         this.log(`reply interrupted; resuming message ${messageId} (attempt ${i + 1}/${MAX_RECOVERY_ATTEMPTS})...`);
-        const res = await this.request('/chat/continue', {
-          body: {
-            chat_session_id: sessionId,
-            message_id: messageId,
-            fallback_to_resume: true,
-          },
+        const body = { chat_session_id: sessionId, message_id: messageId };
+        if (i > 0) body.fallback_to_resume = true;
+        const res = await this.request(endpoint, {
+          body,
           headers: { accept: '*/*' },
           signal: attempt.signal,
         });
         if (debugLines) {
           debugLines.push(
-            `continue http ${res.status} type=${res.headers.get('content-type')} len=${res.headers.get('content-length')}`,
+            `${endpoint.replace('/chat/', '')} http ${res.status} type=${res.headers.get('content-type')} len=${res.headers.get('content-length')}`,
           );
         }
         const outcome = await this.readRecoveryResponse(res, { collected, attempt, debugLines });
@@ -905,18 +916,22 @@ export class DirectClient {
         if (outcome.title) title = outcome.title;
         if (outcome.messageId != null) messageId = outcome.messageId;
         this.log(
-          `reply resumed message=${messageId} recovered=${collected.content.length}c/${collected.reasoning.length}c`,
+          `reply resumed via ${endpoint.replace('/chat/', '')} message=${messageId} recovered=${collected.content.length}c/${collected.reasoning.length}c`,
         );
         return { sessionId, messageId, usage, title, finish: 'stop', debugLines };
       } catch (err) {
         failure = normalizeAttemptError(err, attempt, signal);
-        // A failed continuation may still have streamed useful text. Keep the
+        // A failed resume may still have streamed useful text. Keep the
         // new suffix, then try again from the updated message state.
         this.emitMissing(emitted, collected, emit);
         if (failure.code === 'cancelled' || failure.code === 'timeout' || failure.code === 'not_signed_in') {
           throw failure;
         }
-        if (!isTransientError(failure)) {
+        // resume_stream refusing the message (biz 7/8/23/26) is a verdict
+        // about that endpoint, not the recovery; the /chat/continue fallback
+        // below still gets its shot.
+        const fallbackToContinue = i === 0 && failure.code === 'recovery_unavailable';
+        if (!isTransientError(failure) && !fallbackToContinue) {
           throw new BridgeError(
             `DeepSeek reply was interrupted and could not be resumed: ${failure.message}`,
             'recovery_failed',
@@ -930,7 +945,9 @@ export class DirectClient {
             502,
           );
         }
-        this.log(`resume attempt failed (${failure.message}); retrying...`);
+        this.log(
+          `resume attempt failed (${failure.message})${fallbackToContinue ? '; falling back to /chat/continue' : ''}; retrying...`,
+        );
       } finally {
         attempt.dispose();
       }

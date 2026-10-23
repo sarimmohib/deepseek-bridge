@@ -27,6 +27,12 @@
 - Definitive server error events (e.g. moderation) surface immediately instead
   of being retried as transient failures.
 - Retry bookkeeping releases each attempt's timers before backing off.
+- Recover interrupted replies by re-attaching to the live generation with
+  DeepSeek's `resume_stream` endpoint first (works while the message is still
+  generating), falling back to `/chat/continue` for refused or stale resumes.
+- Always send valid JSON object `arguments` in converted tool calls: malformed
+  or non-object fenced arguments are wrapped instead of passed through, fixing
+  intermittent "wrong format for a tool call" rejections in OpenCode.
 
 ## 0.5.0
 

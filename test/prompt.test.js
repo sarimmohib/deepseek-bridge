@@ -259,3 +259,36 @@ test('plain json fences accept flattened calls only for advertised tools', () =>
   assert.equal(withoutNames.calls.length, 0);
   assert.match(withoutNames.cleaned, /```json/);
 });
+
+// Regression: a fenced call whose `arguments` is not a JSON *object* used to be
+// passed through raw, so the bridge emitted native tool_calls with invalid or
+// non-object JSON on the wire. opencode's openai-compatible parser fails those
+// at finalize ("Invalid JSON input for tool call <name>") and the call bounces
+// as a format error. They must be wrapped into { value: ... } like the DSML
+// path already does, keeping `function.arguments` a valid JSON object string.
+test('non-object fenced arguments are wrapped so tool_calls stay valid JSON', () => {
+  const broken = extractToolCalls('```tool_call\n[{"name":"bash","arguments":"{command: ls}"}]\n```');
+  assert.equal(broken.calls.length, 1);
+  assert.deepEqual(broken.calls[0].arguments, { value: '{command: ls}' });
+
+  const scalar = extractToolCalls('```tool_call\n[{"name":"bash","arguments":"ls -la"}]\n```');
+  assert.deepEqual(scalar.calls[0].arguments, { value: 'ls -la' });
+
+  const array = extractToolCalls('```tool_call\n[{"name":"bash","arguments":["ls","-la"]}]\n```');
+  assert.deepEqual(array.calls[0].arguments, { value: ['ls', '-la'] });
+
+  const literalArray = extractToolCalls('```tool_call\n[{"name":"bash","arguments":{"files":["a.txt","b.txt"]}}]\n```');
+  assert.deepEqual(literalArray.calls[0].arguments, { files: ['a.txt', 'b.txt'] });
+
+  const nulled = extractToolCalls('```tool_call\n[{"name":"bash","arguments":"null"}]\n```');
+  assert.deepEqual(nulled.calls[0].arguments, { value: null });
+
+  for (const { calls } of [broken, scalar, array, nulled]) {
+    const wire = JSON.stringify(calls[0].arguments ?? {});
+    assert.doesNotThrow(() => JSON.parse(wire), `arguments must stay parseable: ${wire}`);
+    assert.equal(typeof JSON.parse(wire), 'object');
+  }
+
+  const object = extractToolCalls('```tool_call\n[{"name":"bash","arguments":{"command":"ls"}}]\n```');
+  assert.deepEqual(object.calls[0].arguments, { command: 'ls' });
+});
