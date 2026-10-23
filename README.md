@@ -29,6 +29,9 @@ mode.
 - **One-command login:** `deepseek --login` copies only `chat.deepseek.com`
   cookies and the site's `userToken` into a `0600` session file.
 - **Extension fallback:** the original same-origin extension path remains.
+- **OpenCode provider:** a ready-to-use `deepseek-bridge/*` provider config.
+- **Versioned self-update:** `deepseek version` checks GitHub, and
+  `deepseek update` fast-forwards a clean git checkout.
 - OpenAI-compatible `POST /v1/chat/completions`, streaming and non-streaming.
 - Image, file, and PDF input through OpenAI content parts.
 - Emulated tool calling, including parallel calls, in native OpenAI format.
@@ -69,6 +72,22 @@ npm install -g .
 
 This creates a global `deepseek` command. The package has no dependencies, so
 there is nothing else to download.
+
+> **For automatic updates, keep a git checkout.** `npm install -g .` copies the
+> package into npm's global directory, so `deepseek update` can only report that
+> the install is not a git checkout. Link the checkout instead if you want
+> `deepseek update` to fast-forward it automatically. A copied install is still
+> fine; pull and reinstall to update it.
+>
+> Linux/macOS:
+>
+> ```bash
+> mkdir -p "$HOME/.local/bin"
+> ln -sf "$PWD/bin/deepseek.js" "$HOME/.local/bin/deepseek"
+> ```
+>
+> Windows: `npm link` from the checkout works the same way (it creates the
+> npm shim). Make sure the chosen `bin` directory is on `PATH`.
 
 Verify:
 
@@ -272,10 +291,14 @@ Direct mode takes precedence whenever `session.json` exists.
 | `deepseek --login --manual` | Paste `userToken` from DevTools; no extension needed |
 | `deepseek --logout` | Delete the terminal session and fall back to extension mode |
 | `deepseek session` | Show stored session metadata, never the token |
+| `deepseek version` | Show the local version, commit, and GitHub `main` version |
+| `deepseek update --check` | Check GitHub without changing files |
+| `deepseek update` | Fast-forward a clean `main` git checkout and optionally restart the bridge |
 | `deepseek chat "hello"` | Send one chat message (starts the bridge if needed) |
 | `deepseek "hello"` | Shorthand for `deepseek chat "hello"` |
 | `deepseek --repl` | Interactive chat |
 | `deepseek key` | Print the API key |
+| `deepseek key --file PATH` | Write the API key to a `0600` file for another client |
 | `deepseek extension` | Print the absolute extension folder |
 | `deepseek logs` | Print the log path and the last 40 lines |
 | `deepseek help` | Show help |
@@ -285,11 +308,144 @@ Start options are passed through:
 ```bash
 deepseek start --port 9000
 deepseek serve --port 9000
+deepseek start --no-update   # skip the automatic GitHub version check
 ```
+
+`deepseek`, `deepseek start`, `deepseek serve`, and `deepseek chat` check
+GitHub before starting. The check is throttled to once every six hours and can
+be disabled with `autoUpdate: false` in the config or
+`DEEPSEEK_NO_UPDATE=1` in the environment.
 
 The bridge listens on `127.0.0.1` only. If port 8787 is busy, it picks the next
 free port and saves it in the config; update the extension popup if you use
 extension mode.
+
+## Versioning and self-update
+
+Versions follow [semantic versioning](https://semver.org/) and live in
+`package.json`; the extension manifest uses the same version. The current
+version is exposed in `/health`, `/v1/bridge/status`, the HTML status page, and
+the startup log.
+
+```bash
+deepseek version          # local + GitHub main + update status
+deepseek version --local  # no network
+deepseek version --json   # machine-readable
+deepseek update --check    # check without changing files
+deepseek update            # fast-forward main, restart a running bridge
+deepseek update --no-restart
+```
+
+The automatic check is intentionally conservative. It only updates an install
+that is:
+
+- a git checkout, not an npm copy;
+- on `main`;
+- clean (no modified or untracked files);
+- behind GitHub `origin/main`;
+- at least one semantic version behind `package.json` on `main`.
+
+It uses `git fetch origin main` and `git merge --ff-only origin/main`, so it
+never overwrites local work and never force-pushes. Failures are reported and
+leave the checkout untouched. Disable the startup check with:
+
+```bash
+deepseek start --no-update
+# or
+DEEPSEEK_NO_UPDATE=1 deepseek
+```
+
+or edit `~/.config/deepseek-bridge/config.json`:
+
+```json
+{
+  "autoUpdate": false
+}
+```
+
+A running bridge is restarted only after a successful update. The command itself
+is still the old process for that invocation; the next invocation and the
+restarted bridge use the new code.
+
+## OpenCode
+
+OpenCode V2 can use the bridge as a normal OpenAI-compatible custom provider.
+Start the bridge first, then export its key to a private file:
+
+```bash
+deepseek
+deepseek key --file ~/.config/deepseek-bridge/opencode.key
+```
+
+Add this to `~/.config/opencode/opencode.jsonc` (the file is normally mode
+`0600`; never commit the key):
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "providers": {
+    "deepseek-bridge": {
+      "name": "DeepSeek Bridge",
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "http://127.0.0.1:8787/v1",
+        "apiKey": "{file:~/.config/deepseek-bridge/opencode.key}"
+      },
+      "compatibility": {
+        "reasoningField": "reasoning_content"
+      },
+      "models": {
+        "deepseek-chat": {
+          "name": "DeepSeek V4.1 Flash (web)",
+          "capabilities": {
+            "tools": true,
+            "input": ["text", "image"],
+            "output": ["text"],
+            "reasoning": { "supported": false }
+          },
+          "limit": { "context": 890880, "output": 131072 }
+        },
+        "deepseek-reasoner": {
+          "name": "DeepSeek V4.1 Flash Reasoner (web)",
+          "capabilities": {
+            "tools": true,
+            "input": ["text", "image"],
+            "output": ["text"],
+            "reasoning": {
+              "supported": true,
+              "toggle": true,
+              "effort": ["low", "high", "max"]
+            }
+          },
+          "limit": { "context": 890880, "output": 131072 }
+        }
+      }
+    }
+  }
+}
+```
+
+The `deepseek-expert` and `deepseek-search` models use the same provider;
+add them by copying one model entry (the installed config on this machine
+already includes all four). Verify and use it:
+
+```bash
+opencode models | grep deepseek-bridge
+opencode run --model deepseek-bridge/deepseek-chat "Reply with exactly: OK"
+```
+
+Select it for an interactive session with `/models`, or make it the default for
+new sessions:
+
+```jsonc
+{
+  "model": "deepseek-bridge/deepseek-chat"
+}
+```
+
+If the bridge chose a different port because 8787 was busy, change
+`settings.baseURL` to match the URL printed by `deepseek status`. The bridge
+must be running; it is not started by OpenCode automatically.
 
 ## API
 
@@ -309,7 +465,7 @@ printed at startup and stored in the config file.
 | `DELETE` | `/v1/bridge/session` | Delete the stored terminal session |
 | `GET` | `/v1/conversations` | Cached session map |
 | `DELETE` | `/v1/conversations` | Forget cached sessions |
-| `GET` | `/health` | Liveness, mode, and extension flag (no auth) |
+| `GET` | `/health` | Liveness, version, mode, and extension flag (no auth) |
 | `GET` | `/` | HTML status page |
 
 ### curl
@@ -556,9 +712,9 @@ npm test
 ```
 
 The suite covers the PoW vector, session storage and cookie filtering,
-prompt/tool parsing, the streaming guard, and a full HTTP replay of every
-accepted tool-call format, including the failing ZCode rollout payloads and the
-empty-DSML loop.
+prompt/tool parsing, the streaming guard, semantic version comparison and the
+GitHub version fetch, and a full HTTP replay of every accepted tool-call format,
+including the failing ZCode rollout payloads and the empty-DSML loop.
 
 End-to-end harness (throwaway Chrome profile; it injects a token into
 localStorage and never touches your real profile):

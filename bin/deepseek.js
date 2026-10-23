@@ -11,16 +11,28 @@
  *   deepseek --login         copy the browser session (extension or manual)
  *   deepseek --logout        delete the terminal session
  *   deepseek session         show session metadata
+ *   deepseek version         show local and GitHub versions
+ *   deepseek update          fast-forward a git checkout
  *   deepseek key             print the API key
  *   deepseek extension       print the absolute extension folder
  *   deepseek logs            print the log path and the last lines
  */
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { loadConfig, paths } from '../src/config.js';
+import { loadConfig, paths, saveConfig } from '../src/config.js';
 import { clearSession, saveSession, sessionSummary } from '../src/session.js';
+import {
+  ROOT,
+  VERSION,
+  compareVersions,
+  fetchLatestVersion,
+  gitState,
+  readLocalVersion,
+  updateFromGit,
+} from '../src/version.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BRIDGE = path.join(HERE, 'ds-bridge.js');
@@ -30,7 +42,11 @@ const LOG = path.join(paths.CONFIG_DIR, 'bridge.log');
 
 const args = process.argv.slice(2);
 const first = args[0];
-const known = new Set(['start', 'serve', 'stop', 'status', 'chat', 'key', 'extension', 'logs', 'login', 'logout', 'session', 'help']);
+const known = new Set([
+  'start', 'serve', 'stop', 'status', 'chat', 'key', 'extension',
+  'logs', 'login', 'logout', 'session', 'version', 'update', 'help',
+]);
+const AUTO_UPDATE_INTERVAL = 6 * 60 * 60 * 1000;
 
 let command = 'start';
 let rest = args;
@@ -43,6 +59,11 @@ if (first && known.has(first)) {
 if (first === '--help' || first === '-h') command = 'help';
 if (first === '--login' || first === '-l') { command = 'login'; rest = args.slice(1); }
 if (first === '--logout') { command = 'logout'; rest = args.slice(1); }
+if (first === '--update') { command = 'update'; rest = args.slice(1); }
+if (first === '--version' || first === '-v') {
+  console.log(`deepseek-bridge ${VERSION}`);
+  process.exit(0);
+}
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const baseUrl = (port) => `http://127.0.0.1:${port}`;
@@ -199,6 +220,7 @@ function printStatus(cfg, health, started = false) {
   console.log(`
   deepseek-bridge ${started ? 'started in the background' : 'is running'}
 
+  Version     ${health?.version || readLocalVersion()}
   Base URL    http://127.0.0.1:${cfg.port}/v1
   API key     ${cfg.key}
   Mode        ${session.available ? 'direct' : health?.extension ? 'extension' : 'not ready'}
@@ -319,6 +341,207 @@ function printLogs() {
     }
   } catch {
     console.log('(no log yet)');
+  }
+}
+
+function writeKeyFile(destination) {
+  const target = path.resolve(String(destination).replace(/^~(?=$|\/)/, os.homedir()));
+  if (!target || target === os.homedir()) {
+    console.error('Usage: deepseek key --file <path>');
+    process.exit(1);
+  }
+  fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+  try {
+    fs.chmodSync(path.dirname(target), 0o700);
+  } catch {
+    /* Windows and some filesystems do not support POSIX modes. */
+  }
+  fs.writeFileSync(target, loadConfig().key, { mode: 0o600 });
+  try {
+    fs.chmodSync(target, 0o600);
+  } catch {
+    /* ignore */
+  }
+  console.log(target);
+}
+
+async function versionCommand() {
+  const check = !rest.includes('--local');
+  const asJson = rest.includes('--json');
+  const local = readLocalVersion();
+  const state = gitState();
+  const info = {
+    version: local,
+    install: ROOT,
+    commit: state.head || null,
+    branch: state.branch || null,
+    latest: null,
+    updateAvailable: false,
+    localAhead: false,
+    error: null,
+  };
+
+  if (check) {
+    try {
+      const latest = await fetchLatestVersion();
+      info.latest = latest.version;
+      info.updateAvailable = compareVersions(latest.version, local) > 0;
+      info.localAhead = compareVersions(latest.version, local) < 0;
+    } catch (err) {
+      info.error = err?.message || String(err);
+    }
+  }
+
+  if (asJson) {
+    console.log(JSON.stringify(info, null, 2));
+    return;
+  }
+
+  console.log(`deepseek-bridge ${local}`);
+  if (info.commit) console.log(`  Commit     ${info.commit} (${info.branch || '?'})`);
+  console.log(`  Install    ${info.install}`);
+  if (check) {
+    if (info.error) {
+      console.log(`  GitHub     unavailable (${info.error})`);
+    } else {
+      console.log(`  GitHub     ${info.latest}`);
+      if (info.updateAvailable) console.log('  Status     update available — run `deepseek update`');
+      else if (info.localAhead) console.log('  Status     local build is ahead of GitHub main');
+      else console.log('  Status     up to date');
+    }
+  }
+}
+
+function updateFailure(result) {
+  switch (result.status) {
+    case 'not-git':
+      return 'this install is not a git checkout; update it from a git clone or reinstall it';
+    case 'dirty':
+      return 'the git checkout has local changes; commit or stash them first';
+    case 'not-main':
+      return `the checkout is on branch ${result.state?.branch || '?'}; switch to main first`;
+    case 'fetch-failed':
+      return `could not fetch origin/main${result.message ? `: ${result.message}` : ''}`;
+    case 'merge-failed':
+      return `could not fast-forward${result.message ? `: ${result.message}` : ''}`;
+    case 'git-error':
+      return result.message || 'git is unavailable';
+    default:
+      return result.message || result.status;
+  }
+}
+
+async function updateCommand() {
+  const checkOnly = rest.includes('--check') || rest.includes('--dry-run');
+  const restart = !rest.includes('--no-restart');
+  const local = readLocalVersion();
+  let latest;
+  try {
+    latest = (await fetchLatestVersion({ timeout: 8000 })).version;
+  } catch (err) {
+    console.error(`Could not check GitHub: ${err?.message || err}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  console.log(`Installed  ${local}`);
+  console.log(`GitHub     ${latest}`);
+  let comparison;
+  try {
+    comparison = compareVersions(latest, local);
+  } catch (err) {
+    console.error(`GitHub returned an invalid version: ${err?.message || err}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (comparison === 0) {
+    console.log('Already up to date.');
+    return;
+  }
+  if (comparison < 0) {
+    console.log('The local build is ahead of GitHub main; not downgrading.');
+    return;
+  }
+  if (checkOnly) {
+    console.log('Update available. Run `deepseek update` to install it.');
+    return;
+  }
+
+  const result = updateFromGit();
+  if (result.status !== 'updated') {
+    console.error(`Update failed: ${updateFailure(result)}.`);
+    process.exitCode = 1;
+    return;
+  }
+
+  try {
+    saveConfig({ lastUpdateCheck: Date.now(), lastUpdateVersion: latest });
+  } catch {
+    /* a read-only config should not hide a successful code update */
+  }
+
+  console.log(`Updated to ${readLocalVersion()} (${result.before?.slice(0, 7)} → ${result.after?.slice(0, 7)}).`);
+
+  const cfg = loadConfig();
+  const health = await getHealth(cfg.port);
+  if (health?.ok) {
+    if (!restart) {
+      console.log('The bridge is running; restart it with `deepseek stop && deepseek`.');
+      return;
+    }
+    console.log('Restarting the bridge to load the new version...');
+    await stopBridge();
+    const { cfg: nextCfg, health: nextHealth, started } = await ensureRunning();
+    printStatus(nextCfg, nextHealth, started);
+  }
+}
+
+async function maybeAutoUpdate() {
+  if (process.env.DEEPSEEK_NO_UPDATE === '1' || process.env.DEEPSEEK_NO_UPDATE === 'true') return;
+  if (rest.includes('--no-update')) return;
+  const cfg = loadConfig();
+  if (!cfg.autoUpdate) return;
+  const now = Date.now();
+  if (now - Number(cfg.lastUpdateCheck || 0) < AUTO_UPDATE_INTERVAL) return;
+
+  let latest;
+  try {
+    latest = (await fetchLatestVersion({ timeout: 4000 })).version;
+  } catch {
+    try {
+      saveConfig({ lastUpdateCheck: now });
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
+
+  try {
+    saveConfig({ lastUpdateCheck: now, lastUpdateVersion: latest });
+  } catch {
+    /* ignore */
+  }
+
+  let comparison;
+  try {
+    comparison = compareVersions(latest, readLocalVersion());
+  } catch {
+    return;
+  }
+  if (comparison <= 0) return;
+
+  const wasRunning = Boolean((await getHealth(cfg.port))?.ok);
+  const result = updateFromGit();
+  if (result.status !== 'updated') {
+    console.log(`deepseek-bridge ${latest} is available, but auto-update could not apply it (${updateFailure(result)}).`);
+    return;
+  }
+
+  console.log(`Updated deepseek-bridge to ${latest} (${result.before?.slice(0, 7)} → ${result.after?.slice(0, 7)}).`);
+  if (wasRunning) {
+    console.log('Restarting the bridge to load the new version...');
+    await stopBridge();
+    await ensureRunning();
   }
 }
 
@@ -475,7 +698,11 @@ Usage:
   deepseek --login --manual  Paste userToken from DevTools (no extension needed)
   deepseek --logout        Delete the terminal session (fall back to extension)
   deepseek session         Show the stored terminal session
+  deepseek version         Show local and GitHub versions
+  deepseek update          Update a git checkout to GitHub main
+  deepseek update --check  Check for an update without installing it
   deepseek key             Print the API key
+  deepseek key --file PATH Write the API key to a file (for OpenCode)
   deepseek extension       Print the absolute extension folder
   deepseek logs            Print the log path and the last lines
   deepseek help            Show this help
@@ -483,6 +710,7 @@ Usage:
 Start options:
   deepseek start --port 9000
   deepseek serve --port 9000
+  deepseek start --no-update   Skip the automatic GitHub version check
 `);
 }
 
@@ -491,9 +719,11 @@ let keepAlive = false;
 if (command === 'help') {
   printHelp();
 } else if (command === 'start') {
+  await maybeAutoUpdate();
   const { cfg, health, started } = await ensureRunning(rest);
   printStatus(cfg, health, started);
 } else if (command === 'serve') {
+  await maybeAutoUpdate();
   const cfg = loadConfig();
   const health = await getHealth(cfg.port);
   if (health?.ok) {
@@ -520,12 +750,27 @@ if (command === 'help') {
   await logout();
 } else if (command === 'session') {
   printSession();
+} else if (command === 'version') {
+  await versionCommand();
+} else if (command === 'update') {
+  await updateCommand();
 } else if (command === 'chat') {
+  await maybeAutoUpdate();
   await ensureRunning();
   runForeground(CHAT, rest);
   keepAlive = true;
 } else if (command === 'key') {
-  console.log(loadConfig().key);
+  const fileIndex = rest.indexOf('--file');
+  if (fileIndex >= 0) {
+    const destination = rest[fileIndex + 1];
+    if (!destination || destination.startsWith('--')) {
+      console.error('Usage: deepseek key --file <path>');
+      process.exit(1);
+    }
+    writeKeyFile(destination);
+  } else {
+    console.log(loadConfig().key);
+  }
 } else if (command === 'extension') {
   console.log(EXTENSION);
 } else if (command === 'logs') {

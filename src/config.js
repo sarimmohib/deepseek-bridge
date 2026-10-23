@@ -35,6 +35,9 @@ export function loadConfig() {
     defaultModel: saved.defaultModel || 'deepseek-chat',
     toolMode: saved.toolMode || 'auto', // auto | off
     ...saved,
+    autoUpdate: saved.autoUpdate !== false,
+    lastUpdateCheck: Number(saved.lastUpdateCheck) || 0,
+    lastUpdateVersion: saved.lastUpdateVersion || null,
   };
   if (!saved.key) writeJSON(CONFIG_FILE, cfg);
   return cfg;

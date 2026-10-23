@@ -6,6 +6,7 @@ import { DirectClient } from './direct.js';
 import { handleChatCompletions, sendError, MODELS } from './openai.js';
 import { clearSession, loadSession, saveSession, sessionSummary } from './session.js';
 import { paths } from './config.js';
+import { VERSION } from './version.js';
 
 const MAX_BODY = 40 * 1024 * 1024;
 
@@ -71,6 +72,7 @@ export function createServer({ config, store, log = () => {} }) {
         const directSession = loadSession();
         json(res, 200, {
           ok: true,
+          version: VERSION,
           extension: agent.connected,
           direct: Boolean(directSession),
           mode: directSession ? 'direct' : agent.connected ? 'extension' : 'offline',
@@ -86,6 +88,7 @@ export function createServer({ config, store, log = () => {} }) {
 <style>body{font:14px/1.5 ui-monospace,monospace;max-width:720px;margin:40px auto;padding:0 20px;background:#0b0f14;color:#c9d1d9}
 b{color:#7ee787}.bad{color:#ff7b72}.k{color:#79c0ff}code{background:#161b22;padding:2px 6px;border-radius:4px}</style>
 <h2>deepseek-bridge</h2>
+<p>Version: <b>${VERSION}</b></p>
 <p>Mode: <b class="${mode === 'offline' ? 'bad' : ''}">${mode}</b></p>
 <p>Direct session: <b class="${session.available ? '' : 'bad'}">${session.available ? (session.user || 'signed in') : 'not configured'}</b>
 ${session.available ? ` (${session.cookies} cookies)` : ' — run <code>deepseek --login</code>'}</p>
@@ -115,6 +118,7 @@ ${session.available ? ` (${session.cookies} cookies)` : ' — run <code>deepseek
         const session = sessionSummary();
         json(res, 200, {
           ok: true,
+          version: VERSION,
           ...agent.status,
           mode: session.available ? 'direct' : agent.connected ? 'extension' : 'offline',
           direct: session,

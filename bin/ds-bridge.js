@@ -5,6 +5,7 @@ import { createServer } from '../src/server.js';
 import { loadConfig, saveConfig, Store, paths } from '../src/config.js';
 import { sessionSummary } from '../src/session.js';
 import { MODELS } from '../src/openai.js';
+import { VERSION } from '../src/version.js';
 
 const args = process.argv.slice(2);
 const flag = (name) => args.includes(name);
@@ -49,6 +50,7 @@ const store = new Store();
 store.startAutosave();
 const session = sessionSummary();
 const { server, close } = createServer({ config, store, log });
+log(`deepseek-bridge ${VERSION} starting on ${config.host}:${config.port}`);
 
 const listen = (port, attempts = 10) =>
   new Promise((resolve, reject) => {
