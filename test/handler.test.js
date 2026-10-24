@@ -641,3 +641,19 @@ test('accumulates usage deltas across continuation turns', async () => {
   assert.equal(saved.tokensOut, 60);
   assert.equal(saved.sessionTokens, 60);
 });
+
+test('pure degenerate DSML stream ends with an in-stream error instead of silence', async () => {
+  const loop = '<｜｜DSML｜｜ calls>\n' + '<｜｜DSML｜｜>\n'.repeat(6);
+  const events = await replayRequest(loop, ['Bash'], true);
+  const errorFrame = events.find((event) => event.error);
+  assert.ok(errorFrame, 'expected an error frame in the stream');
+  assert.equal(errorFrame.error.code, 'empty_reply');
+  assert.equal(events.filter((event) => event.choices?.[0]?.finish_reason).length, 0);
+});
+
+test('pure degenerate DSML non-stream returns a 502 empty_reply', async () => {
+  const loop = '<｜｜DSML｜｜ calls>\n' + '<｜｜DSML｜｜>\n'.repeat(6);
+  const body = await replayRequest(loop, ['Bash'], false);
+  assert.equal(body.error.code, 'empty_reply');
+  assert.match(body.error.message, /no usable output/);
+});

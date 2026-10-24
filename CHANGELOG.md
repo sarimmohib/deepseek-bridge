@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.1
+
+- Hardened reply integrity end to end: a `/chat/resume_stream` replay that
+  still ends WIP keeps resuming instead of returning a partial reply, a
+  recovery that confirms an empty reply falls through to the fresh-start
+  retry, and a response whose converted output is empty (degenerate DSML
+  loop with no content, reasoning, or calls) now surfaces a retriable
+  `empty_reply` error instead of a silent empty completion.
+- Attachment polish: mid-size text files over the per-attachment token
+  budget are split instead of skipped whole, and the in-prompt split note
+  names the one delivered part and states the remainder is omitted.
+- The per-request config reload no longer rotates the API key when the
+  config file goes missing or corrupt (startup config stays authoritative;
+  reloads never write).
+- Token counters survive no-usage turns, and non-numeric runner usage no
+  longer leaks into the OpenAI usage fields.
+
 ## 0.6.0
 
 - Added `deepseek ui`, a zero-dependency terminal dashboard: live panels for

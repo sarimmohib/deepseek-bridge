@@ -13,6 +13,7 @@ import {
   resolveAttachments,
   formatTurn,
 } from './prompt.js';
+import { BridgeError } from './agent.js';
 
 export const MODELS = [
   {
@@ -620,6 +621,16 @@ export async function handleChatCompletions(req, res, body, ctx) {
       }
     } else {
       content = toolCalls.cleaned;
+    }
+
+    if (!content && !reasoning && toolCalls.calls.length === 0) {
+      // Conversion can strip everything: a degenerate DSML loop or tool
+      // markup without an executable call leaves no content, no reasoning,
+      // and no calls. Delivering an empty completion makes harnesses stall
+      // silently — surface a retriable error instead (stream clients get an
+      // in-stream error event, others a 502 they can retry).
+      log(`empty completion after conversion (raw ${fullContent.length}c); failing the request`);
+      throw new BridgeError('The model returned no usable output.', 'empty_reply', 502);
     }
 
     if (toolCalls.calls.length > 0) {
