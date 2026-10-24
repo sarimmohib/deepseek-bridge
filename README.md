@@ -785,6 +785,61 @@ backoff, so short windows are absorbed invisibly; a deep window surfaces a
 clean retriable `empty_reply` 502. After a heavy burst, give the account a
 few quiet minutes (or pace the swarm) before the next sustained load.
 
+## Agent harnesses
+
+The bridge speaks plain OpenAI Chat Completions, so any harness can point at
+`http://127.0.0.1:8787/v1` with the API key (`deepseek key`) and model
+`deepseek-reasoner` / `deepseek-search`.
+
+- **DeepSeek Harness (`dsh`)** — <https://github.com/deepseek-ai/deepseek-harness>.
+  Install with `npm install -g @deepseek-ai/dsh` (allow its native-build
+  scripts), then patch `~/.dsh/profiles/web/cordis.patch.yml`:
+
+  ```yaml
+  - id: llm-pi-ai
+    config:
+      providers:
+        bridge:
+          apiKeyEnv: DEEPSEEK_BRIDGE_KEY
+          baseURL: http://127.0.0.1:8787/v1
+          api: openai-completions
+          models:
+            - id: deepseek-reasoner
+              name: DeepSeek Reasoner (bridge)
+              contextWindow: 890880
+              maxTokens: 131072
+              reasoningEfforts:
+                off:
+                low: low
+                high: high
+                max: max
+  - id: agent-default-model
+    config:
+      provider: bridge
+      model: deepseek-reasoner
+      reasoningEffort: high
+  ```
+
+  Export `DEEPSEEK_BRIDGE_KEY` in your shell profile, boot `dsh web`, and the
+  model picker shows "DeepSeek Reasoner (bridge)". Note `reasoningEfforts`
+  maps each level to the wire spelling (empty strings are rejected at
+  runtime), and the patch ids are the profile's short slugs (`llm-pi-ai`),
+  not package names.
+
+- **Hermes agent** — <https://github.com/NousResearch/hermes-agent>.
+  Install with `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash`,
+  then in `~/.hermes/config.yaml`:
+
+  ```yaml
+  model:
+    default: "deepseek-reasoner"
+    provider: "custom"
+    base_url: "http://127.0.0.1:8787/v1"
+    api_key: "<bridge key>"
+  ```
+
+  `hermes -z "prompt"` sends a one-shot message; `hermes` starts the TUI.
+
 ## How it works
 
 - **Direct session.** `deepseek --login` asks the extension for the
