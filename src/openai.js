@@ -11,6 +11,7 @@ import {
   estimateTokens,
   collectAttachments,
   resolveAttachments,
+  formatTurn,
 } from './prompt.js';
 
 export const MODELS = [
@@ -31,6 +32,115 @@ export const MODELS = [
     max_output_tokens: 131072,
   },
 ];
+
+/** Bridge-provided system presets, applied when config.systemPreset names one. */
+export const PRESET_SYSTEM_PROMPTS = {
+  coding:
+    'You are a focused coding assistant. Produce concise, correct code. Prefer complete, runnable solutions over prose. State an assumption only when it changes the outcome. No filler and no restating the question.',
+  concise:
+    'Answer as briefly as possible while staying correct and complete. No preamble, no filler, no restating the question.',
+  tutor:
+    'You are a patient tutor. Explain step by step, building from what the user likely already knows. Define terms when first used, show your reasoning, and close with a short summary or a check of understanding.',
+  agent:
+    'You are an autonomous tool-using coding agent. Be decisive: pick the most reasonable approach and act on it. State your assumptions explicitly, verify your work, and never emit partial or hypothetical tool calls — only complete, executable ones.',
+};
+
+/**
+ * Process-global upstream concurrency limiter: at most `maxUpstream` runner
+ * executions against DeepSeek at once. Extra requests queue FIFO and take the
+ * first freed slot. Release hands the slot straight to the next waiter (so the
+ * active count can never overshoot max even across microtask scheduling), and
+ * try/finally guarantees a slot is freed on both errors and aborts.
+ */
+export const bridgeQueue = { active: 0, queued: 0, max: 3 };
+const slotWaiters = [];
+
+function clampMaxUpstream(v) {
+  const n = Math.floor(Number(v));
+  if (!Number.isFinite(n)) return 3;
+  return Math.min(16, Math.max(1, n));
+}
+
+async function withUpstreamSlot(cfg, fn) {
+  bridgeQueue.max = clampMaxUpstream(cfg?.maxUpstream);
+  if (bridgeQueue.active < bridgeQueue.max) {
+    bridgeQueue.active++;
+  } else {
+    bridgeQueue.queued++;
+    try {
+      await new Promise((resolve) => slotWaiters.push(resolve));
+    } finally {
+      bridgeQueue.queued--;
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    const next = slotWaiters.shift();
+    if (next) next();
+    else bridgeQueue.active = Math.max(0, bridgeQueue.active - 1);
+  }
+}
+
+function numOr(v, dflt) {
+  return Number.isFinite(v) ? v : dflt;
+}
+
+function clampFraction(v, dflt) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return dflt;
+  return Math.min(1, n);
+}
+
+function clampPositiveInt(v, dflt) {
+  const n = Math.floor(Number(v));
+  if (!Number.isFinite(n) || n <= 0) return dflt;
+  return n;
+}
+
+/**
+ * Best-effort numeric extraction from a runner usage value. The direct runner
+ * surfaces DeepSeek's accumulated_token_usage (a session-cumulative count) as
+ * { completion: N }; tolerate both a bare number and an object carrying token
+ * fields.
+ */
+function numericTokens(v) {
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  if (v && typeof v === 'object') {
+    for (const k of ['total_tokens', 'completion_tokens', 'prompt_tokens']) {
+      const n = v[k];
+      if (typeof n === 'number' && Number.isFinite(n)) return n;
+    }
+  }
+  return null;
+}
+
+/**
+ * Cap a fresh-start transcript to the most recent window that fits maxChars,
+ * never dropping the latest user message. Returns the prompt text with a
+ * one-line elision marker prepended when older messages were dropped.
+ */
+function capTranscript(rest, maxChars) {
+  if (!rest.length) return { text: '', omitted: 0 };
+  let lastUser = -1;
+  for (let i = rest.length - 1; i >= 0; i--) {
+    if (rest[i].role === 'user') {
+      lastUser = i;
+      break;
+    }
+  }
+  if (lastUser < 0) return { text: flattenTurns(rest), omitted: 0 };
+  const lens = rest.map((m) => formatTurn(m).length);
+  const suffix = new Array(rest.length + 1).fill(0);
+  for (let i = rest.length - 1; i >= 0; i--) {
+    suffix[i] = lens[i] + (i < rest.length - 1 ? 2 + suffix[i + 1] : 0);
+  }
+  let start = 0;
+  while (start < lastUser && suffix[start] > maxChars) start++;
+  if (start === 0) return { text: flattenTurns(rest), omitted: 0 };
+  const text = `[earlier conversation omitted: ${start} messages]\n\n${flattenTurns(rest.slice(start))}`;
+  return { text, omitted: start };
+}
 
 function normalizeEffort(value) {
   if (value == null) return null;
@@ -225,14 +335,32 @@ function chunk({ id, created, model, delta, finish = null }) {
 
 export async function handleChatCompletions(req, res, body, ctx) {
   const { agent, store, log } = ctx;
+  const cfg = ctx.config || {};
 
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     return sendError(res, 400, 'messages must be a non-empty array', 'invalid_request');
   }
 
-  const requestedModel = body.model || ctx.config.defaultModel;
+  const requestedModel = body.model || cfg.defaultModel;
   const model = normalizeModelId(requestedModel);
-  const messages = normalizeMessages(body.messages);
+  let messages = normalizeMessages(body.messages);
+
+  // Bridge-provided system prompt: prepended as an extra system message so the
+  // harness's own system message is kept verbatim (ours comes first; nothing
+  // is deduped or rewritten). An explicit systemPrompt beats a preset.
+  let bridgeSystem = '';
+  const explicitSystem = typeof cfg.systemPrompt === 'string' ? cfg.systemPrompt.trim() : '';
+  const presetName = typeof cfg.systemPreset === 'string' ? cfg.systemPreset.trim() : '';
+  if (explicitSystem) {
+    bridgeSystem = explicitSystem;
+  } else if (presetName) {
+    if (Object.hasOwn(PRESET_SYSTEM_PROMPTS, presetName)) bridgeSystem = PRESET_SYSTEM_PROMPTS[presetName];
+    else log(`unknown systemPreset '${presetName}' ignored; valid presets: ${Object.keys(PRESET_SYSTEM_PROMPTS).join(', ')}`);
+  }
+  if (bridgeSystem) {
+    messages = [{ role: 'system', content: bridgeSystem, attachments: [] }, ...messages];
+  }
+
   const { system, rest } = splitMessages(messages);
   const opts = resolveModel(model, body);
 
@@ -244,17 +372,45 @@ export async function handleChatCompletions(req, res, body, ctx) {
   const hint = opts.thinking && opts.effortExplicit ? effortHint(opts.effort) : '';
 
   const key = conversationKey(messages, model);
-  const prev = store.getConversation(key);
+  let prev = store.getConversation(key);
   const digest = transcriptDigest(rest);
 
+  // Context-limit switching: once a stored session has consumed roughly its
+  // share of the model's context window, abandon it and replay from scratch.
+  // `sessionTokens` is the runner-reported cumulative count when available;
+  // otherwise fall back to completion tokens sent so far plus a rough estimate
+  // of the upcoming prompt (~4 chars per token — heuristic, not exact).
+  const contextWindow = MODELS.find((m) => m.id === model)?.context_window || 890880;
+  const contextSwitchAt = clampFraction(cfg.contextSwitchAt, 0.8);
+  if (prev) {
+    const threshold = contextSwitchAt * contextWindow;
+    const estPromptTokens = Math.ceil(
+      (system.map((m) => m.content).join('\n\n').length + flattenTurns(rest).length) / 4,
+    ); // rough estimate
+    const used = Number.isFinite(prev.sessionTokens)
+      ? prev.sessionTokens
+      : Number.isFinite(prev.tokensOut)
+        ? prev.tokensOut + estPromptTokens
+        : null;
+    if (used != null && used >= threshold) {
+      store.deleteConversation?.(key);
+      log(`context limit reached (${used}/${Math.round(threshold)} tokens); starting a fresh session`);
+      prev = null;
+    }
+  }
+
+  const maxFreshTranscriptChars = clampPositiveInt(cfg.maxFreshTranscriptChars, 200_000);
   const fullPlan = () => {
     const head = [system.map((m) => m.content).join('\n\n'), preamble, hint].filter(Boolean).join('\n\n');
-    const transcript = flattenTurns(rest);
+    // Fresh starts replay the entire transcript; cap it to the most recent
+    // window that fits so the prompt stays bounded. Bookkeeping (digest, turns)
+    // still covers the full transcript, so later continuations keep working.
+    const transcript = capTranscript(rest, maxFreshTranscriptChars);
     return {
       continuation: false,
       sessionId: null,
       parentMessageId: null,
-      prompt: head ? `${head}\n\n${transcript}` : transcript,
+      prompt: head ? `${head}\n\n${transcript.text}` : transcript.text,
       baseTurns: 0,
     };
   };
@@ -364,31 +520,34 @@ export async function handleChatCompletions(req, res, body, ctx) {
   try {
     let activePlan = plan;
     const runPlan = (currentPlan) =>
-      runner.run(
-        {
-          prompt: currentPlan.prompt,
-          continuation: currentPlan.continuation,
-          sessionId: currentPlan.sessionId,
-          parentMessageId: currentPlan.parentMessageId,
-          modelType: opts.modelType,
-          thinking: opts.thinking,
-          search: opts.search,
-          attachments: attachments.map(({ name, mime, dataBase64 }) => ({ name, mime, dataBase64 })),
-          debug: body.debug === true,
-          requestId: id,
-        },
-        {
-          onReady: (msg) => {
-            if (msg.sessionId) sessionId = msg.sessionId;
-            if (msg.messageId) messageId = msg.messageId;
+      // Hold one of the process-global upstream slots for the whole runner
+      // execution; excess concurrent requests queue FIFO until a slot frees.
+      withUpstreamSlot(cfg, () =>
+        runner.run(
+          {
+            prompt: currentPlan.prompt,
+            continuation: currentPlan.continuation,
+            sessionId: currentPlan.sessionId,
+            parentMessageId: currentPlan.parentMessageId,
+            modelType: opts.modelType,
+            thinking: opts.thinking,
+            search: opts.search,
+            attachments: attachments.map(({ name, mime, dataBase64 }) => ({ name, mime, dataBase64 })),
+            debug: body.debug === true,
+            requestId: id,
           },
-          onDelta: (msg) => {
-            if (msg.kind === 'reasoning') emitReasoning(msg.text);
-            else emitContent(msg.text);
+          {
+            onReady: (msg) => {
+              if (msg.sessionId) sessionId = msg.sessionId;
+              if (msg.messageId) messageId = msg.messageId;
+            },
+            onDelta: (msg) => {
+              if (msg.kind === 'reasoning') emitReasoning(msg.text);
+              else emitContent(msg.text);
+            },
           },
-        },
-        { signal: controller.signal },
-      );
+          { signal: controller.signal },
+        ));
 
     let result;
     try {
@@ -477,23 +636,55 @@ export async function handleChatCompletions(req, res, body, ctx) {
       }
     }
 
-    if (sessionId && messageId) {
-      store.setConversation(key, {
-        sessionId,
-        parentId: messageId,
-        turns: rest.length,
-        digest,
-        model,
-      });
-    }
-
     const promptTokens = estimateTokens(plan.prompt);
-    const completionTokens = usage?.completion || Math.max(1, Math.round((content.length + reasoning.length) / 3.6));
+    const runnerCompletion = numericTokens(usage?.completion);
+    const completionTokens =
+      runnerCompletion ?? Math.max(1, Math.round((content.length + reasoning.length) / 3.6));
     const usageOut = {
       prompt_tokens: promptTokens,
       completion_tokens: completionTokens,
       total_tokens: promptTokens + completionTokens,
     };
+
+    if (sessionId && messageId) {
+      // Token accounting is cumulative per conversation and only advances when
+      // the runner reported usage for the turn; a turn without usage carries
+      // the previous counters forward. Counter carry-over only happens on a
+      // true continuation — a fresh session starts from zero.
+      const carried = plan.continuation ? prev : null;
+      const entry = {
+        sessionId,
+        parentId: messageId,
+        turns: rest.length,
+        digest,
+        model,
+      };
+      const firstUser = rest.find((m) => m.role === 'user');
+      if (firstUser) entry.preview = String(firstUser.content || '').slice(0, 80);
+      if (usage) {
+        const runnerCumulative = numericTokens(usage.completion);
+        const prevSession = numOr(carried?.sessionTokens, 0);
+        entry.tokensIn = numOr(carried?.tokensIn, 0) + promptTokens;
+        if (runnerCumulative != null) {
+          // Session-true cumulative count reported by the runner: store it
+          // directly and grow tokensOut by the per-turn delta so a cumulative
+          // counter is never double-counted as per-turn output.
+          entry.sessionTokens = runnerCumulative;
+          entry.tokensOut = numOr(carried?.tokensOut, 0) + Math.max(0, runnerCumulative - prevSession);
+        } else {
+          // No cumulative count available: estimate the session total.
+          entry.sessionTokens = prevSession + usageOut.total_tokens;
+          entry.tokensOut = numOr(carried?.tokensOut, 0) + completionTokens;
+        }
+      } else {
+        // No usage this turn (recovered or extension-mode turn): carry the
+        // previous counters forward instead of resetting them.
+        entry.tokensIn = numOr(carried?.tokensIn, 0);
+        entry.tokensOut = numOr(carried?.tokensOut, 0);
+        if (carried?.sessionTokens != null) entry.sessionTokens = carried.sessionTokens;
+      }
+      store.setConversation(key, entry);
+    }
 
     if (stream) {
       sse(res, chunk({ id, created, model, delta: {}, finish }));

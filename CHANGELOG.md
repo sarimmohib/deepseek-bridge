@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.6.0
+
+- Added `deepseek ui`, a zero-dependency terminal dashboard: live panels for
+  models, conversations (turns, token counts, preview), bridge health
+  (upstream active/queued/max), and the bridge log tail. Keyboard-driven
+  (1-4/Tab move focus, `r` refresh, `q` quit); when stdin is not a TTY it
+  renders one static frame and exits.
+- Added `deepseek models` and `deepseek models --info`: the model table plus
+  pasteable harness configuration — an OpenCode provider JSON block mirroring
+  the working `opencode.jsonc` entry, and a generic `OPENAI_BASE_URL` /
+  `OPENAI_API_KEY` env block with a shell export form.
+- Conversation management: per-conversation token accounting (session tokens
+  from DeepSeek's accumulated usage) exposed via a new auth-gated
+  `GET /v1/bridge/conversations`. When a conversation crosses `contextSwitchAt`
+  (default 0.8 of the model context window) the bridge starts a fresh session
+  automatically. Fresh-session transcripts are capped at
+  `maxFreshTranscriptChars` (default 200000) with an elision marker instead of
+  failing on huge histories.
+- Upstream concurrency limiting for agent swarms: `maxUpstream` (default 3)
+  caps simultaneous DeepSeek requests; extras queue FIFO.
+  `upstream: {active, queued, max}` now appears in `/health` and
+  `/v1/bridge/status`.
+- Bridge-provided system prompts: `systemPrompt` (exact text) or `systemPreset`
+  (one of `coding`/`concise`/`tutor`/`agent`) is prepended to each request's
+  system messages. The config is re-read per request, so edits apply on the
+  next request without restarting the bridge.
+- Attachment overhaul: DeepSeek ingests text files into the model context
+  (~0.55 tokens/byte measured; 1.55 MB ≈ 695k tokens ingested fully; ~2.7 MB ≈
+  1.2M tokens overflows the 890,880-token window and breaks the turn).
+  Oversized text files are now split into ~636 KB context-budgeted parts
+  (350k tokens each) instead of dropped; a per-attachment context ceiling of
+  500k tokens keeps totals sane and drops the remainder with clear notes.
+  Binary/image handling is unchanged (10 MB per file, 20 MB total caps).
+- Reply-integrity hardening: a stream that ends while the message status is
+  still WIP is treated as interrupted and resumed via `/chat/resume_stream`;
+  a clean stream that carries zero content and reasoning is retried as a
+  transient failure (`empty_reply`) instead of returning a silent empty
+  completion. Uploads referenced while DeepSeek still shows them PENDING
+  trigger one transparent fresh retry (or a clean 504 `file_not_ready` if text
+  was already streamed), and consecutive uploads get a 750 ms settle gap.
+
 ## 0.5.1
 
 - Retry transient DeepSeek failures instead of ending a reply midway: network

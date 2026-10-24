@@ -6,6 +6,9 @@
  *   deepseek serve           run in the foreground
  *   deepseek stop            stop the background process
  *   deepseek status          show bridge/extension status
+ *   deepseek ui              full-screen dashboard (models/conversations/health/log)
+ *   deepseek models          one line per model
+ *   deepseek models --info   model details + pasteable harness config snippets
  *   deepseek chat "hello"    send a chat message
  *   deepseek "hello"         shorthand for chat
  *   deepseek --login         copy the browser session (extension or manual)
@@ -23,6 +26,14 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, paths, saveConfig } from '../src/config.js';
+import { MODELS } from '../src/openai.js';
+import {
+  modelDetailLines,
+  modelSummaryLines,
+  openaiEnvSnippet,
+  opencodeProviderSnippet,
+  runTui,
+} from '../src/tui.js';
 import { clearSession, loadSession, saveSession, sessionSummary } from '../src/session.js';
 import {
   ROOT,
@@ -45,6 +56,7 @@ const first = args[0];
 const known = new Set([
   'start', 'serve', 'stop', 'status', 'chat', 'key', 'extension',
   'logs', 'login', 'logout', 'session', 'version', 'update', 'help',
+  'ui', 'models',
 ]);
 const AUTO_UPDATE_INTERVAL = 6 * 60 * 60 * 1000;
 
@@ -422,6 +434,47 @@ function printLogs() {
     }
   } catch {
     console.log('(no log yet)');
+  }
+}
+
+function modelsCommand() {
+  const cfg = loadConfig();
+  if (!rest.includes('--info')) {
+    for (const line of modelSummaryLines({
+      models: MODELS,
+      defaultModel: cfg.defaultModel,
+      width: process.stdout.columns || 100,
+    })) {
+      console.log(line);
+    }
+    return;
+  }
+
+  console.log(`deepseek-bridge models  (default: ${cfg.defaultModel})`);
+  console.log(`Base URL   http://127.0.0.1:${cfg.port}/v1`);
+  console.log(`API key    ${cfg.key}`);
+  console.log('');
+  for (const model of MODELS) {
+    for (const line of modelDetailLines(model, { isDefault: model.id === cfg.defaultModel })) {
+      console.log(line);
+    }
+    console.log('');
+  }
+
+  console.log('OpenCode provider snippet (paste under "providers" in ~/.config/opencode/opencode.jsonc):');
+  console.log(opencodeProviderSnippet({ models: MODELS, port: cfg.port }));
+  console.log('');
+  console.log('Generic OpenAI-compatible env (JSON):');
+  const envJson = openaiEnvSnippet({ apiKey: cfg.key, port: cfg.port, model: cfg.defaultModel });
+  console.log(envJson);
+  console.log('');
+  try {
+    console.log('Shell export form:');
+    for (const [name, value] of Object.entries(JSON.parse(envJson))) {
+      console.log(`  export ${name}=${value}`);
+    }
+  } catch {
+    /* the snippet builder always emits valid JSON */
   }
 }
 
@@ -819,6 +872,9 @@ Usage:
   deepseek serve           Run the bridge in the foreground
   deepseek stop            Stop the background bridge
   deepseek status          Show the bridge and extension status
+  deepseek ui              Full-screen dashboard (models, conversations, health, log)
+  deepseek models          One line per model
+  deepseek models --info   Model details + pasteable OpenCode/OpenAI config snippets
   deepseek chat "hello"    Send a chat message (starts the bridge if needed)
   deepseek "hello"         Shorthand for deepseek chat "hello"
   deepseek --login         Copy the chat.deepseek.com session from Chrome once
@@ -903,6 +959,10 @@ if (command === 'help') {
   }
 } else if (command === 'extension') {
   console.log(EXTENSION);
+} else if (command === 'ui') {
+  await runTui();
+} else if (command === 'models') {
+  modelsCommand();
 } else if (command === 'logs') {
   printLogs();
 } else {

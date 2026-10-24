@@ -310,6 +310,9 @@ Direct mode takes precedence whenever `session.json` exists.
 | `deepseek key --file PATH` | Write the API key to a `0600` file for another client |
 | `deepseek extension` | Print the absolute extension folder |
 | `deepseek logs` | Print the log path and the last 40 lines |
+| `deepseek ui` | Full-screen terminal dashboard: models, conversations, health, log tail |
+| `deepseek models` | One line per advertised model |
+| `deepseek models --info` | Model details plus pasteable OpenCode/OpenAI harness config |
 | `deepseek help` | Show help |
 
 Start options are passed through:
@@ -328,6 +331,28 @@ be disabled with `autoUpdate: false` in the config or
 The bridge listens on `127.0.0.1` only. If port 8787 is busy, it picks the next
 free port and saves it in the config; update the extension popup if you use
 extension mode.
+
+## Terminal UI
+
+```bash
+deepseek ui
+```
+
+A zero-dependency, full-screen dashboard for the running bridge. Four live
+panels:
+
+- `[1] MODELS` — the advertised models with context/output limits, the default
+  one marked.
+- `[2] CONVERSATIONS` — cached conversations with model, turns, input/output
+  and session token counts, age, and a preview of the latest turn.
+- `[3] HEALTH` — bridge up/down, port, mode, direct-session age, and the
+  upstream queue (`active/queued/max`).
+- `[4] LOG` — the tail of `bridge.log`.
+
+Keys: `1`-`4` or `Tab` move the focus ring, `r` refreshes immediately (the
+panels also poll on their own), `q` or `Ctrl+C` quits. When stdin is not a TTY
+(CI, pipes), the command renders one static frame with no focus highlight and
+exits.
 
 ## Versioning and self-update
 
@@ -371,6 +396,21 @@ or edit `~/.config/deepseek-bridge/config.json`:
   "autoUpdate": false
 }
 ```
+
+The config file holds the keys below. Every key is optional, and the bridge
+re-reads the file per request, so edits apply on the next request without a
+restart.
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `autoUpdate` | `true` | Automatic GitHub version check on start/chat/serve |
+| `defaultModel` | `deepseek-reasoner` | Model used when a request omits `model` |
+| `toolMode` | `auto` | Set `"off"` to disable tool-call emulation |
+| `contextSwitchAt` | `0.8` | Fraction of the model context window after which a conversation restarts fresh |
+| `maxFreshTranscriptChars` | `200000` | Cap for transcripts replayed into a fresh session |
+| `maxUpstream` | `3` | Maximum simultaneous DeepSeek requests; extras queue FIFO |
+| `systemPrompt` | empty | Bridge-provided system prompt, prepended to every request |
+| `systemPreset` | empty | Named preset instead of `systemPrompt`: `coding`, `concise`, `tutor`, `agent` |
 
 A running bridge is restarted only after a successful update. The command itself
 is still the old process for that invocation; the next invocation and the
@@ -472,6 +512,7 @@ printed at startup and stored in the config file.
 | `POST` | `/v1/bridge/session/export` | Ask Chrome for a fresh session (used by `--login`) |
 | `POST` | `/v1/bridge/session/verify` | Verify the stored session with a small authenticated call |
 | `DELETE` | `/v1/bridge/session` | Delete the stored terminal session |
+| `GET` | `/v1/bridge/conversations` | Cached conversations with token counts and previews |
 | `GET` | `/v1/conversations` | Cached session map |
 | `DELETE` | `/v1/conversations` | Forget cached sessions |
 | `GET` | `/health` | Liveness, version, mode, and extension flag (no auth) |
@@ -535,8 +576,10 @@ loop.
 
 The web app currently serves **DeepSeek-V4.1-Flash**, a multimodal MoE with a
 552B backbone, a 1,048,576-token model context, and continuous reasoning effort.
-The web session reports an **890,880-token** history/file budget and up to
-**100 MB per uploaded file**. The bridge exposes two stable IDs:
+The web session reports an **890,880-token** history/file budget. The bridge
+caps uploads at **10 MB per file / 20 MB total** and budgets text files against
+that context window (see [Images, files, and PDFs](#images-files-and-pdfs)).
+The bridge exposes two stable IDs:
 
 | Model | Site mode |
 | --- | --- |
@@ -557,6 +600,46 @@ always sends `search_enabled: true`. For compatibility, legacy IDs
 > `reasoning_effort: "none"` is accepted but does not disable reasoning in this
 > reasoning-only build. Real numeric effort control requires the official
 > DeepSeek API, not the web session.
+
+#### Model information
+
+```bash
+deepseek models          # one line per model
+deepseek models --info   # details plus pasteable harness configuration
+```
+
+`--info` prints each model's description and limits, then ready-to-paste
+configuration: an OpenCode provider JSON block that mirrors the working entry
+from the [OpenCode](#opencode) section, and a generic OpenAI-compatible env
+block for any other client. The output has this shape:
+
+```text
+deepseek-bridge models  (default: deepseek-reasoner)
+Base URL   http://127.0.0.1:8787/v1
+API key    sk-ds-...
+
+* deepseek-reasoner  (default)
+    description        DeepSeek V4.1 Flash (web Reasoner), reasoning enabled, ...
+    context_window     890,880
+    max_output_tokens  131,072
+
+OpenCode provider snippet (paste under "providers" in ~/.config/opencode/opencode.jsonc):
+{
+  "deepseek-bridge": {
+    "name": "DeepSeek Bridge",
+    "package": "@opencode/ai/providers/openai-compatible",
+    "settings": { "baseURL": "http://127.0.0.1:8787/v1", ... },
+    "models": { "deepseek-reasoner": { ... }, "deepseek-search": { ... } }
+  }
+}
+
+Generic OpenAI-compatible env (JSON):
+{
+  "OPENAI_BASE_URL": "http://127.0.0.1:8787/v1",
+  "OPENAI_API_KEY": "sk-ds-...",
+  "OPENAI_MODEL": "deepseek-reasoner"
+}
+```
 
 ### Images, files, and PDFs
 
@@ -581,6 +664,18 @@ the same upload path. Images can be added on a later turn; the file ids are
 attached to that turn of the reused DeepSeek session. A failed image fetch is
 logged and skipped rather than failing the whole request.
 
+**Text files are context-budgeted.** DeepSeek ingests attached text into the
+model context at roughly 0.55 tokens per byte (measured: 1.55 MB ≈ 695k tokens
+ingested fully; ~2.7 MB ≈ 1.2M tokens overflows the 890,880-token window and
+breaks the turn). A text file whose estimate exceeds 500k tokens is therefore
+not uploaded as-is: files above the per-file byte cap are split into ~636 KB
+parts (≈350k tokens each, named `name.part01ofNN.ext`), and only the leading
+parts that fit the 500k-token per-attachment budget are sent — the remainder is
+dropped with an explicit note in the prompt instead of failing the request.
+Text files that fit the byte cap but not the token budget are skipped with the
+same kind of note. Images and binary files are exempt; they keep the plain
+10 MB per file / 20 MB total caps.
+
 ### Multi-turn conversations
 
 The bridge keys a session on `(model, system prompt, first user message)`,
@@ -589,6 +684,39 @@ stores the DeepSeek `chat_session_id` and last assistant message id in
 turns, continues that session with only the new tail as `parent_message_id`.
 Keep sending the full transcript, like any OpenAI client does.
 `DELETE /v1/conversations` starts fresh everywhere.
+
+Continuation is digest-verified: the bridge hashes the turns it believes the
+DeepSeek session already holds and only reuses the session when the hash
+matches, so an edited or divergent transcript starts fresh instead of making
+the model answer its own echo.
+
+**Context-limit switching.** Each conversation tracks session tokens from
+DeepSeek's accumulated usage (with a rough fallback estimate). When the count
+passes `contextSwitchAt` — a fraction of the model's context window, default
+`0.8` (≈712k of the 890,880 tokens) — the bridge abandons the stored session
+and the next request starts a fresh one automatically instead of failing
+mid-window. Fresh starts replay the transcript capped at
+`maxFreshTranscriptChars` (default `200000`), keeping the most recent turns and
+prepending an `[earlier conversation omitted: N messages]` marker for the rest,
+so huge histories elide instead of failing.
+
+`GET /v1/bridge/conversations` lists the cached conversations with model,
+turns, input/output/session token counts, a preview, and the upstream queue
+state (same auth as the other bridge endpoints).
+
+### System prompts
+
+The bridge can prepend its own system message to every request. Two keys in
+`~/.config/deepseek-bridge/config.json`:
+
+- `"systemPrompt": "..."` — exact text, sent verbatim.
+- `"systemPreset"` — one of `coding`, `concise`, `tutor`, or `agent`.
+
+An explicit `systemPrompt` wins over a `systemPreset`; an unknown preset name
+is ignored with a one-line log. The bridge message is prepended as an extra
+system message: the harness's own system message is kept verbatim, nothing is
+deduped or rewritten. The config file is re-read per request, so edits apply on
+the next request without restarting the bridge.
 
 ### Tool calling
 
@@ -637,6 +765,19 @@ ZCode → **Model settings** → **Add provider**, then:
 Tool calls work through the emulation above (parallel calls supported), and
 multi-turn agent loops reuse the same DeepSeek session. In direct mode you no
 longer need a signed-in tab; in extension mode keep one open.
+
+### Agent swarms
+
+Multiple harness agents can share one bridge. Each conversation key
+(model + system prompt + first user message) is distinct, so concurrent agents
+get independent DeepSeek conversations automatically — no per-agent setup.
+
+Set `"maxUpstream"` in the config (default `3`, clamped to 1-16) to cap how
+many requests hit DeepSeek at the same time; extras queue FIFO and take the
+first freed slot. This protects the single web session from parallel-swarm
+rate limits without serializing every request. The queue is observable:
+`/health` and `/v1/bridge/status` report `upstream: {active, queued, max}`,
+and `deepseek ui` shows the same counts in its health panel.
 
 ## How it works
 
@@ -767,8 +908,9 @@ because the previous worker does not know that message.
   but they are not isolated accounts.
 - The session file is a credential. Treat it like a browser cookie export.
 - Image/file attachments are supported through the web upload endpoint, with a
-  bridge cap of 10 MB per file and 20 MB total per request. The site itself
-  allows larger files.
+  bridge cap of 10 MB per file and 20 MB total per request. Text files are
+  additionally budgeted against the model context window; see
+  [Images, files, and PDFs](#images-files-and-pdfs).
 - The tool-call protocol is an adapter convention, not a native web-chat
   feature. Native DSML output is parsed as a fallback, and parallel calls are
   returned in one turn.

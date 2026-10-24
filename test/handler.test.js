@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { handleChatCompletions } from '../src/openai.js';
-import { normalizeMessages, splitMessages, transcriptDigest } from '../src/prompt.js';
+import { handleChatCompletions, PRESET_SYSTEM_PROMPTS, bridgeQueue } from '../src/openai.js';
+import { normalizeMessages, splitMessages, transcriptDigest, conversationKey } from '../src/prompt.js';
 
 const failingRollout = JSON.parse(
   fs.readFileSync(new URL('./fixtures/failing-rollout.json', import.meta.url), 'utf8'),
@@ -293,4 +293,351 @@ test('resolves earlier-turn attachments when restarting from a fresh session', a
   assert.equal(calls, 2);
   assert.equal(body.choices[0].message.content, 'AFTER_RESET');
   assert.equal(body.choices[0].finish_reason, 'stop');
+});
+
+test('starts a fresh session when accumulated tokens exceed the context threshold', async () => {
+  const res = new FakeResponse();
+  const messages = [
+    { role: 'user', content: 'first question' },
+    { role: 'assistant', content: 'first answer' },
+    { role: 'user', content: 'second question' },
+  ];
+  const normalized = normalizeMessages(messages);
+  const { rest } = splitMessages(normalized);
+  const key = conversationKey(normalized, 'deepseek-reasoner');
+  // Digest matches the stored prefix, so without the context switch this
+  // request would have continued the saved session.
+  const history = transcriptDigest(rest.slice(0, 1));
+  const events = [];
+  let saved = null;
+  const store = {
+    getConversation: () => ({
+      sessionId: 'sess_old',
+      parentId: 2,
+      turns: 1,
+      digest: history,
+      model: 'deepseek-reasoner',
+      tokensOut: 900000,
+    }),
+    setConversation: (_key, value) => {
+      saved = value;
+    },
+    deleteConversation: (k) => events.push(['delete', k]),
+  };
+  let sawContinuation = null;
+  const agent = {
+    async run(request, handlers) {
+      sawContinuation = request.continuation;
+      assert.equal(request.continuation, false);
+      assert.match(request.prompt, /USER:\nfirst question/);
+      assert.match(request.prompt, /USER:\nsecond question/);
+      handlers.onReady({ sessionId: 'sess_new', messageId: 3 });
+      handlers.onDelta({ kind: 'content', text: 'FRESH' });
+      return { usage: { completion: 10 }, finish: 'stop', sessionId: 'sess_new', messageId: 3 };
+    },
+  };
+
+  await handleChatCompletions(
+    {},
+    res,
+    { model: 'deepseek-reasoner', messages, stream: false },
+    {
+      agent,
+      store,
+      log: (m) => events.push(['log', m]),
+      config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto', contextSwitchAt: 0.8 },
+    },
+  );
+
+  const body = JSON.parse(res.chunks.join(''));
+  assert.equal(sawContinuation, false);
+  assert.ok(events.some(([kind, k]) => kind === 'delete' && k === key), 'stored conversation was deleted');
+  assert.ok(
+    events.some(([kind, m]) => kind === 'log' && /context limit reached \(\d+\/712704 tokens\); starting a fresh session/.test(m)),
+    `context-limit log line missing: ${JSON.stringify(events)}`,
+  );
+  assert.equal(body.choices[0].message.content, 'FRESH');
+  assert.equal(saved.sessionId, 'sess_new');
+  assert.equal(saved.turns, 3);
+});
+
+test('caps a fresh transcript with an elision marker when it exceeds maxFreshTranscriptChars', async () => {
+  const res = new FakeResponse();
+  const filler = 'x'.repeat(400);
+  const messages = [
+    { role: 'user', content: `OLD1 ${filler}` },
+    { role: 'assistant', content: `OLD2 ${filler}` },
+    { role: 'user', content: `OLD3 ${filler}` },
+    { role: 'assistant', content: `OLD4 ${filler}` },
+    { role: 'user', content: 'LATEST_QUESTION' },
+  ];
+  let prompt = '';
+  const agent = {
+    async run(request, handlers) {
+      prompt = request.prompt;
+      assert.equal(request.continuation, false);
+      handlers.onReady({ sessionId: 'sess_cap', messageId: 1 });
+      handlers.onDelta({ kind: 'content', text: 'ok' });
+      return { usage: null, finish: 'stop', sessionId: 'sess_cap', messageId: 1 };
+    },
+  };
+  const store = { getConversation: () => null, setConversation: () => {} };
+
+  await handleChatCompletions(
+    {},
+    res,
+    { model: 'deepseek-reasoner', messages, stream: false },
+    {
+      agent,
+      store,
+      log: () => {},
+      config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto', maxFreshTranscriptChars: 700 },
+    },
+  );
+
+  // 700 chars fit the last three turns (439 chars) but not four (852), so the
+  // three oldest messages are dropped and the recent window is kept.
+  assert.equal(
+    prompt,
+    `[earlier conversation omitted: 3 messages]\n\nASSISTANT:\nOLD4 ${filler}\n\nUSER:\nLATEST_QUESTION`,
+  );
+  assert.ok(!prompt.includes('OLD1'));
+  const body = JSON.parse(res.chunks.join(''));
+  assert.equal(body.choices[0].message.content, 'ok');
+});
+
+test('leaves short transcripts uncapped on a fresh start', async () => {
+  const res = new FakeResponse();
+  let prompt = '';
+  const agent = {
+    async run(request, handlers) {
+      prompt = request.prompt;
+      handlers.onReady({ sessionId: 'sess_small', messageId: 1 });
+      handlers.onDelta({ kind: 'content', text: 'ok' });
+      return { usage: null, finish: 'stop', sessionId: 'sess_small', messageId: 1 };
+    },
+  };
+  const store = { getConversation: () => null, setConversation: () => {} };
+  await handleChatCompletions(
+    {},
+    res,
+    { model: 'deepseek-reasoner', messages: [{ role: 'user', content: 'tiny' }], stream: false },
+    { agent, store, log: () => {}, config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto', maxFreshTranscriptChars: 10 } },
+  );
+  assert.equal(prompt, 'USER:\ntiny');
+});
+
+test('prepends the preset bridge system prompt before the harness system message', async () => {
+  const res = new FakeResponse();
+  let prompt = '';
+  const agent = {
+    async run(request, handlers) {
+      prompt = request.prompt;
+      handlers.onReady({ sessionId: 'sess_sys', messageId: 1 });
+      handlers.onDelta({ kind: 'content', text: 'ok' });
+      return { usage: null, finish: 'stop', sessionId: 'sess_sys', messageId: 1 };
+    },
+  };
+  const store = { getConversation: () => null, setConversation: () => {} };
+  await handleChatCompletions(
+    {},
+    res,
+    {
+      model: 'deepseek-reasoner',
+      messages: [
+        { role: 'system', content: 'HARNESS_SYS' },
+        { role: 'user', content: 'hi' },
+      ],
+      stream: false,
+    },
+    { agent, store, log: () => {}, config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto', systemPreset: 'coding' } },
+  );
+  assert.equal(prompt, `${PRESET_SYSTEM_PROMPTS.coding}\n\nHARNESS_SYS\n\nUSER:\nhi`);
+});
+
+test('explicit systemPrompt wins over systemPreset', async () => {
+  const res = new FakeResponse();
+  let prompt = '';
+  const agent = {
+    async run(request, handlers) {
+      prompt = request.prompt;
+      handlers.onReady({ sessionId: 'sess_sys', messageId: 1 });
+      handlers.onDelta({ kind: 'content', text: 'ok' });
+      return { usage: null, finish: 'stop', sessionId: 'sess_sys', messageId: 1 };
+    },
+  };
+  const store = { getConversation: () => null, setConversation: () => {} };
+  await handleChatCompletions(
+    {},
+    res,
+    {
+      model: 'deepseek-reasoner',
+      messages: [
+        { role: 'system', content: 'HARNESS_SYS' },
+        { role: 'user', content: 'hi' },
+      ],
+      stream: false,
+    },
+    {
+      agent,
+      store,
+      log: () => {},
+      config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto', systemPrompt: 'BRIDGE_EXPLICIT', systemPreset: 'concise' },
+    },
+  );
+  assert.ok(prompt.startsWith('BRIDGE_EXPLICIT\n\nHARNESS_SYS\n\nUSER:\nhi'));
+  assert.ok(!prompt.includes(PRESET_SYSTEM_PROMPTS.concise));
+});
+
+test('unknown systemPreset is ignored with a one-line log', async () => {
+  const res = new FakeResponse();
+  const logs = [];
+  let prompt = '';
+  const agent = {
+    async run(request, handlers) {
+      prompt = request.prompt;
+      handlers.onReady({ sessionId: 'sess_sys', messageId: 1 });
+      handlers.onDelta({ kind: 'content', text: 'ok' });
+      return { usage: null, finish: 'stop', sessionId: 'sess_sys', messageId: 1 };
+    },
+  };
+  const store = { getConversation: () => null, setConversation: () => {} };
+  await handleChatCompletions(
+    {},
+    res,
+    {
+      model: 'deepseek-reasoner',
+      messages: [
+        { role: 'system', content: 'HARNESS_SYS' },
+        { role: 'user', content: 'hi' },
+      ],
+      stream: false,
+    },
+    { agent, store, log: (m) => logs.push(m), config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto', systemPreset: 'bogus' } },
+  );
+  assert.equal(prompt, 'HARNESS_SYS\n\nUSER:\nhi');
+  assert.equal(logs.filter((m) => /unknown systemPreset/.test(m)).length, 1);
+});
+
+test('queues upstream execution beyond maxUpstream and never exceeds it', async () => {
+  let activeNow = 0;
+  let maxSeen = 0;
+  let completed = 0;
+  const agent = {
+    async run(_request, handlers) {
+      activeNow++;
+      maxSeen = Math.max(maxSeen, activeNow);
+      handlers.onReady({ sessionId: 'sess_cc', messageId: 1 });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      handlers.onDelta({ kind: 'content', text: 'ok' });
+      activeNow--;
+      completed++;
+      return { usage: null, finish: 'stop', sessionId: 'sess_cc', messageId: 1 };
+    },
+  };
+  const store = { getConversation: () => null, setConversation: () => {} };
+  const requests = [];
+  for (let i = 0; i < 6; i++) {
+    const res = new FakeResponse();
+    requests.push(
+      handleChatCompletions(
+        {},
+        res,
+        { model: 'deepseek-reasoner', messages: [{ role: 'user', content: `q${i}` }], stream: false },
+        { agent, store, log: () => {}, config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto', maxUpstream: 2 } },
+      ).then(() => res),
+    );
+  }
+  const responses = await Promise.all(requests);
+
+  assert.equal(completed, 6);
+  assert.ok(maxSeen <= 2, `overlapping executions reached ${maxSeen}`);
+  assert.equal(maxSeen, 2, 'expected the limiter to actually admit 2 at once');
+  assert.equal(bridgeQueue.active, 0);
+  assert.equal(bridgeQueue.queued, 0);
+  for (const res of responses) {
+    const body = JSON.parse(res.chunks.join(''));
+    assert.equal(body.choices[0].message.content, 'ok');
+    assert.equal(body.choices[0].finish_reason, 'stop');
+  }
+});
+
+test('accumulates usage into the store after a successful turn', async () => {
+  const res = new FakeResponse();
+  let saved = null;
+  const store = {
+    getConversation: () => null,
+    setConversation: (_key, value) => {
+      saved = value;
+    },
+  };
+  const agent = {
+    async run(request, handlers) {
+      assert.equal(request.continuation, false);
+      handlers.onReady({ sessionId: 'sess_tok', messageId: 9 });
+      handlers.onDelta({ kind: 'content', text: 'reply' });
+      return { usage: { completion: 42 }, finish: 'stop', sessionId: 'sess_tok', messageId: 9 };
+    },
+  };
+  await handleChatCompletions(
+    {},
+    res,
+    { model: 'deepseek-reasoner', messages: [{ role: 'user', content: 'count me' }], stream: false },
+    { agent, store, log: () => {}, config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto' } },
+  );
+  const body = JSON.parse(res.chunks.join(''));
+  assert.ok(saved, 'conversation entry was stored');
+  assert.equal(saved.tokensOut, 42);
+  assert.equal(saved.tokensIn, body.usage.prompt_tokens);
+  assert.ok(saved.tokensIn > 0);
+  assert.equal(saved.sessionTokens, 42);
+  assert.equal(saved.preview, 'count me');
+});
+
+test('accumulates usage deltas across continuation turns', async () => {
+  const res = new FakeResponse();
+  const messages = [
+    { role: 'user', content: 'q1' },
+    { role: 'assistant', content: 'a1' },
+    { role: 'user', content: 'q2' },
+  ];
+  const normalized = normalizeMessages(messages);
+  const { rest } = splitMessages(normalized);
+  const history = transcriptDigest(rest.slice(0, 2));
+  let saved = null;
+  const store = {
+    getConversation: () => ({
+      sessionId: 'sess_cont',
+      parentId: 2,
+      turns: 2,
+      digest: history,
+      model: 'deepseek-reasoner',
+      tokensIn: 10,
+      tokensOut: 42,
+      sessionTokens: 42,
+    }),
+    setConversation: (_key, value) => {
+      saved = value;
+    },
+  };
+  const agent = {
+    async run(request, handlers) {
+      assert.equal(request.continuation, true);
+      handlers.onReady({ sessionId: 'sess_cont', messageId: 3 });
+      handlers.onDelta({ kind: 'content', text: 'second reply' });
+      // 60 is the runner-reported session-cumulative count: the turn delta is 18.
+      return { usage: { completion: 60 }, finish: 'stop', sessionId: 'sess_cont', messageId: 3 };
+    },
+  };
+  await handleChatCompletions(
+    {},
+    res,
+    { model: 'deepseek-reasoner', messages, stream: false },
+    { agent, store, log: () => {}, config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto' } },
+  );
+  const body = JSON.parse(res.chunks.join(''));
+  assert.ok(saved, 'conversation entry was stored');
+  assert.equal(saved.tokensIn, 10 + body.usage.prompt_tokens);
+  assert.equal(saved.tokensOut, 60);
+  assert.equal(saved.sessionTokens, 60);
 });

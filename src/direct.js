@@ -69,7 +69,13 @@ function isTransientError(err) {
     code === 'stream_stalled' ||
     code === 'server_busy' ||
     code === 'invalid_pow' ||
-    code === 'continue_locked'
+    code === 'continue_locked' ||
+    // Retriable like a transient failure, but capped at one attempt overall by
+    // run()'s fileRetryUsed flag so a permanently stuck file cannot loop.
+    code === 'file_not_ready' ||
+    // Retried by the start loop only while nothing reached the client; a
+    // persistently empty model surfaces after MAX_START_ATTEMPTS.
+    code === 'empty_reply'
   ) {
     return true;
   }
@@ -218,6 +224,85 @@ function applyFullMessage(message, emit) {
 }
 
 /* ----------------------------------------------------------- sse parser --- */
+
+function normalizeStatus(value) {
+  // Exact matches first: the hot path never pays for toUpperCase().
+  if (value === 'FINISHED' || value === 'WIP') return value;
+  if (typeof value !== 'string') return null;
+  const upper = value.toUpperCase();
+  if (upper === 'FINISHED') return 'FINISHED';
+  if (upper === 'WIP') return 'WIP';
+  return null;
+}
+
+/**
+ * Lifecycle status carried by an SSE event, if any: 'FINISHED', 'WIP', or
+ * null when the event says nothing about it. Accepted shapes (live captures):
+ *   - snapshots: {v:{response:{status|quasi_status:'...'}}} (usually with
+ *     fragments), {v:{status:'...'}} when v is the response itself, and
+ *     {v:{response:{...}}} reached through a patch value;
+ *   - JSON patches: {p:'response/status'|'response/quasi_status',o:'SET',v:'...'}
+ *     (the leaf segment decides, so deeper/shorter paths work too);
+ *   - BATCH patches whose sub-patches carry any of the shapes above.
+ * O(1)-ish per event: property reads and a leaf-segment check; BATCH only
+ * scans that one event's small sub-patch list. Unknown status strings map to
+ * null so run() keeps today's behavior for flows this does not recognize.
+ */
+function extractStatus(data) {
+  if (!data || typeof data !== 'object') return null;
+  if (data.o === 'BATCH' && Array.isArray(data.v)) {
+    let found = null;
+    for (const sub of data.v) {
+      const seen = extractStatus(sub);
+      if (seen) found = seen;
+    }
+    return found;
+  }
+  if (typeof data.p === 'string') {
+    const leaf = data.p.slice(data.p.lastIndexOf('/') + 1);
+    if (leaf === 'status' || leaf === 'quasi_status') return normalizeStatus(data.v);
+    // SET of a whole sub-object (e.g. p:'response') may carry the status.
+    return data.v && typeof data.v === 'object' ? extractStatus({ v: data.v }) : null;
+  }
+  const v = data.v;
+  const response = v && typeof v === 'object' ? v.response ?? v : data.response;
+  if (!response || typeof response !== 'object') return null;
+  return normalizeStatus(response.status ?? response.quasi_status);
+}
+
+/* File lifecycle objects embedded in SSE frames (live shape: the completion's
+ * user-message snapshot carries each referenced file as
+ * {"id":"file-...","status":"SUCCESS|PENDING|ERROR|FAILED","file_name":...}). */
+
+const FILE_SCAN_MAX_DEPTH = 6;
+const FILE_SCAN_MAX_NODES = 256;
+
+/**
+ * Collect file objects from one SSE frame into `into` (id -> {status, name}).
+ * The walk accepts a file object at any depth but is capped by depth and a
+ * per-frame node budget, so even a large replay snapshot stays O(small);
+ * frames are JSON.parse output, so cycles are impossible.
+ */
+function collectFileStatus(data, into) {
+  if (!data || typeof data !== 'object') return;
+  let budget = FILE_SCAN_MAX_NODES;
+  const walk = (node, depth) => {
+    if (budget <= 0 || depth > FILE_SCAN_MAX_DEPTH) return;
+    if (node == null || typeof node !== 'object') return;
+    budget--;
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item, depth + 1);
+      return;
+    }
+    const id = node.id;
+    if (typeof id === 'string' && id.startsWith('file-') && typeof node.status === 'string') {
+      into[id] = { status: node.status, name: typeof node.file_name === 'string' ? node.file_name : null };
+      return; // a file object is a leaf for this purpose
+    }
+    for (const key of Object.keys(node)) walk(node[key], depth + 1);
+  };
+  walk(data, 0);
+}
 
 function createAccumulator(emit) {
   const state = { response: null, lastPath: null };
@@ -754,8 +839,25 @@ export class DirectClient {
     let messageId = null;
     let title = null;
     let usage = null;
+    let status = null;
     let terminal = false;
+    // Files referenced by this completion, as observed in embedded user-message
+    // snapshot frames: id -> {status, name}. run()'s readiness gate reads this
+    // to catch uploads that were still being ingested when the reply fired.
+    const fileStatus = {};
     const acc = createAccumulator(onDelta);
+    // A close/finish marker alone does not prove the reply is complete: the
+    // message object also carries a lifecycle status that reaches 'FINISHED'
+    // only once DeepSeek is done writing. Remember the strongest status seen;
+    // run() treats "closed while still WIP" like any other truncation.
+    const observeStatus = (data) => {
+      const seen = extractStatus(data);
+      if (!seen) return;
+      // 'FINISHED' is terminal: a later replayed WIP snapshot must not
+      // downgrade an already-finished message back to interrupted.
+      if (seen === 'FINISHED' || status !== 'FINISHED') status = seen;
+    };
+    const observeFiles = (data) => collectFileStatus(data, fileStatus);
     const handler = sseHandler({
       debugLines,
       onEvent(name, data) {
@@ -778,7 +880,11 @@ export class DirectClient {
         }
         if (name === 'finish') {
           terminal = true;
-          if (data && (data.v !== undefined || data.p !== undefined)) acc.applyMessage(data);
+          if (data && (data.v !== undefined || data.p !== undefined)) {
+            observeStatus(data);
+            acc.applyMessage(data);
+            observeFiles(data);
+          }
           return;
         }
         if (name === 'error') {
@@ -786,6 +892,8 @@ export class DirectClient {
           throw new BridgeError(detail, 'stream_error', 502);
         }
         acc.applyMessage(data);
+        observeStatus(data);
+        observeFiles(data);
         const response = acc.state.response;
         if (response?.accumulated_token_usage) {
           usage = { completion: response.accumulated_token_usage };
@@ -826,13 +934,20 @@ export class DirectClient {
       if (debugLines) debugLines.push(`body ${bytes} bytes; tail=${JSON.stringify(buffer.slice(-160))}`);
     }
 
+    if (debugLines && Object.keys(fileStatus).length) {
+      debugLines.push(
+        `files: ${Object.entries(fileStatus)
+          .map(([id, info]) => `${id}=${info.status}`)
+          .join(', ')}`,
+      );
+    }
     if (signal?.aborted) {
       throw signal.reason || new BridgeError('DeepSeek stream was interrupted.', 'stream_interrupted', 502);
     }
     if (!terminal) {
       throw new BridgeError('DeepSeek stream ended before the completion marker.', 'stream_interrupted', 502);
     }
-    return { messageId, title, usage };
+    return { messageId, title, usage, status, fileStatus };
   }
 
   async readRecoveryResponse(res, { collected, attempt, debugLines }) {
@@ -912,6 +1027,18 @@ export class DirectClient {
         }
         const outcome = await this.readRecoveryResponse(res, { collected, attempt, debugLines });
         this.emitMissing(emitted, collected, emit);
+        if (outcome.status === 'WIP') {
+          // The replay ended while the message was still generating — same
+          // failure class as the primary-stream WIP gate. emitMissing already
+          // kept the recovered suffix (and stays idempotent when the catch
+          // calls it again); the transient handling below tries the next
+          // endpoint instead of returning a partial reply as complete.
+          throw new BridgeError(
+            'DeepSeek stream closed while the reply was still generating.',
+            'stream_interrupted',
+            502,
+          );
+        }
         if (outcome.usage) usage = outcome.usage;
         if (outcome.title) title = outcome.title;
         if (outcome.messageId != null) messageId = outcome.messageId;
@@ -990,7 +1117,9 @@ export class DirectClient {
         }));
 
       const fileIds = [];
-      for (const att of payload.attachments || []) {
+      const attachments = payload.attachments || [];
+      for (let i = 0; i < attachments.length; i++) {
+        const att = attachments[i];
         const t0 = Date.now();
         const fileId = await this.withTransientRetry((attemptSignal) => this.uploadAttachment(att, attemptSignal), {
           signal,
@@ -1004,6 +1133,10 @@ export class DirectClient {
             `upload ${att.name || 'file'} ${att.mime || '?'} ${Math.round((((att.dataBase64 || '').length * 0.75) / 1024))}k -> ${fileId} ${Date.now() - t0}ms`,
           );
         }
+        // DeepSeek ingests uploads asynchronously; back-to-back uploads raced
+        // and left later files PENDING at completion time. Give every upload
+        // except the last a short settle gap before the next one starts.
+        if (i < attachments.length - 1) await sleep(750, signal);
       }
 
       handlers.onReady?.({ sessionId });
@@ -1012,6 +1145,8 @@ export class DirectClient {
       let title = null;
       let usage = null;
       let startFailures = 0;
+      // One transparent file_not_ready retry, ever (see the failure handler).
+      let fileRetryUsed = false;
 
       for (;;) {
         if (signal?.aborted) throw cancelledError();
@@ -1051,6 +1186,45 @@ export class DirectClient {
           if (stream.messageId != null) messageId = stream.messageId;
           if (stream.title) title = stream.title;
           if (stream.usage) usage = stream.usage;
+          if (stream.status === 'WIP') {
+            // The server sent its terminal marker while the message was still
+            // generating. Same failure class as a truncation: recovery replays
+            // the message and finishes it instead of returning a partial
+            // reply as complete. Flows that never send a status (status null)
+            // and finished streams keep today's success behavior.
+            throw new BridgeError(
+              'DeepSeek stream closed while the reply was still generating.',
+              'stream_interrupted',
+              502,
+            );
+          }
+          // Readiness gate: a file referenced while DeepSeek was still ingesting
+          // it produced answers that silently ignored the file (observed live:
+          // the model cannot read a PENDING file, even minutes later). Only
+          // files the stream actually reported as not-ready gate here; files
+          // the stream never mentioned keep today's behavior.
+          const fileStatus = stream.fileStatus || {};
+          const notReady = fileIds.filter((id) => {
+            const fileState = fileStatus[id]?.status;
+            return fileState === 'PENDING' || fileState === 'ERROR' || fileState === 'FAILED';
+          });
+          if (notReady.length) {
+            const names = notReady.map((id) => fileStatus[id]?.name || id).join(', ');
+            const err = new BridgeError(
+              `DeepSeek had not finished processing ${names} when the reply was generated.`,
+              'file_not_ready',
+              504,
+            );
+            err.fileNames = names;
+            throw err;
+          }
+          if (!emitted.content && !emitted.reasoning) {
+            // Live-observed failure mode: a clean stream (close, sometimes
+            // FINISHED) whose message contains zero fragments. Useless as a
+            // reply and transient in practice — throw while nothing has
+            // reached the client so the start-retry loop below reruns it.
+            throw new BridgeError('DeepSeek returned an empty reply.', 'empty_reply', 502);
+          }
           return { sessionId, messageId, usage, title, finish: 'stop', debugLines };
         } catch (err) {
           failure = normalizeAttemptError(err, attempt, signal);
@@ -1060,13 +1234,57 @@ export class DirectClient {
 
         if (failure.code === 'cancelled' || failure.code === 'timeout') throw failure;
 
+        // file_not_ready: one of our uploads was still being ingested when the
+        // reply was generated. Two deliberate tradeoffs:
+        //  - Retry as a FRESH completion, never via recover()/continue: a
+        //    continue would append a second answer to a turn that already
+        //    ignored the file, while a fresh start re-references the files in
+        //    a new message, which have had time to ingest by now.
+        //  - A retried completion re-streams the full answer, so a transparent
+        //    retry is only safe before anything was emitted. Once text is on
+        //    the wire the error is surfaced to the client instead (504) —
+        //    openai.js passes status/code through unchanged — and the client
+        //    retries the whole request. fileRetryUsed caps this at one retry
+        //    so a permanently stuck file cannot loop.
+        if (failure.code === 'file_not_ready') {
+          if (fileRetryUsed || emitted.content || emitted.reasoning) throw failure;
+          fileRetryUsed = true;
+          this.log(`file ${failure.fileNames || 'attachment'} was still processing; retrying...`);
+          await sleep(this.nextRetryDelay(startFailures, failure.retryAfter), signal);
+          startFailures++;
+          continue;
+        }
+
         const canRecover =
           messageId != null &&
           failure.code !== 'invalid_parent' &&
           failure.code !== 'not_signed_in' &&
-          failure.code !== 'invalid_pow';
+          failure.code !== 'invalid_pow' &&
+          // Unreachable for file_not_ready (handled above), kept explicit so
+          // the fresh-retry-vs-recover rule survives future reordering.
+          failure.code !== 'file_not_ready' &&
+          // An empty reply must be retried as a fresh completion, not
+          // continued: the dangling message has nothing to resume.
+          failure.code !== 'empty_reply';
         if (canRecover) {
-          return this.recover({ sessionId, messageId, emit, emitted, signal, deadline, debugLines, cause: failure });
+          const recovered = await this.recover({
+            sessionId,
+            messageId,
+            emit,
+            emitted,
+            signal,
+            deadline,
+            debugLines,
+            cause: failure,
+          });
+          if (emitted.content || emitted.reasoning) return recovered;
+          // Recovery confirmed the reply is empty. Fall through to the same
+          // fresh-start retry a clean empty stream gets, instead of failing
+          // the client on the first try.
+          messageId = recovered.messageId ?? messageId;
+          if (recovered.usage) usage = recovered.usage;
+          if (recovered.title) title = recovered.title;
+          failure = new BridgeError('DeepSeek returned an empty reply.', 'empty_reply', 502);
         }
 
         if (emitted.content || emitted.reasoning) throw failure;

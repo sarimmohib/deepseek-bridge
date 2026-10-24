@@ -57,6 +57,178 @@ function sanitizeName(name, mime, index) {
   return out;
 }
 
+/* --- oversized text splitting -------------------------------------------- */
+
+// Files above MAX_ATTACHMENT_BYTES are dropped — unless they are text-like, in
+// which case resolveAttachments splits them into context-budgeted parts (see
+// splitOversizedText) instead of silently losing the content. Text-like files
+// that fit the byte caps but exceed MAX_ATTACHMENT_TOKENS take the same split
+// path — the model context budget is the tighter ceiling for text — and only
+// the leading context-budgeted part(s) of a split file are delivered. See the
+// split trigger in resolveAttachments.
+const TEXT_EXTS = new Set([
+  'txt', 'md', 'json', 'csv', 'log', 'xml', 'yaml', 'yml', 'js', 'ts', 'py',
+  'rs', 'go', 'c', 'h', 'cpp', 'sh', 'toml', 'ini', 'sql', 'html', 'css',
+]);
+const TEXT_MIMES = new Set([
+  'application/json', 'application/xml', 'application/javascript',
+  'application/x-javascript', 'application/ecmascript', 'application/typescript',
+  'application/x-typescript', 'application/yaml', 'application/x-yaml',
+  'application/toml', 'application/x-sh', 'application/x-python', 'application/sql',
+  'application/ndjson', 'application/x-ndjson',
+]);
+const BINARY_MIME_PREFIXES = ['image/', 'audio/', 'video/'];
+const BINARY_MIMES = new Set([
+  'application/pdf', 'application/zip', 'application/x-zip-compressed',
+  'application/gzip', 'application/x-gzip', 'application/x-tar',
+  'application/x-7z-compressed', 'application/x-rar-compressed',
+  'application/java-archive', 'application/wasm',
+]);
+// DeepSeek ingests attached text files directly into the model context.
+// Measured live: 1.55 MB of plain text = 694,999 tokens (ingested fully, the
+// model verified the content); ~2.7 MB = 1,198,999 tokens, which OVERFLOWS
+// the model's 890,880-token context window and returns an empty/broken
+// completion. Empirical rate ≈ 0.45–0.55 tokens per byte for plain text, so
+// budget with the pessimistic end.
+export const TEXT_TOKENS_PER_BYTE = 0.55;
+// ~56% of the 890,880-token context window; the measured 1.2M-token file
+// broke the turn outright.
+export const MAX_ATTACHMENT_TOKENS = 500000;
+// One split part ≈ 40% of the 890,880-token context, so a part plus the
+// surrounding conversation still fits.
+export const SPLIT_PART_TOKENS = 350000;
+export const SPLIT_PART_BYTES = Math.floor(SPLIT_PART_TOKENS / TEXT_TOKENS_PER_BYTE); // ≈ 636 KB
+const TEXT_PROBE_BYTES = 1024 * 1024;
+
+function isTextMime(mime) {
+  return Boolean(mime) && (mime.startsWith('text/') || TEXT_MIMES.has(mime) || /(?:\+xml|\+json)$/.test(mime));
+}
+
+function isBinaryMime(mime) {
+  return Boolean(mime) && (BINARY_MIME_PREFIXES.some((p) => mime.startsWith(p)) || BINARY_MIMES.has(mime));
+}
+
+/** Cheap deterministic UTF-8 sanity check: replacement-char ratio of a
+ * bounded prefix. Random binary decodes with many U+FFFD; text does not. */
+function looksLikeUtf8Text(buf) {
+  if (!buf?.length) return false;
+  const sample = buf.subarray(0, TEXT_PROBE_BYTES).toString('utf8');
+  let bad = 0;
+  for (let i = 0; i < sample.length; i++) if (sample.charCodeAt(i) === 0xfffd) bad++;
+  return bad / Math.max(1, sample.length) < 0.01;
+}
+
+function isTextLike(name, mime, buf) {
+  if (isBinaryMime(mime)) return false;
+  const ext = String(name || '').toLowerCase().match(/\.([a-z0-9]{1,8})$/)?.[1] || '';
+  if (TEXT_EXTS.has(ext) || isTextMime(mime)) return true;
+  if (sniffMime(buf)) return false; // known binary magic wins over the byte probe
+  return looksLikeUtf8Text(buf);
+}
+
+/** Offsets that cut `buf` into pieces of at most `target` bytes, preferring
+ * line boundaries and never splitting a UTF-8 code point. */
+function textSplitOffsets(buf, target) {
+  const ends = [];
+  let start = 0;
+  while (start < buf.length) {
+    let end = Math.min(start + target, buf.length);
+    if (end < buf.length) {
+      const nl = buf.lastIndexOf(0x0a, end - 1);
+      if (nl > start) {
+        end = nl + 1; // keep the newline with the line it terminates
+      } else {
+        // No line boundary in the window: cut between code points. A valid
+        // cut position is never a continuation byte (10xxxxxx).
+        while (end > start && (buf[end] & 0xc0) === 0x80) end--;
+        if (end <= start) end = Math.min(start + target, buf.length);
+      }
+    }
+    ends.push(end);
+    start = end;
+  }
+  return ends;
+}
+
+/**
+ * Split one text-like file into parts that each stay under the per-attachment
+ * byte limit and carry ≈ SPLIT_PART_TOKENS tokens of model context (see the
+ * measurements above the constants). Parts are named
+ * `<base>.part01ofNN.<ext>` so they sort in upload order and describe
+ * themselves; concatenating the part buffers restores the original bytes
+ * exactly. The caller decides when splitting applies — the per-file byte cap
+ * or the model context budget in resolveAttachments — so any non-empty
+ * text-like buffer is splittable here. Returns [] when the file is not
+ * splittable text (caller keeps the plain skip behaviour).
+ */
+export function splitOversizedText(name, mime, buf) {
+  if (!Buffer.isBuffer(buf) || !buf.length) return [];
+  if (!isTextLike(name, mime || '', buf)) return [];
+  const raw = String(name || '').trim();
+  const clean = sanitizeName(raw || 'file.txt', mime || 'text/plain', 0);
+  const dot = clean.lastIndexOf('.');
+  const stem = (dot > 0 ? clean.slice(0, dot) : clean).slice(0, 90) || 'file';
+  const ext = dot > 0 ? clean.slice(dot + 1) : MIME_EXT[(mime || '').toLowerCase()] || 'txt';
+  const ends = textSplitOffsets(buf, SPLIT_PART_BYTES);
+  const width = Math.max(2, String(ends.length).length);
+  const pad = (v) => String(v).padStart(width, '0');
+  return ends.map((end, i) => ({
+    name: `${stem}.part${pad(i + 1)}of${pad(ends.length)}.${ext}`,
+    mime: (mime || 'text/plain').toLowerCase(),
+    data: buf.subarray(i === 0 ? 0 : ends[i - 1], end),
+  }));
+}
+
+/** Decoded byte length of a data URL, without building the full buffer. */
+function dataUrlByteLength(url) {
+  const comma = url.indexOf(',');
+  if (comma < 0) return 0;
+  const payload = url.slice(comma + 1);
+  if (/;base64/i.test(url.slice(0, comma))) {
+    let pad = 0;
+    while (pad < payload.length && payload[payload.length - 1 - pad] === '=') pad++;
+    return Math.max(0, Math.floor(((payload.length - pad) * 3) / 4));
+  }
+  let text = payload;
+  try {
+    text = decodeURIComponent(payload);
+  } catch {
+    /* keep the raw payload */
+  }
+  return Buffer.byteLength(text, 'utf8');
+}
+
+/** Visible note for text files that resolveAttachments will split into
+ * context-budgeted parts — whether they bust the per-file byte cap or only the
+ * model context budget. Same bracketed style as the other in-prompt file
+ * annotations. The per-attachment-set budget keeps only the leading
+ * ~SPLIT_PART_BYTES part (two such parts together exceed
+ * MAX_ATTACHMENT_TOKENS), so the note names that one delivered part and says
+ * the remainder is omitted instead of promising the full part count. The count
+ * (NN) is a cheap approximation derived from the data URL length; the
+ * splitter's line-boundary cuts may shift it by one. */
+function oversizedSplitNote(name, mime, url) {
+  const lowerMime = (mime || '').toLowerCase();
+  if (isBinaryMime(lowerMime)) return null;
+  const ext = String(name || '').toLowerCase().match(/\.([a-z0-9]{1,8})$/)?.[1] || '';
+  if (!TEXT_EXTS.has(ext) && !isTextMime(lowerMime)) return null;
+  const bytes = dataUrlByteLength(url);
+  const tokens = Math.round(bytes * TEXT_TOKENS_PER_BYTE);
+  // Mirror the resolve-side split trigger: per-file byte cap or context budget.
+  if (bytes <= MAX_ATTACHMENT_BYTES && tokens <= MAX_ATTACHMENT_TOKENS) return null;
+  const parts = Math.ceil(bytes / SPLIT_PART_BYTES);
+  const nn = String(parts).padStart(Math.max(2, String(parts).length), '0');
+  const kb = Math.round(SPLIT_PART_BYTES / 1000);
+  if (!name) {
+    return `[a file exceeds the model context budget: only the first part (~${kb} KB) can be attached; the rest of the file is omitted]`;
+  }
+  const base = String(name).split(/[\\/]/).pop() || 'file';
+  const dot = base.lastIndexOf('.');
+  const stem = dot > 0 ? base.slice(0, dot) : base;
+  const extOut = dot > 0 ? base.slice(dot + 1) : 'txt';
+  return `[file ${base} exceeds the model context budget: only the first part (${stem}.part01of${nn}.${extOut}, ~${kb} KB) can be attached; the rest of the file is omitted]`;
+}
+
 function parseDataUrl(url) {
   const m = /^data:([^;,]*)(;base64)?,([\s\S]*)$/.exec(url || '');
   if (!m) throw new Error('invalid data URL');
@@ -115,6 +287,8 @@ function contentParts(content) {
       if (typeof data === 'string' && data) {
         const urlValue = data.startsWith('data:') ? data : `data:${mime || 'application/octet-stream'};base64,${data}`;
         attachments.push({ kind: 'file', url: urlValue, name, mime });
+        const splitNote = oversizedSplitNote(name, mime, urlValue);
+        if (splitNote) texts.push(splitNote);
       } else if (typeof url === 'string' && url) {
         attachments.push({ kind: 'file', url, name, mime });
       } else if (file.file_id) {
@@ -232,6 +406,12 @@ export function collectAttachments(messages) {
  * Turn the URLs/data URLs collected from OpenAI content parts into uploadable
  * bytes. Remote URLs are fetched by the bridge (http/https only) with a hard
  * byte cap; data URLs are decoded locally. Duplicate bytes are sent once.
+ * Text-like files over the per-file byte cap or over the model context budget
+ * are split into uploadable parts instead of being dropped; parts share the
+ * attachment count and total byte budgets. The model context budget is the
+ * true ceiling: only the leading parts of one split file whose combined
+ * tokens fit MAX_ATTACHMENT_TOKENS are delivered — with the current constants
+ * that is exactly the first ~636 KB part, and the remainder is omitted.
  */
 export async function resolveAttachments(attachments, { log = () => {} } = {}) {
   const out = [];
@@ -267,12 +447,85 @@ export async function resolveAttachments(attachments, { log = () => {} } = {}) {
     }
 
     if (!buf?.length) continue;
-    if (buf.length > MAX_ATTACHMENT_BYTES) {
-      log(`attachment skipped (${att.name || 'file'}): ${buf.length} bytes > ${MAX_ATTACHMENT_BYTES}`);
+
+    // Context-budget handling, ahead of every byte/count budget below: DeepSeek
+    // ingests attached text into the model context, so a text-like upload
+    // whose estimated tokens exceed MAX_ATTACHMENT_TOKENS breaks the turn
+    // (measured: a 1.2M-token file came back as an empty completion). Images
+    // and binary mimes are exempt — they route through the vision pipeline,
+    // not text ingestion. Text-like files over the token budget, like files
+    // over the per-file byte cap, are split below instead of being dropped
+    // whole; the per-attachment-SET budget then caps the combined tokens of
+    // the parts, so only the leading context-budgeted head is delivered.
+    const textLike = att.kind !== 'image' && isTextLike(att.name, (mime || '').toLowerCase(), buf);
+    const estTokens = Math.round(buf.length * TEXT_TOKENS_PER_BYTE);
+    const overTokenBudget = textLike && estTokens > MAX_ATTACHMENT_TOKENS;
+
+    if (buf.length > MAX_ATTACHMENT_BYTES || overTokenBudget) {
+      // Text-like files are split into uploadable parts instead of being
+      // dropped; binary files (and image parts) keep the plain skip below.
+      const parts = att.kind === 'image' ? [] : splitOversizedText(att.name, mime, buf);
+      if (!parts.length) {
+        log(
+          buf.length > MAX_ATTACHMENT_BYTES
+            ? `attachment skipped (${att.name || 'file'}): ${buf.length} bytes > ${MAX_ATTACHMENT_BYTES}`
+            : `attachment skipped (${att.name || 'file'}): ~${estTokens} tokens exceeds the model context budget; file is not splittable text`,
+        );
+        continue;
+      }
+      const origName = att.name || 'file';
+      const trigger =
+        buf.length > MAX_ATTACHMENT_BYTES
+          ? `${buf.length} bytes > ${MAX_ATTACHMENT_BYTES}`
+          : `~${estTokens} tokens exceeds the model context budget`;
+      log(`attachment split (${origName}): ${trigger}; splitting into ${parts.length} context-budgeted parts`);
+
+      // Per-attachment-SET context budget: each part fits (~SPLIT_PART_TOKENS
+      // tokens), but the combined parts of one big file do not. Keep only the
+      // leading parts that fit within MAX_ATTACHMENT_TOKENS.
+      let kept = 0;
+      let keptTokens = 0;
+      while (kept < parts.length) {
+        const partTokens = parts[kept].data.length * TEXT_TOKENS_PER_BYTE;
+        if (keptTokens + partTokens > MAX_ATTACHMENT_TOKENS) break;
+        keptTokens += partTokens;
+        kept++;
+      }
+      if (kept < parts.length) {
+        const wholeTokens = Math.round(buf.length * TEXT_TOKENS_PER_BYTE);
+        log(
+          `attachment skipped (${parts[kept].name}): ~${wholeTokens} tokens exceeds the model context budget; remainder of ${origName} dropped (context budget)`,
+        );
+      }
+      for (const part of parts.slice(0, kept)) {
+        if (out.length >= MAX_ATTACHMENTS) {
+          log(`attachment skipped (${part.name}): attachment limit of ${MAX_ATTACHMENTS} reached; remainder of ${origName} dropped`);
+          break;
+        }
+        if (total + part.data.length > MAX_TOTAL_ATTACHMENT_BYTES) {
+          log(`attachment skipped (${part.name}): total attachment budget exceeded; remainder of ${origName} dropped`);
+          break;
+        }
+        const partHash = sha256(part.data);
+        if (seen.has(partHash)) continue;
+        seen.add(partHash);
+        total += part.data.length;
+        out.push({
+          kind: 'file',
+          name: part.name,
+          mime: part.mime,
+          bytes: part.data.length,
+          dataBase64: part.data.toString('base64'),
+        });
+      }
       continue;
     }
     if (total + buf.length > MAX_TOTAL_ATTACHMENT_BYTES) {
       log(`attachment skipped (${att.name || 'file'}): total attachment budget exceeded`);
+      continue;
+    }
+    if (out.length >= MAX_ATTACHMENTS) {
+      log(`attachment skipped (${att.name || 'file'}): attachment limit of ${MAX_ATTACHMENTS} reached`);
       continue;
     }
 

@@ -1,11 +1,12 @@
+import fs from 'node:fs';
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { attachWebSocket, WsConnection } from './ws.js';
 import { Agent, BridgeError } from './agent.js';
 import { DirectClient } from './direct.js';
-import { handleChatCompletions, sendError, MODELS } from './openai.js';
+import { handleChatCompletions, sendError, MODELS, bridgeQueue } from './openai.js';
 import { clearSession, loadSession, saveSession, sessionSummary } from './session.js';
-import { paths } from './config.js';
+import { loadConfig, paths } from './config.js';
 import { VERSION } from './version.js';
 
 const MAX_BODY = 40 * 1024 * 1024;
@@ -62,6 +63,19 @@ export function createServer({ config, store, log = () => {} }) {
       return;
     }
 
+    // Re-read config per request so edits (model default, system prompt,
+    // context-switch threshold, key rotation) apply without a restart. Only
+    // trust a config we could fully parse — a missing or corrupt file must
+    // not rotate the API key out from under connected clients, so the
+    // startup object stays as the fallback. persist:false avoids a write
+    // storm when the file predates the current defaults.
+    try {
+      JSON.parse(fs.readFileSync(paths.CONFIG_FILE, 'utf8'));
+      config = loadConfig({ persist: false });
+    } catch {
+      // keep the startup config
+    }
+
     const authHeader = req.headers.authorization || '';
     const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
     const provided = bearer || req.headers['x-api-key'] || url.searchParams.get('key') || '';
@@ -76,6 +90,7 @@ export function createServer({ config, store, log = () => {} }) {
           extension: agent.connected,
           direct: Boolean(directSession),
           mode: directSession ? 'direct' : agent.connected ? 'extension' : 'offline',
+          upstream: { active: bridgeQueue.active, queued: bridgeQueue.queued, max: bridgeQueue.max },
         });
         return;
       }
@@ -135,6 +150,7 @@ ${session.available ? ` (${session.cookies} cookies)` : ' — run <code>deepseek
             reasoningEffort: 'hint-only',
             contextWindow: 890880,
           },
+          upstream: { active: bridgeQueue.active, queued: bridgeQueue.queued, max: bridgeQueue.max },
         });
         return;
       }
@@ -195,6 +211,30 @@ ${session.available ? ` (${session.cookies} cookies)` : ' — run <code>deepseek
         const sent = agent.connections.size;
         agent.broadcast({ type: 'reload-extension' });
         json(res, 200, { ok: true, sent });
+        return;
+      }
+
+      if (url.pathname === '/v1/bridge/conversations' && req.method === 'GET') {
+        const conversations = Object.entries(store.data.conversations)
+          .map(([key, v]) => {
+            const item = {
+              key,
+              model: v.model,
+              turns: v.turns,
+              tokensIn: Number.isFinite(v.tokensIn) ? v.tokensIn : 0,
+              tokensOut: Number.isFinite(v.tokensOut) ? v.tokensOut : 0,
+              updatedAt: v.updatedAt,
+            };
+            if (Number.isFinite(v.sessionTokens)) item.sessionTokens = v.sessionTokens;
+            if (typeof v.preview === 'string') item.preview = v.preview;
+            return item;
+          })
+          .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
+          .slice(0, 100);
+        json(res, 200, {
+          conversations,
+          upstream: { active: bridgeQueue.active, queued: bridgeQueue.queued, max: bridgeQueue.max },
+        });
         return;
       }
 

@@ -24,6 +24,18 @@ export function normalizeDefaultModel(value) {
   return v === 'deepseek-search' ? 'deepseek-search' : 'deepseek-reasoner';
 }
 
+function clampFraction(v, dflt) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return dflt;
+  return Math.min(1, n);
+}
+
+function clampInt(v, dflt, min, max = Number.MAX_SAFE_INTEGER) {
+  const n = Math.floor(Number(v));
+  if (!Number.isFinite(n)) return dflt;
+  return Math.min(max, Math.max(min, n));
+}
+
 function writeJSON(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const tmp = `${file}.${process.pid}.tmp`;
@@ -31,7 +43,7 @@ function writeJSON(file, value) {
   fs.renameSync(tmp, file);
 }
 
-export function loadConfig() {
+export function loadConfig({ persist = true } = {}) {
   const saved = readJSON(CONFIG_FILE, {});
   const cfg = {
     ...saved,
@@ -43,8 +55,14 @@ export function loadConfig() {
     autoUpdate: saved.autoUpdate !== false,
     lastUpdateCheck: Number(saved.lastUpdateCheck) || 0,
     lastUpdateVersion: saved.lastUpdateVersion || null,
+    // Conversation-intelligence knobs.
+    contextSwitchAt: clampFraction(saved.contextSwitchAt, 0.8), // fraction of the context window; 0 < v <= 1
+    maxFreshTranscriptChars: clampInt(saved.maxFreshTranscriptChars, 200000, 1),
+    maxUpstream: clampInt(saved.maxUpstream, 3, 1, 16),
+    systemPrompt: typeof saved.systemPrompt === 'string' ? saved.systemPrompt : '',
+    systemPreset: typeof saved.systemPreset === 'string' ? saved.systemPreset : '',
   };
-  if (!saved.key || saved.defaultModel !== cfg.defaultModel) {
+  if (persist && (!saved.key || saved.defaultModel !== cfg.defaultModel)) {
     try {
       writeJSON(CONFIG_FILE, cfg);
     } catch {
