@@ -1,10 +1,12 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { attachWebSocket, WsConnection } from './ws.js';
 import { Agent, BridgeError } from './agent.js';
 import { DirectClient } from './direct.js';
 import { handleChatCompletions, sendError, MODELS, bridgeQueue, clampMaxUpstream } from './openai.js';
+import { dashboardHtml } from './dashboard.js';
 import { clearSession, loadSession, saveSession, sessionSummary } from './session.js';
 import { loadConfig, paths } from './config.js';
 import { VERSION } from './version.js';
@@ -96,27 +98,35 @@ export function createServer({ config, store, log = () => {} }) {
         return;
       }
 
+      if (url.pathname === '/v1/bridge/log' && req.method === 'GET') {
+        const lines = Math.min(500, Math.max(1, Number(url.searchParams.get('lines')) || 80));
+        const logFile = path.join(paths.CONFIG_DIR, 'bridge.log');
+        let out;
+        try {
+          out = fs.readFileSync(logFile, 'utf8').split('\n').slice(-lines);
+        } catch {
+          out = [`(no log file at ${logFile})`];
+        }
+        json(res, 200, { lines: out });
+        return;
+      }
+
+      if (url.pathname.startsWith('/v1/conversations/') && req.method === 'DELETE') {
+        const key = decodeURIComponent(url.pathname.slice('/v1/conversations/'.length));
+        if (!key || !store.getConversation(key)) {
+          sendError(res, 404, 'No such conversation', 'not_found');
+          return;
+        }
+        store.deleteConversation(key);
+        store.flush();
+        json(res, 200, { ok: true, deleted: key });
+        return;
+      }
+
       if (url.pathname === '/' && req.method === 'GET') {
-        const status = agent.status;
-        const session = sessionSummary();
-        const mode = session.available ? 'direct' : status.connected ? 'extension' : 'offline';
-        const html = `<!doctype html><meta charset="utf-8"><title>deepseek-bridge</title>
-<style>body{font:14px/1.5 ui-monospace,monospace;max-width:720px;margin:40px auto;padding:0 20px;background:#0b0f14;color:#c9d1d9}
-b{color:#7ee787}.bad{color:#ff7b72}.k{color:#79c0ff}code{background:#161b22;padding:2px 6px;border-radius:4px}</style>
-<h2>deepseek-bridge</h2>
-<p>Version: <b>${VERSION}</b></p>
-<p>Mode: <b class="${mode === 'offline' ? 'bad' : ''}">${mode}</b></p>
-<p>Direct session: <b class="${session.available ? '' : 'bad'}">${session.available ? (session.user || 'signed in') : 'not configured'}</b>
-${session.available ? ` (${session.cookies} cookies)` : ' — run <code>deepseek --login</code>'}</p>
-<p>Extension: <b class="${status.connected ? '' : 'bad'}">${status.connected ? 'connected' : 'not connected'}</b>
- (${status.connections} socket(s)${status.lastHello ? `, version ${status.lastHello.version || '?'}` : ''})</p>
-<p>Active jobs: ${status.activeJobs}</p>
-<p>Base URL: <code>http://${config.host}:${config.port}/v1</code></p>
-<p>Key: <code>${config.key.slice(0, 10)}…</code> (see <code>${paths.CONFIG_FILE}</code>)</p>
-<p>Models: ${MODELS.map((m) => `<code>${m.id}</code>`).join(' ')}</p>
-<p>State: <code>${paths.STATE_FILE}</code></p>`;
+        // Static dashboard: no data embedded, all fetches are auth-gated.
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-        res.end(html);
+        res.end(dashboardHtml);
         return;
       }
 
@@ -153,6 +163,31 @@ ${session.available ? ` (${session.cookies} cookies)` : ' — run <code>deepseek
           },
           upstream: { active: bridgeQueue.active, queued: bridgeQueue.queued, max: bridgeQueue.max },
         });
+        return;
+      }
+
+      if (url.pathname === '/v1/bridge/log' && req.method === 'GET') {
+        const lines = Math.min(500, Math.max(1, Number(url.searchParams.get('lines')) || 80));
+        const logFile = path.join(paths.CONFIG_DIR, 'bridge.log');
+        let out;
+        try {
+          out = fs.readFileSync(logFile, 'utf8').split('\n').slice(-lines);
+        } catch {
+          out = [`(no log file at ${logFile})`];
+        }
+        json(res, 200, { lines: out });
+        return;
+      }
+
+      if (url.pathname.startsWith('/v1/conversations/') && req.method === 'DELETE') {
+        const key = decodeURIComponent(url.pathname.slice('/v1/conversations/'.length));
+        if (!key || !store.getConversation(key)) {
+          sendError(res, 404, 'No such conversation', 'not_found');
+          return;
+        }
+        store.deleteConversation(key);
+        store.flush();
+        json(res, 200, { ok: true, deleted: key });
         return;
       }
 
@@ -236,6 +271,31 @@ ${session.available ? ` (${session.cookies} cookies)` : ' — run <code>deepseek
           conversations,
           upstream: { active: bridgeQueue.active, queued: bridgeQueue.queued, max: bridgeQueue.max },
         });
+        return;
+      }
+
+      if (url.pathname === '/v1/bridge/log' && req.method === 'GET') {
+        const lines = Math.min(500, Math.max(1, Number(url.searchParams.get('lines')) || 80));
+        const logFile = path.join(paths.CONFIG_DIR, 'bridge.log');
+        let out;
+        try {
+          out = fs.readFileSync(logFile, 'utf8').split('\n').slice(-lines);
+        } catch {
+          out = [`(no log file at ${logFile})`];
+        }
+        json(res, 200, { lines: out });
+        return;
+      }
+
+      if (url.pathname.startsWith('/v1/conversations/') && req.method === 'DELETE') {
+        const key = decodeURIComponent(url.pathname.slice('/v1/conversations/'.length));
+        if (!key || !store.getConversation(key)) {
+          sendError(res, 404, 'No such conversation', 'not_found');
+          return;
+        }
+        store.deleteConversation(key);
+        store.flush();
+        json(res, 200, { ok: true, deleted: key });
         return;
       }
 

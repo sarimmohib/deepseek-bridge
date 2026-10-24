@@ -310,7 +310,6 @@ Direct mode takes precedence whenever `session.json` exists.
 | `deepseek key --file PATH` | Write the API key to a `0600` file for another client |
 | `deepseek extension` | Print the absolute extension folder |
 | `deepseek logs` | Print the log path and the last 40 lines |
-| `deepseek ui` | Full-screen terminal dashboard: models, conversations, health, log tail |
 | `deepseek models` | One line per advertised model |
 | `deepseek models --info` | Model details plus pasteable OpenCode/OpenAI harness config |
 | `deepseek help` | Show help |
@@ -332,27 +331,24 @@ The bridge listens on `127.0.0.1` only. If port 8787 is busy, it picks the next
 free port and saves it in the config; update the extension popup if you use
 extension mode.
 
-## Terminal UI
+## Web dashboard
 
-```bash
-deepseek ui
-```
+Open <http://127.0.0.1:8787/> in a browser while the bridge runs. The page is
+served by the bridge itself — one self-contained HTML file, no external
+requests, nothing installed.
 
-A zero-dependency, full-screen dashboard for the running bridge. Four live
-panels:
+Unlock it with the API key (`deepseek key` prints it; the key is stored in
+your browser's localStorage and sent only to the bridge). Panels:
 
-- `[1] MODELS` — the advertised models with context/output limits, the default
-  one marked.
-- `[2] CONVERSATIONS` — cached conversations with model, turns, input/output
-  and session token counts, age, and a preview of the latest turn.
-- `[3] HEALTH` — bridge up/down, port, mode, direct-session age, and the
-  upstream queue (`active/queued/max`).
-- `[4] LOG` — the tail of `bridge.log`.
-
-Keys: `1`-`4` or `Tab` move the focus ring, `r` refreshes immediately (the
-panels also poll on their own), `q` or `Ctrl+C` quits. When stdin is not a TTY
-(CI, pipes), the command renders one static frame with no focus highlight and
-exits.
+- **Header** — version, mode, base URL, and the upstream queue
+  (`active/queued/max`); refreshes every few seconds.
+- **Models** — the advertised models with context/output limits and a
+  "Copy OpenCode config" button that mirrors the working
+  `~/.config/opencode/opencode.jsonc` entry.
+- **Conversations** — searchable, filterable, sortable table of cached
+  conversations (model, turns, input/output and session token counts, age,
+  preview) with per-row delete and a double-confirm "Clear all".
+- **Log** — the tail of `bridge.log` (auth-gated `GET /v1/bridge/log`).
 
 ## Versioning and self-update
 
@@ -779,7 +775,7 @@ many requests hit DeepSeek at the same time; extras queue FIFO and take the
 first freed slot. This protects the single web session from parallel-swarm
 rate limits without serializing every request. The queue is observable:
 `/health` and `/v1/bridge/status` report `upstream: {active, queued, max}`,
-and `deepseek ui` shows the same counts in its health panel.
+and the web dashboard shows the same counts in its header.
 
 Mind the account-level rate throttle on top of the parallelism cap: rapid
 bursts (measured trigger: ~13+ back-to-back requests, or a sustained heavy

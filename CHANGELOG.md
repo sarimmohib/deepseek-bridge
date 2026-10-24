@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.0
+
+- Replaced the terminal dashboard with a web dashboard served by the bridge
+  itself at `http://127.0.0.1:8787/`: unlock with the API key (stored in the
+  browser, sent only to the bridge), then live models with copyable OpenCode
+  config, a searchable/filterable/sortable conversations table with per-row
+  delete and a double-confirm clear-all, the upstream queue, and the log tail.
+  One self-contained HTML file, no external requests.
+- Removed `deepseek ui` and the ANSI dashboard module; the model-table and
+  harness-snippet helpers moved to `src/modelinfo.js` (`deepseek models` and
+  `deepseek models --info` are unchanged).
+- New auth-gated endpoints: `GET /v1/bridge/log?lines=N` and
+  `DELETE /v1/conversations/:key`.
+
 ## 0.6.3
 
 - Empty replies are DeepSeek's per-account rate throttle, not a parallelism
