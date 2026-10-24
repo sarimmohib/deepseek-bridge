@@ -642,7 +642,7 @@ function parameterValue(param) {
   }
 }
 
-function extractDsml(text) {
+function extractDsml(text, { paramToolIndex = null } = {}) {
   const source = String(text || '');
   const calls = [];
   let saw = false;
@@ -679,6 +679,17 @@ function extractDsml(text) {
     delete call.args.name;
     delete call.args.tool;
     delete call.args.tool_name;
+    if (!name && paramToolIndex) {
+      const keys = Object.keys(call.args);
+      if (keys.length) {
+        let best = null, bestScore = 0;
+        for (const [tool, params] of paramToolIndex) {
+          const overlap = keys.filter((k) => params.has(k)).length;
+          if (overlap === keys.length && overlap > bestScore) { best = tool; bestScore = overlap; }
+        }
+        if (best) name = best;
+      }
+    }
     if (!name) return;
     if (call.argPayload !== undefined) {
       let parsed = call.argPayload;
@@ -747,10 +758,18 @@ function extractDsml(text) {
         callsBody = '';
       } else if (name === 'parameter' || name === 'param') {
         if (inParam) finishParam();
-        if (inInvoke) {
-          currentParam = { name: attrs.name || '', string: attrs.string, value: '' };
-          inParam = true;
+        if (!inInvoke) {
+          // Malformed stream: parameters with no invoke opener (DeepSeek
+          // degrades long tool calls this way under rate pressure — tags come
+          // out with doubled bars and the invoke/name tag lost). Start an
+          // implicit call; the tool is inferred from the parameter names at
+          // close via paramToolIndex.
+          inCalls = true;
+          inInvoke = true;
+          currentCall = { name: '', args: {}, argPayload: undefined };
         }
+        currentParam = { name: attrs.name || '', string: attrs.string, value: '' };
+        inParam = true;
       }
     } else if (name === 'parameter' || name === 'param') {
       finishParam();
@@ -895,7 +914,7 @@ function normalizeToolNames(toolNames) {
  * ```json fences that contain a call, XML <tool_call> wrappers, DSML markup
  * (including malformed closing tags), and a bare JSON object/array.
  */
-export function extractToolCalls(text, { toolNames = null } = {}) {
+export function extractToolCalls(text, { toolNames = null, paramToolIndex = null } = {}) {
   const source = text || '';
   const names = normalizeToolNames(toolNames);
   const calls = [];
@@ -927,7 +946,7 @@ export function extractToolCalls(text, { toolNames = null } = {}) {
     return '';
   });
 
-  const dsml = extractDsml(cleaned);
+  const dsml = extractDsml(cleaned, { paramToolIndex });
   if (dsml.had) {
     sawBlock = true;
     cleaned = dsml.cleaned;
@@ -954,6 +973,19 @@ export function extractToolCalls(text, { toolNames = null } = {}) {
     cleaned: cleaned.replace(/\n{3,}/g, '\n\n').trim(),
     hadBlock: sawBlock || calls.length > 0,
   };
+}
+
+export function buildParamToolIndex(tools) {
+  const index = new Map();
+  for (const tool of Array.isArray(tools) ? tools : []) {
+    const fn = tool?.function && typeof tool.function === 'object' ? tool.function : tool;
+    const name = String(fn?.name || '').trim();
+    if (!name) continue;
+    const props = fn?.parameters?.properties ?? {};
+    const keys = Object.keys(props || {});
+    if (keys.length) index.set(name, new Set(keys));
+  }
+  return index;
 }
 
 export const estimateTokens = (text) => Math.max(1, Math.round((text || '').length / 3.6));

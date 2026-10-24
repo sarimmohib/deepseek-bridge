@@ -597,3 +597,39 @@ test('text data URLs over the token cap announce the honest split in the flatten
   ]);
   assert.equal(quiet, '');
 });
+
+test('malformed doubled-bar DSML with no invoke tag is salvaged into the matching tool', () => {
+  // Exact shape observed live: DeepSeek degrades a long tool call under rate
+  // pressure — doubled bars, no invoke/name tag, bare parameters.
+  const malformed = [
+    '<｜｜DSML｜｜calls>',
+    '<｜｜DSML｜｜parameter name="command" string="true">cd /ws && node -e "diag"',
+    'fs.writeFileSync(\'/tmp/test1.html\', h); console.log("ok"); " && timeout 120 chrome --headless --dump-dom file:///tmp/t.html | head -40</｜｜DSML｜｜parameter>',
+    ' <｜｜DSML｜｜parameter name="description" string="true">Dump in-page diagnostics</｜｜DSML｜｜>',
+    ' <｜｜DSML｜｜parameter name="timeoutMs" string="false">140000</｜｜DSML｜｜>',
+    ' </｜｜DSML｜｜calls>',
+  ].join('\\n');
+  const index = new Map([['Bash', new Set(['command', 'description', 'timeoutMs'])]]);
+  const out = extractToolCalls(malformed, {
+    toolNames: ['Bash'],
+    paramToolIndex: index,
+  });
+  assert.equal(out.calls.length, 1);
+  assert.equal(out.calls[0].name, 'Bash');
+  assert.ok(out.calls[0].arguments.command.startsWith('cd /ws && node -e "diag"'));
+  assert.ok(out.calls[0].arguments.command.endsWith('head -40'));
+  assert.equal(out.calls[0].arguments.description, 'Dump in-page diagnostics');
+  assert.equal(out.calls[0].arguments.timeoutMs, 140000);
+  assert.doesNotMatch(out.cleaned, /DSML/);
+});
+
+test('without a param index the malformed block stays stripped (legacy behavior)', () => {
+  const malformed = [
+    '<｜｜DSML｜｜calls>',
+    '<｜｜DSML｜｜parameter name="command" string="true">ls</｜｜DSML｜｜parameter>',
+    '</｜｜DSML｜｜calls>',
+  ].join('\\n');
+  const out = extractToolCalls(malformed, { toolNames: ['Bash'] });
+  assert.equal(out.calls.length, 0);
+  assert.doesNotMatch(out.cleaned, /DSML/);
+});

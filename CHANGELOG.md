@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.5
+
+- DSML SALVAGE for degraded tool calls: under sustained rate pressure
+  DeepSeek emits tool calls with malformed markup — doubled bars
+  (<｜｜DSML｜｜calls>), a lost invoke/name tag, bare parameter tags. The
+  extractor previously stripped those blocks silently, so the agent's
+  intended tool call (e.g. a diagnostic command) was lost and the turn
+  ended text-only. The extractor now starts an implicit call on
+  parameter-open inside a calls wrapper and infers the tool from a
+  parameter-name index built from the request's tool schemas (a block is
+  salvaged only when its parameter names uniquely match one registered
+  tool). Found on the Gummy Bears build: the model's diagnostic
+  chrome --dump-dom tool call was being discarded verbatim.
+
 ## 0.7.4
 
 - ROOT-CAUSE FIX for long builds halting: DeepSeek rate-stops long

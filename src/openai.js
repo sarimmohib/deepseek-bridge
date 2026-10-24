@@ -14,6 +14,7 @@ import {
   formatTurn,
 } from './prompt.js';
 import { BridgeError } from './agent.js';
+import { buildParamToolIndex } from './prompt.js';
 import { noteUpstreamThrottleEvent, upstreamCooldownMs } from './direct.js';
 
 export const MODELS = [
@@ -231,7 +232,7 @@ const TOOL_START_PATTERNS = [
  * the payload is an ordinary JSON answer it is released immediately; if it has
  * the shape of a tool call it stays held so the client never sees it as text.
  */
-export function createToolGuard({ enabled, emit, toolNames = null }) {
+export function createToolGuard({ enabled, emit, toolNames = null, paramToolIndex = null }) {
   let pending = '';
   let holding = false;
   let held = '';
@@ -383,6 +384,7 @@ export async function handleChatCompletions(req, res, body, ctx) {
   const toolChoice = body.tool_choice ?? 'auto';
   const toolsActive = Boolean(tools?.length) && toolChoice !== 'none' && ctx.config.toolMode !== 'off';
   const toolNames = toolsActive ? new Set(tools.map((tool) => tool?.function?.name).filter(Boolean)) : null;
+  const paramToolIndex = toolsActive ? buildParamToolIndex(tools) : null;
   const preamble = toolsActive ? toolPreamble(tools, toolChoice) : '';
   const hint = opts.thinking && opts.effortExplicit ? effortHint(opts.effort) : '';
 
@@ -520,7 +522,7 @@ export async function handleChatCompletions(req, res, body, ctx) {
     content += text;
     if (stream) sse(res, chunk({ id, created, model, delta: { content: text } }));
   };
-  const guard = createToolGuard({ enabled: toolsActive, emit: writeContent, toolNames });
+  const guard = createToolGuard({ enabled: toolsActive, emit: writeContent, toolNames, paramToolIndex });
   const emitContent = (text) => {
     if (!text) return;
     fullContent += text;
@@ -623,13 +625,13 @@ export async function handleChatCompletions(req, res, body, ctx) {
 
     const unemitted = guard.finish();
     const toolCalls = toolsActive
-      ? extractToolCalls(fullContent, { toolNames })
+      ? extractToolCalls(fullContent, { toolNames, paramToolIndex })
       : { calls: [], cleaned: fullContent, hadBlock: false };
 
     if (toolCalls.calls.length === 0) {
       if (unemitted) {
         const held = toolsActive
-          ? extractToolCalls(unemitted, { toolNames })
+          ? extractToolCalls(unemitted, { toolNames, paramToolIndex })
           : { calls: [], cleaned: unemitted, hadBlock: false };
         if (held.hadBlock) {
           // Malformed DSML/tool markup with no executable call: drop the
