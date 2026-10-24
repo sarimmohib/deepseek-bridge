@@ -657,3 +657,48 @@ test('pure degenerate DSML non-stream returns a 502 empty_reply', async () => {
   assert.equal(body.error.code, 'empty_reply');
   assert.match(body.error.message, /no usable output/);
 });
+
+test('raising maxUpstream mid-queue wakes FIFO waiters instead of a new arrival', async () => {
+  const startOrder = [];
+  const agent = {
+    async run(_request, handlers) {
+      handlers.onReady({ sessionId: 'sess_cc', messageId: 1 });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      handlers.onDelta({ kind: 'content', text: 'ok' });
+      return { usage: null, finish: 'stop', sessionId: 'sess_cc', messageId: 1 };
+    },
+  };
+  const tracked = {
+    async run(request, handlers) {
+      startOrder.push(request.prompt);
+      return agent.run(request, handlers);
+    },
+  };
+  const store = { getConversation: () => null, setConversation: () => {} };
+  const fire = (label, maxUpstream) => {
+    const res = new FakeResponse();
+    const done = handleChatCompletions(
+      {},
+      res,
+      { model: 'deepseek-reasoner', messages: [{ role: 'user', content: label }], stream: false },
+      { agent: tracked, store, log: () => {}, config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto', maxUpstream } },
+    ).then(() => label);
+    return { done, res };
+  };
+
+  fire('a', 1);
+  await new Promise((resolve) => setTimeout(resolve, 5)); // a is active
+  fire('b', 1); // queued behind a
+  fire('c', 1); // queued behind b
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  fire('d', 2); // arrives with a raised limit while b and c are waiting
+
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.deepEqual(
+    startOrder.map((p) => p.trim().split('\n').at(-1)),
+    ['a', 'b', 'c', 'd'],
+    `start order was ${startOrder}`,
+  );
+  assert.equal(bridgeQueue.active, 0);
+  assert.equal(bridgeQueue.queued, 0);
+});

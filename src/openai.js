@@ -64,6 +64,13 @@ function clampMaxUpstream(v) {
 
 async function withUpstreamSlot(cfg, fn) {
   bridgeQueue.max = clampMaxUpstream(cfg?.maxUpstream);
+  // A raised limit must benefit queued waiters first: hand out the freed
+  // capacity here (synchronously, so no new arrival can jump the FIFO).
+  while (bridgeQueue.active < bridgeQueue.max && slotWaiters.length > 0) {
+    const waiter = slotWaiters.shift();
+    bridgeQueue.active++;
+    waiter();
+  }
   if (bridgeQueue.active < bridgeQueue.max) {
     bridgeQueue.active++;
   } else {
