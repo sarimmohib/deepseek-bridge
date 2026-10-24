@@ -53,10 +53,10 @@ export const PRESET_SYSTEM_PROMPTS = {
  * active count can never overshoot max even across microtask scheduling), and
  * try/finally guarantees a slot is freed on both errors and aborts.
  */
-export const bridgeQueue = { active: 0, queued: 0, max: 3 };
+export const bridgeQueue = { active: 0, queued: 0, max: 2 };
 const slotWaiters = [];
 
-function clampMaxUpstream(v) {
+export function clampMaxUpstream(v) {
   const n = Math.floor(Number(v));
   if (!Number.isFinite(n)) return 2;
   return Math.min(16, Math.max(1, n));

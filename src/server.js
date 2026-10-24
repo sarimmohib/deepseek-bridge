@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import { attachWebSocket, WsConnection } from './ws.js';
 import { Agent, BridgeError } from './agent.js';
 import { DirectClient } from './direct.js';
-import { handleChatCompletions, sendError, MODELS, bridgeQueue } from './openai.js';
+import { handleChatCompletions, sendError, MODELS, bridgeQueue, clampMaxUpstream } from './openai.js';
 import { clearSession, loadSession, saveSession, sessionSummary } from './session.js';
 import { loadConfig, paths } from './config.js';
 import { VERSION } from './version.js';
@@ -46,6 +46,7 @@ function readBody(req) {
 }
 
 export function createServer({ config, store, log = () => {} }) {
+  bridgeQueue.max = clampMaxUpstream(config?.maxUpstream);
   const agent = new Agent({ log });
   const direct = new DirectClient({ log });
 
