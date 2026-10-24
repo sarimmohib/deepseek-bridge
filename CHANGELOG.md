@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.3
+
+- Persistent empty replies on a long-lived DeepSeek session (a rate window
+  that outlives the cool-down valve, observed when three concurrent dsh
+  agent loops pushed one 22-turn session past its tolerance) now abandon
+  the session and replay the conversation into a fresh one — the same
+  recovery path as invalid-parent failures, bounded to one retry.
+- The dashboard/upstream tests reset the throttle valve between cases.
+
 ## 0.7.2
 
 - Global adaptive throttle valve: when DeepSeek's rate window produces empty

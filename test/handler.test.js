@@ -659,6 +659,91 @@ test('pure degenerate DSML non-stream returns a 502 empty_reply', async () => {
   assert.match(body.error.message, /no usable output/);
 });
 
+test('persistent empty replies restart from a fresh session', async () => {
+  upstreamThrottle.level = 0;
+  upstreamThrottle.until = 0;
+  const { transcriptDigest, normalizeMessages, splitMessages } = await import('../src/prompt.js');
+  const calls = [];
+  let deletes = 0;
+  const agent = {
+    async run(_request, handlers) {
+      calls.push(String(_request.prompt).slice(0, 40));
+      handlers.onReady({ sessionId: 'sess_' + calls.length, messageId: calls.length });
+      if (calls.length === 1) {
+        handlers.onDelta({ kind: 'content', text: 'first turn ok' });
+        return { usage: { completion: 5 }, finish: 'stop', sessionId: 'sess_1', messageId: 1 };
+      }
+      if (calls.length === 2) {
+        // the continuation attempt dies on the rate-throttled session
+        const err = new Error('DeepSeek returned an empty reply.');
+        err.code = 'empty_reply';
+        err.status = 502;
+        throw err;
+      }
+      handlers.onDelta({ kind: 'content', text: 'RECOVERED' });
+      return { usage: { completion: 5 }, finish: 'stop', sessionId: 'sess_3', messageId: 3 };
+    },
+  };
+  const store = {
+    getConversation: () => null,
+    deleteConversation: () => {
+      deletes++;
+    },
+    setConversation: () => {},
+  };
+  // turn 1: establish the stored conversation (2 messages, real digest)
+  const messages1 = [
+    { role: 'user', content: 'hi there friend' },
+    { role: 'assistant', content: 'first turn ok' },
+  ];
+  const res1 = new FakeResponse();
+  await handleChatCompletions(
+    {},
+    res1,
+    { model: 'deepseek-reasoner', stream: false, messages: messages1 },
+    { agent, store, log: () => {}, config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto' } },
+  );
+  // capture what turn 1 stored (digest + turns) via a recording store
+  const stored = {};
+  const store2 = {
+    getConversation: () => ({ ...stored }),
+    deleteConversation: () => {
+      deletes++;
+    },
+    setConversation: (key, value) => {
+      Object.assign(stored, value);
+    },
+  };
+  // turn 2: continuation whose LLM call dies with empty_reply
+  const messages2 = [
+    ...messages1,
+    { role: 'assistant', content: 'first turn ok' },
+    { role: 'user', content: 'and now continue please' },
+  ];
+  stored.turns = 2;
+  const normalized2 = normalizeMessages(messages2);
+  const { rest: rest2 } = splitMessages(normalized2);
+  stored.digest = transcriptDigest(rest2.slice(0, 2));
+  stored.sessionId = 'sess_1';
+  stored.parentId = 1;
+  const res2 = new FakeResponse();
+  try {
+    await handleChatCompletions(
+      {},
+      res2,
+      { model: 'deepseek-reasoner', stream: false, messages: messages2 },
+      { agent, store: store2, log: (m) => console.error('LOG2:', m), config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto' } },
+    );
+  } catch (e) {
+    console.error('THROWN:', e && e.stack ? e.stack.split('\n').slice(0, 5).join(' | ') : e);
+    throw e;
+  }
+  const body = JSON.parse(res2.chunks.join(''));
+  assert.equal(body.choices[0].message.content, 'RECOVERED');
+  assert.equal(calls.length, 3); // turn 1 + failed continuation + fresh-session replay
+  assert.equal(deletes, 1);
+});
+
 test.after(() => {
   // the empty_reply tests raise the global upstream throttle; drop it so
   // later suites in this process are not paced by a leftover cooldown

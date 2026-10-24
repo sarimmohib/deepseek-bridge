@@ -575,8 +575,21 @@ export async function handleChatCompletions(req, res, body, ctx) {
       const invalidParent =
         err?.code === 'invalid_parent' ||
         /invalid message id|message not found|invalid parent|not a leaf/i.test(String(err?.message || ''));
-      if (activePlan.continuation && invalidParent && !content && !reasoning) {
-        log('saved DeepSeek parent was rejected; retrying from a fresh session');
+      // Persistent empty replies on a long-lived DeepSeek session (rate
+      // throttling that outlives the cool-down valve) recover the same way:
+      // abandon the bloated session and replay into a fresh one.
+      const emptyReply = err?.code === 'empty_reply';
+      if (
+        activePlan.continuation &&
+        (invalidParent || emptyReply) &&
+        !content &&
+        !reasoning
+      ) {
+        log(
+          emptyReply
+            ? 'persistent empty replies from DeepSeek; retrying from a fresh session'
+            : 'saved DeepSeek parent was rejected; retrying from a fresh session',
+        );
         store.deleteConversation?.(key);
         // The fresh prompt replays the whole transcript, but `attachments` was
         // collected from the continuation tail only. Resolve what earlier turns
