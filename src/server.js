@@ -107,7 +107,32 @@ export function createServer({ config, store, log = () => {} }) {
         } catch {
           out = [`(no log file at ${logFile})`];
         }
+        // The startup banner prints the API key; never hand it back out.
+        out = out.map((line) => line.replace(/sk-ds-[a-f0-9]+/g, 'sk-ds-…'));
         json(res, 200, { lines: out });
+        return;
+      }
+
+      if (url.pathname === '/v1/bridge/session/token' && req.method === 'GET') {
+        // Auth-gated like every other route: hands out the DeepSeek login
+        // token so another device can `deepseek --login --manual --token`.
+        const session = loadSession();
+        if (!session?.token) {
+          json(res, 200, { ok: false, reason: 'no_session' });
+          return;
+        }
+        const full = url.searchParams.get('full') === '1';
+        const payload = {
+          ok: true,
+          token: session.token,
+          updatedAt: session.updatedAt || null,
+          cookiesCount: Array.isArray(session.cookies) ? session.cookies.length : 0,
+        };
+        if (full) {
+          payload.cookies = Array.isArray(session.cookies) ? session.cookies : [];
+          if (session.userAgent) payload.userAgent = session.userAgent;
+        }
+        json(res, 200, payload);
         return;
       }
 
@@ -175,6 +200,8 @@ export function createServer({ config, store, log = () => {} }) {
         } catch {
           out = [`(no log file at ${logFile})`];
         }
+        // The startup banner prints the API key; never hand it back out.
+        out = out.map((line) => line.replace(/sk-ds-[a-f0-9]+/g, 'sk-ds-…'));
         json(res, 200, { lines: out });
         return;
       }
@@ -283,6 +310,8 @@ export function createServer({ config, store, log = () => {} }) {
         } catch {
           out = [`(no log file at ${logFile})`];
         }
+        // The startup banner prints the API key; never hand it back out.
+        out = out.map((line) => line.replace(/sk-ds-[a-f0-9]+/g, 'sk-ds-…'));
         json(res, 200, { lines: out });
         return;
       }

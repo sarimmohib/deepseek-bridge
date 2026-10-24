@@ -6,6 +6,7 @@
  *   deepseek serve           run in the foreground
  *   deepseek stop            stop the background process
  *   deepseek status          show bridge/extension status
+ *   deepseek ui              open the web dashboard in a browser
  *   deepseek models          one line per model
  *   deepseek models --info   model details + pasteable harness config snippets
  *   deepseek chat "hello"    send a chat message
@@ -54,7 +55,7 @@ const first = args[0];
 const known = new Set([
   'start', 'serve', 'stop', 'status', 'chat', 'key', 'extension',
   'logs', 'login', 'logout', 'session', 'version', 'update', 'help',
-  'models',
+  'ui', 'models',
 ]);
 const AUTO_UPDATE_INTERVAL = 6 * 60 * 60 * 1000;
 
@@ -870,6 +871,7 @@ Usage:
   deepseek serve           Run the bridge in the foreground
   deepseek stop            Stop the background bridge
   deepseek status          Show the bridge and extension status
+  deepseek ui              Open the web dashboard in a browser
   deepseek models          One line per model
   deepseek models --info   Model details + pasteable OpenCode/OpenAI config snippets
   deepseek chat "hello"    Send a chat message (starts the bridge if needed)
@@ -956,6 +958,20 @@ if (command === 'help') {
   }
 } else if (command === 'extension') {
   console.log(EXTENSION);
+} else if (command === 'ui') {
+  const { cfg: uiCfg } = await ensureRunning();
+  const uiUrl = `http://127.0.0.1:${uiCfg.port}/`;
+  const openers = { darwin: 'open', win32: 'cmd /c start', linux: 'xdg-open' };
+  const [exe, ...exeArgs] = (openers[process.platform] || openers.linux).split(' ');
+  try {
+    const child = spawn(exe, [...exeArgs, uiUrl], { stdio: 'ignore', detached: true });
+    child.on('error', () => {});
+    child.unref();
+  } catch {
+    // no opener on this platform; the URL is printed either way
+  }
+  console.log(`  Dashboard: ${uiUrl}`);
+  console.log('  Unlock with your API key (deepseek key).');
 } else if (command === 'models') {
   modelsCommand();
 } else if (command === 'logs') {

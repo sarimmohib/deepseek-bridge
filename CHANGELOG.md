@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.7.1
+
+- Dashboard theme: richer ZCode-style dark palette (charcoal + warm orange
+  accent) and a creamy-white light theme, with a header toggle persisted in
+  the browser (first visit follows the system preference, no flash).
+- Session-token card: view (masked, Show to reveal), copy, and export the
+  DeepSeek login token plus cookies for connecting another device without
+  re-logging in — including a one-click `deepseek --login --manual --token …`
+  setup command. Served by the auth-gated `GET /v1/bridge/session/token`
+  (`?full=1` adds cookies and user agent).
+- `deepseek ui` is back, now simply opening the web dashboard in a browser
+  (starts the bridge if needed). The page is a static string server-side, so
+  it costs nothing when nobody is viewing it; polling pauses on hidden tabs.
+- The dashboard log panel no longer exposes the API key that the bridge's
+  startup banner prints (`sk-ds-…` values are redacted server-side).
+
 ## 0.7.0
 
 - Replaced the terminal dashboard with a web dashboard served by the bridge

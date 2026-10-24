@@ -5,6 +5,10 @@
  * Zero dependencies, zero external requests (no CDNs, fonts, or images).
  * The API key lives in localStorage only and is sent as a Bearer header.
  *
+ * Theme: CSS custom properties on :root (dark default) overridden by
+ * [data-theme="light"] on <html>; choice persists in localStorage (dsb.theme)
+ * and is applied by an early head script before first paint (no flash).
+ *
  * The page JS deliberately avoids template literals, backticks and
  * backslashes so this whole file can be one safe backtick template.
  */
@@ -14,279 +18,246 @@ export const dashboardHtml = `<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
 <title>deepseek-bridge dashboard</title>
+<script>
+/* Apply the saved theme before first paint so there is no flash. */
+(function () {
+  var t = 'dark';
+  try {
+    var saved = localStorage.getItem('dsb.theme');
+    if (saved === 'light' || saved === 'dark') t = saved;
+    else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) t = 'light';
+  } catch (e) {}
+  document.documentElement.setAttribute('data-theme', t);
+})();
+</script>
 <style>
+  /* dark is the default; [data-theme="light"] on <html> overrides below */
   :root {
-    --bg: #0d0f14;
-    --card: #141821;
-    --card2: #10141c;
-    --border: #232733;
-    --text: #e8ebf2;
-    --muted: #8b93a7;
-    --accent: #4d6bfe;
-    --accent-soft: rgba(77, 107, 254, 0.14);
-    --amber: #e3b341;
-    --green: #3fb950;
-    --red: #f16a6a;
+    color-scheme: dark;
+    --bg: #141417;
+    --panel: #1d1d21;
+    --panel2: #232328;
+    --border: #2c2c33;
+    --border-strong: #3b3b46;
+    --text: #ececec;
+    --muted: #9a9aa3;
+    --accent: #f0883e;
+    --accent-strong: #ff9d57;
+    --on-accent: #241304;
+    --accent-border: rgba(240, 136, 62, 0.5);
+    --accent-soft: rgba(240, 136, 62, 0.14);
+    --good: #3fb950;
+    --warn: #d29922;
+    --bad: #f85149;
+    --good-glow: rgba(63, 185, 80, 0.65);
+    --bad-glow: rgba(248, 81, 73, 0.6);
+    --bad-soft: rgba(248, 81, 73, 0.12);
+    --hover-wash: rgba(240, 136, 62, 0.07);
+    --selection: rgba(240, 136, 62, 0.32);
+    --code-bg: #26262c;
+    --header-bg: rgba(20, 20, 23, 0.88);
+    --overlay-bg: rgba(10, 10, 12, 0.8);
+    --row-border: rgba(44, 44, 51, 0.6);
+    --dot-idle: #52525c;
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.28), 0 4px 14px rgba(0, 0, 0, 0.18);
+    --shadow-toast: 0 8px 24px rgba(0, 0, 0, 0.45);
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  [data-theme="light"] {
+    color-scheme: light;
+    --bg: #faf6ef; --panel: #fffdf8; --panel2: #f3ede2;
+    --border: #e6ddcd; --border-strong: #d6c9ae; --text: #2b2620;
+    --muted: #8a8172; --accent: #d96f1f; --accent-strong: #c05f14;
+    --on-accent: #ffffff;
+    --accent-border: rgba(217, 111, 31, 0.5); --accent-soft: rgba(217, 111, 31, 0.12);
+    --good: #1a7f37; --warn: #9a6700; --bad: #cf222e;
+    --good-glow: rgba(26, 127, 55, 0.45); --bad-glow: rgba(207, 34, 46, 0.4);
+    --bad-soft: rgba(207, 34, 46, 0.1); --hover-wash: rgba(217, 111, 31, 0.08);
+    --selection: rgba(217, 111, 31, 0.25);
+    --code-bg: #efe8db; --header-bg: rgba(250, 246, 239, 0.9);
+    --overlay-bg: rgba(43, 38, 32, 0.45); --row-border: rgba(230, 221, 205, 0.8);
+    --dot-idle: #cdc4b0;
+    --shadow-card: 0 1px 2px rgba(122, 102, 72, 0.14), 0 4px 14px rgba(122, 102, 72, 0.1);
+    --shadow-toast: 0 8px 24px rgba(122, 102, 72, 0.24);
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; }
   body {
-    background: var(--bg);
-    color: var(--text);
+    background: var(--bg); color: var(--text);
     font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     -webkit-font-smoothing: antialiased;
   }
+  ::selection { background: var(--selection); }
   .mono { font-family: var(--mono); }
   .hidden { display: none !important; }
   .muted { color: var(--muted); font-weight: 400; font-size: 11.5px; }
 
   /* ---------- header ---------- */
   header {
-    position: sticky;
-    top: 0;
-    z-index: 40;
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 8px;
+    position: sticky; top: 0; z-index: 40;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
     padding: 10px 20px;
-    background: rgba(13, 15, 20, 0.9);
+    background: var(--header-bg);
     backdrop-filter: blur(10px);
     border-bottom: 1px solid var(--border);
   }
-  .brand { font-weight: 700; font-size: 15px; letter-spacing: 0.2px; }
+  .brand { font-weight: 700; font-size: 15px; letter-spacing: 0.2px; color: var(--accent); }
   .chip {
-    font-size: 11px;
-    padding: 2px 9px;
-    border-radius: 999px;
-    border: 1px solid var(--border);
-    color: var(--muted);
-    background: var(--card);
-    white-space: nowrap;
-    font-variant-numeric: tabular-nums;
+    font-size: 11px; padding: 2px 9px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--muted); background: var(--panel);
+    white-space: nowrap; font-variant-numeric: tabular-nums;
   }
-  .chip.accent {
-    color: #9db1ff;
-    border-color: rgba(77, 107, 254, 0.5);
-    background: var(--accent-soft);
-  }
-  .chip.amber {
-    color: var(--amber);
-    border-color: rgba(227, 179, 65, 0.45);
-    background: rgba(227, 179, 65, 0.12);
-  }
-  .dot { width: 9px; height: 9px; border-radius: 50%; background: #4a5163; flex: none; }
-  .dot.up { background: var(--green); box-shadow: 0 0 6px rgba(63, 185, 80, 0.7); }
-  .dot.down { background: var(--red); box-shadow: 0 0 6px rgba(241, 106, 106, 0.6); }
+  .chip.accent { color: var(--accent); border-color: var(--accent-border); background: var(--accent-soft); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--dot-idle); flex: none; }
+  .dot.up { background: var(--good); box-shadow: 0 0 6px var(--good-glow); }
+  .dot.down { background: var(--bad); box-shadow: 0 0 6px var(--bad-glow); }
   .spacer { flex: 1 1 auto; }
 
   /* ---------- layout ---------- */
   main { max-width: 1080px; margin: 0 auto; padding: 20px; display: flex; flex-direction: column; gap: 22px; }
   section h2 {
-    margin: 0 0 10px;
-    font-size: 12px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 1.2px;
-    color: var(--muted);
+    margin: 0 0 10px; font-size: 12px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 1.2px; color: var(--muted);
   }
   .card {
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 14px 16px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 14px 16px; box-shadow: var(--shadow-card);
+    transition: border-color 0.15s;
   }
+  .card:hover { border-color: var(--border-strong); }
   .empty { color: var(--muted); font-size: 13px; padding: 6px 2px; }
 
   /* ---------- buttons & inputs ---------- */
   .btn {
-    background: var(--card2);
-    border: 1px solid var(--border);
-    color: var(--text);
-    border-radius: 8px;
-    padding: 7px 12px;
-    font-size: 12.5px;
-    font-family: inherit;
-    cursor: pointer;
-    transition: border-color 0.15s, background 0.15s, color 0.15s;
+    background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; padding: 7px 12px; font-size: 12.5px; font-family: inherit;
+    cursor: pointer; transition: border-color 0.15s, background 0.15s, color 0.15s;
   }
-  .btn:hover { border-color: var(--accent); color: #cdd7ff; }
-  .btn:focus-visible { outline: 2px solid rgba(77, 107, 254, 0.55); outline-offset: 1px; }
-  .btn.ok { border-color: var(--green); color: var(--green); }
-  .btn.armed { border-color: var(--red); color: var(--red); background: rgba(241, 106, 106, 0.12); }
-  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  .btn.primary:hover { background: #3d59e0; color: #fff; }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn:focus-visible { outline: 2px solid var(--accent-border); outline-offset: 1px; }
+  .btn:disabled { opacity: 0.45; pointer-events: none; }
+  .btn.sm { padding: 4px 9px; font-size: 11.5px; }
+  .btn.ok { border-color: var(--good); color: var(--good); }
+  .btn.armed { border-color: var(--bad); color: var(--bad); background: var(--bad-soft); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+  .btn.primary:hover { background: var(--accent-strong); color: var(--on-accent); }
   input, select {
-    background: var(--card2);
-    border: 1px solid var(--border);
-    color: var(--text);
-    border-radius: 8px;
-    padding: 7px 10px;
-    font-size: 13px;
-    font-family: inherit;
-    outline: none;
+    background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; padding: 7px 10px; font-size: 13px; font-family: inherit; outline: none;
   }
   input:focus, select:focus { border-color: var(--accent); }
 
   /* ---------- models ---------- */
-  .models-row {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-    gap: 12px;
-  }
+  .models-row { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
   .model-card { display: flex; flex-direction: column; gap: 8px; }
   .model-card.def {
-    border-color: rgba(77, 107, 254, 0.55);
-    box-shadow: inset 0 0 0 1px rgba(77, 107, 254, 0.2);
+    border-color: var(--accent-border);
+    box-shadow: inset 0 0 0 1px var(--accent-soft), var(--shadow-card);
   }
   .model-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
   .model-id { font-weight: 700; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .star { color: var(--amber); font-size: 11px; white-space: nowrap; }
+  .star { color: var(--accent); font-size: 11px; white-space: nowrap; }
   .model-desc {
-    color: var(--muted);
-    font-size: 12px;
-    line-height: 1.45;
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
+    color: var(--muted); font-size: 12px; line-height: 1.45;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
   }
   .model-meta {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px 14px;
-    font-size: 11px;
-    color: var(--muted);
-    font-variant-numeric: tabular-nums;
+    display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 11px;
+    color: var(--muted); font-variant-numeric: tabular-nums;
   }
   .model-card .btn { align-self: flex-start; margin-top: 2px; }
+
+  /* ---------- session token ---------- */
+  .token-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
+  .token-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+  #token-value {
+    flex: 1 1 240px; min-width: 0; overflow-x: auto; white-space: nowrap;
+    font-family: var(--mono); font-size: 12.5px;
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 7px; padding: 6px 10px;
+  }
+  #token-value.msg { background: transparent; border-color: transparent; padding-left: 2px; color: var(--muted); }
+  .token-meta { margin-top: 8px; }
+  .token-hint { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+  .token-hint code { flex: 1 1 220px; min-width: 0; overflow-x: auto; white-space: nowrap; }
+  .unlock-card code, .token-hint code, #token-value code {
+    font-family: var(--mono); font-size: 11.5px;
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 5px; padding: 1px 5px;
+  }
 
   /* ---------- conversations ---------- */
   .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; }
   #search { flex: 1 1 170px; min-width: 150px; }
   .count { margin-left: auto; font-size: 12px; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
   .table-wrap {
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    background: var(--card);
-    overflow: auto;
-    max-height: 560px;
+    border: 1px solid var(--border); border-radius: 12px; background: var(--panel);
+    box-shadow: var(--shadow-card); overflow: auto; max-height: 560px;
   }
   table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 700px; }
   thead th {
-    position: sticky;
-    top: 0;
-    z-index: 2;
-    background: var(--card2);
-    text-align: left;
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.8px;
-    color: var(--muted);
-    padding: 9px 12px;
-    border-bottom: 1px solid var(--border);
-    white-space: nowrap;
+    position: sticky; top: 0; z-index: 2; background: var(--panel2);
+    text-align: left; font-size: 11px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.8px; color: var(--muted);
+    padding: 9px 12px; border-bottom: 1px solid var(--border); white-space: nowrap;
   }
-  tbody td { padding: 8px 12px; border-bottom: 1px solid rgba(35, 39, 51, 0.6); vertical-align: middle; }
-  tbody tr:hover { background: rgba(77, 107, 254, 0.06); }
+  tbody td { padding: 8px 12px; border-bottom: 1px solid var(--row-border); vertical-align: middle; }
+  tbody tr:hover { background: var(--hover-wash); }
   tbody tr:last-child td { border-bottom: none; }
   th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .pv { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .mdl { font-size: 12px; color: #b9c2d8; }
+  .mdl { font-size: 12px; color: var(--muted); }
   .act { width: 40px; }
   tr.fading { opacity: 0.25; transition: opacity 0.3s; }
   tr.empty-row td { text-align: center; color: var(--muted); padding: 28px 12px; }
   .del {
-    background: transparent;
-    border: none;
-    color: var(--muted);
-    font-size: 13px;
-    line-height: 1;
-    padding: 3px 7px;
-    border-radius: 6px;
-    cursor: pointer;
+    background: transparent; border: none; color: var(--muted);
+    font-size: 13px; line-height: 1; padding: 3px 7px; border-radius: 6px; cursor: pointer;
   }
-  .del:hover { color: var(--red); background: rgba(241, 106, 106, 0.12); }
+  .del:hover { color: var(--bad); background: var(--bad-soft); }
   .more-row { display: flex; justify-content: center; margin-top: 10px; }
 
   /* ---------- log ---------- */
   details#log-panel { padding: 10px 16px 14px; }
   details#log-panel summary { cursor: pointer; user-select: none; font-size: 13px; font-weight: 600; }
   #log-pre {
-    margin: 10px 0 0;
-    background: #0a0c10;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 12px;
-    font-family: var(--mono);
-    font-size: 12px;
-    line-height: 1.55;
-    color: #b6bfd4;
-    max-height: 280px;
-    overflow: auto;
-    white-space: pre;
+    margin: 10px 0 0; background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px; font-family: var(--mono); font-size: 12px;
+    line-height: 1.55; color: var(--muted); max-height: 280px;
+    overflow: auto; white-space: pre;
   }
   #log-pre::-webkit-scrollbar, .table-wrap::-webkit-scrollbar { width: 9px; height: 9px; }
-  #log-pre::-webkit-scrollbar-thumb, .table-wrap::-webkit-scrollbar-thumb { background: #232733; border-radius: 5px; }
+  #log-pre::-webkit-scrollbar-thumb, .table-wrap::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
 
   footer { text-align: center; color: var(--muted); font-size: 11.5px; padding: 16px 12px 28px; opacity: 0.85; }
 
   /* ---------- unlock overlay ---------- */
   #unlock {
-    position: fixed;
-    inset: 0;
-    z-index: 200;
-    background: rgba(8, 10, 15, 0.82);
-    backdrop-filter: blur(6px);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 16px;
+    position: fixed; inset: 0; z-index: 200;
+    background: var(--overlay-bg); backdrop-filter: blur(6px);
+    display: flex; align-items: center; justify-content: center; padding: 16px;
   }
   .unlock-card { width: min(360px, 100%); display: flex; flex-direction: column; gap: 10px; }
   .unlock-card h2 { margin: 0; font-size: 16px; }
   .unlock-card p { margin: 0; font-size: 12px; color: var(--muted); }
-  .unlock-card code {
-    font-family: var(--mono);
-    font-size: 11.5px;
-    background: var(--card2);
-    border: 1px solid var(--border);
-    border-radius: 5px;
-    padding: 1px 5px;
-  }
   .unlock-card input { width: 100%; }
   .unlock-card .btn { width: 100%; }
 
   /* ---------- toasts ---------- */
   #toasts {
-    position: fixed;
-    right: 16px;
-    bottom: 16px;
-    z-index: 300;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    max-width: min(90vw, 340px);
+    position: fixed; right: 16px; bottom: 16px; z-index: 300;
+    display: flex; flex-direction: column; gap: 8px; max-width: min(90vw, 340px);
   }
   .toast {
-    background: #1a1f2b;
-    border: 1px solid var(--border);
-    border-left: 3px solid var(--accent);
-    color: var(--text);
-    border-radius: 10px;
-    padding: 9px 13px;
-    font-size: 12.5px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
-    word-break: break-word;
-    opacity: 1;
-    transform: none;
-    transition: opacity 0.3s, transform 0.3s;
+    background: var(--panel2); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    color: var(--text); border-radius: 10px; padding: 9px 13px; font-size: 12.5px;
+    box-shadow: var(--shadow-toast); word-break: break-word;
+    opacity: 1; transform: none; transition: opacity 0.3s, transform 0.3s;
   }
-  .toast.ok { border-left-color: var(--green); }
-  .toast.error { border-left-color: var(--red); }
+  .toast.ok { border-left-color: var(--good); }
+  .toast.error { border-left-color: var(--bad); }
   .toast.gone { opacity: 0; transform: translateY(6px); }
 
   @media (max-width: 640px) {
@@ -307,12 +278,34 @@ export const dashboardHtml = `<!DOCTYPE html>
   <span class="chip mono" id="base-url" title="bridge base URL">–</span>
   <span class="chip" id="chip-upstream" title="upstream active/queued/max">upstream –/0/–</span>
   <span class="spacer"></span>
+  <button class="btn" id="btn-theme" type="button" title="toggle theme">☼</button>
   <button class="btn" id="btn-refresh" type="button" title="refresh now">Refresh</button>
 </header>
 <main>
   <section>
     <h2>Models</h2>
     <div class="models-row" id="models-row"><div class="empty">Loading…</div></div>
+  </section>
+  <section>
+    <h2>Session token</h2>
+    <div class="card">
+      <div class="muted">Your DeepSeek login token — needed once per device. Treat it like a password.</div>
+      <div class="token-row">
+        <span class="mono msg" id="token-value">Waiting for API key…</span>
+        <span class="token-actions">
+          <button class="btn sm" id="btn-token-refresh" type="button" title="re-check session token">↻</button>
+          <button class="btn" id="btn-token-show" type="button" disabled>Show</button>
+          <button class="btn" id="btn-token-copy" type="button" disabled>Copy token</button>
+          <button class="btn" id="btn-token-json" type="button" disabled>Copy session JSON</button>
+        </span>
+      </div>
+      <div class="token-meta muted" id="token-meta"></div>
+      <div class="token-hint">
+        <span class="muted">On another machine:</span>
+        <code id="token-cmd">deepseek --login --manual --token &lt;token&gt;</code>
+        <button class="btn sm" id="btn-token-cmd" type="button" disabled>Copy setup command</button>
+      </div>
+    </div>
   </section>
   <section>
     <h2>Conversations</h2>
@@ -355,7 +348,7 @@ export const dashboardHtml = `<!DOCTYPE html>
     </details>
   </section>
 </main>
-<footer>loopback-only · API key stays in your browser</footer>
+<footer>loopback-only · API key stays in your browser · dashboard is a static page · polls only while the tab is visible</footer>
 <div id="toasts"></div>
 <div id="unlock" class="hidden">
   <div class="unlock-card card">
@@ -390,6 +383,16 @@ export const dashboardHtml = `<!DOCTYPE html>
     filterSig: null,
     modelsSig: null,
     lastPollErr: 0
+  };
+  var tokenState = {
+    pending: false,
+    token: '',
+    cookies: 0,
+    updatedAt: 0,
+    revealed: false,
+    noSession: false,
+    oldBridge: false,
+    err: ''
   };
   try { state.key = localStorage.getItem('dsb.key') || ''; } catch (e) {}
 
@@ -472,6 +475,7 @@ export const dashboardHtml = `<!DOCTYPE html>
     hideUnlock();
     toast('Key saved', 'ok');
     refreshAll();
+    loadToken();
   }
 
   /* ---------------- header ---------------- */
@@ -487,10 +491,18 @@ export const dashboardHtml = `<!DOCTYPE html>
     var q = num(up.queued);
     var badge = $('chip-upstream');
     badge.textContent = 'upstream ' + dash(up.active) + '/' + q + '/' + dash(up.max);
-    badge.classList.toggle('amber', q > 0);
+    badge.classList.toggle('accent', q > 0);
     var dot = $('dot');
     dot.className = 'dot ' + (h ? (h.ok ? 'up' : 'down') : '');
     dot.title = h && h.ok ? 'bridge is up' : 'bridge not responding';
+  }
+
+  /* ---------------- theme ---------------- */
+  function applyTheme(t) {
+    document.documentElement.setAttribute('data-theme', t);
+    var b = $('btn-theme');
+    b.textContent = t === 'light' ? '☾' : '☼';
+    b.title = t === 'light' ? 'Switch to dark theme' : 'Switch to light theme';
   }
 
   /* ---------------- models ---------------- */
@@ -588,6 +600,104 @@ export const dashboardHtml = `<!DOCTYPE html>
         + '</div>';
     }
     host.innerHTML = html;
+  }
+
+  /* ---------------- session token ---------------- */
+  function maskToken(t) {
+    if (typeof t !== 'string' || t.length < 12) return '••••••••••••';
+    return t.slice(0, 6) + '••••••••' + t.slice(-4);
+  }
+  function renderToken() {
+    var v = $('token-value');
+    var has = !!tokenState.token;
+    var ids = ['btn-token-show', 'btn-token-copy', 'btn-token-json', 'btn-token-cmd'];
+    for (var i = 0; i < ids.length; i++) $(ids[i]).disabled = !has;
+    $('btn-token-show').textContent = tokenState.revealed ? 'Hide' : 'Show';
+    if (!has) {
+      v.className = 'mono msg';
+      var msg = 'Checking…';
+      if (!tokenState.pending) {
+        if (tokenState.noSession) msg = 'No DeepSeek session — run <code>deepseek --login</code>';
+        else if (tokenState.oldBridge) msg = 'Requires bridge 0.7.1+';
+        else if (tokenState.err) msg = 'Token check failed: ' + esc(tokenState.err);
+        else msg = 'Waiting for API key…';
+      }
+      v.innerHTML = msg;
+      $('token-cmd').textContent = 'deepseek --login --manual --token <token>';
+      $('token-meta').textContent = '';
+      return;
+    }
+    v.className = 'mono';
+    var shown = tokenState.revealed ? tokenState.token : maskToken(tokenState.token);
+    v.textContent = shown;
+    $('token-cmd').textContent = 'deepseek --login --manual --token ' + shown;
+    var parts = [];
+    if (num(tokenState.cookies)) parts.push(num(tokenState.cookies) + ' cookies');
+    if (num(tokenState.updatedAt)) parts.push('updated ' + fmtAge(tokenState.updatedAt) + ' ago');
+    $('token-meta').textContent = parts.join(' · ');
+  }
+  function loadToken() {
+    if (!state.key) {
+      tokenState.token = '';
+      renderToken();
+      return;
+    }
+    if (tokenState.pending) return;
+    tokenState.pending = true;
+    tokenState.noSession = false;
+    tokenState.oldBridge = false;
+    tokenState.err = '';
+    renderToken();
+    fetch('/v1/bridge/session/token', { headers: { 'Authorization': 'Bearer ' + state.key } }).then(function (res) {
+      return res.text().then(function (body) {
+        var d = null;
+        try { d = body ? JSON.parse(body) : null; } catch (e) {}
+        if (res.status === 401) {
+          var had = !!state.key;
+          clearKey();
+          if (had) toast('Unauthorized — key cleared', 'error');
+          tokenState.token = '';
+          tokenState.err = 'unauthorized';
+        } else if (res.status === 404) {
+          tokenState.token = '';
+          if (d && (d.ok === false || d.reason === 'no_session')) tokenState.noSession = true;
+          else tokenState.oldBridge = true;
+        } else if (!res.ok) {
+          tokenState.token = '';
+          tokenState.err = 'HTTP ' + res.status;
+        } else if (!d || d.ok === false || typeof d.token !== 'string' || !d.token) {
+          tokenState.token = '';
+          tokenState.noSession = true;
+        } else {
+          tokenState.token = d.token;
+          tokenState.cookies = num(d.cookiesCount);
+          tokenState.updatedAt = typeof d.updatedAt === 'number' ? d.updatedAt : 0;
+        }
+      });
+    }).catch(function () {
+      tokenState.token = '';
+      tokenState.err = 'network error';
+    }).then(function () {
+      tokenState.pending = false;
+      renderToken();
+    });
+  }
+  function copySessionJson(btn) {
+    if (!state.key) return;
+    fetch('/v1/bridge/session/token?full=1', { headers: { 'Authorization': 'Bearer ' + state.key } }).then(function (res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    }).then(function (d) {
+      if (!d || d.ok === false || typeof d.token !== 'string' || !d.token) {
+        toast('No session token to export', 'error');
+        return;
+      }
+      var out = { token: d.token, cookies: Array.isArray(d.cookies) ? d.cookies : [] };
+      if (d.userAgent) out.userAgent = d.userAgent;
+      copyText(JSON.stringify(out, null, 2), btn);
+    }).catch(function (err) {
+      toast('Session JSON failed: ' + (err && err.message ? err.message : 'error'), 'error');
+    });
   }
 
   /* ---------------- conversations ---------------- */
@@ -712,12 +822,29 @@ export const dashboardHtml = `<!DOCTYPE html>
   }
   function wire() {
     $('btn-refresh').addEventListener('click', refreshAll);
+    $('btn-theme').addEventListener('click', function () {
+      var next = document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+      try { localStorage.setItem('dsb.theme', next); } catch (e) {}
+      applyTheme(next);
+    });
     $('btn-save').addEventListener('click', saveKey);
     $('key-input').addEventListener('keydown', function (e) { if (e.key === 'Enter') saveKey(); });
     $('search').addEventListener('input', function (e) { state.search = e.target.value; renderConvos(); });
     $('model-filter').addEventListener('change', function (e) { state.model = e.target.value; renderConvos(); });
     $('sort').addEventListener('change', function (e) { state.sort = e.target.value; renderConvos(); });
     $('btn-more').addEventListener('click', function () { state.limit += 100; renderConvos(); });
+    $('btn-token-refresh').addEventListener('click', loadToken);
+    $('btn-token-show').addEventListener('click', function () {
+      tokenState.revealed = !tokenState.revealed;
+      renderToken();
+    });
+    $('btn-token-copy').addEventListener('click', function () {
+      if (tokenState.token) copyText(tokenState.token, this);
+    });
+    $('btn-token-json').addEventListener('click', function () { copySessionJson(this); });
+    $('btn-token-cmd').addEventListener('click', function () {
+      if (tokenState.token) copyText('deepseek --login --manual --token ' + tokenState.token, this);
+    });
     $('models-row').addEventListener('click', function (ev) {
       var btn = ev.target && ev.target.closest ? ev.target.closest('button[data-idx]') : null;
       if (!btn) return;
@@ -772,9 +899,11 @@ export const dashboardHtml = `<!DOCTYPE html>
   });
 
   wire();
+  applyTheme(document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark');
   if (state.key) hideUnlock();
   else showUnlock();
   refreshAll();
+  loadToken();
 })();
 </script>
 </body>
