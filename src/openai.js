@@ -58,7 +58,7 @@ const slotWaiters = [];
 
 function clampMaxUpstream(v) {
   const n = Math.floor(Number(v));
-  if (!Number.isFinite(n)) return 3;
+  if (!Number.isFinite(n)) return 2;
   return Math.min(16, Math.max(1, n));
 }
 

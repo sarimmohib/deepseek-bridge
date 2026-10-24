@@ -408,7 +408,7 @@ restart.
 | `toolMode` | `auto` | Set `"off"` to disable tool-call emulation |
 | `contextSwitchAt` | `0.8` | Fraction of the model context window after which a conversation restarts fresh |
 | `maxFreshTranscriptChars` | `200000` | Cap for transcripts replayed into a fresh session |
-| `maxUpstream` | `3` | Maximum simultaneous DeepSeek requests; extras queue FIFO |
+| `maxUpstream` | `2` | Maximum simultaneous DeepSeek requests; extras queue FIFO. Measured: DeepSeek starts returning empty replies above ~2 parallel generations per account |
 | `systemPrompt` | empty | Bridge-provided system prompt, prepended to every request |
 | `systemPreset` | empty | Named preset instead of `systemPrompt`: `coding`, `concise`, `tutor`, `agent` |
 
@@ -774,7 +774,7 @@ Multiple harness agents can share one bridge. Each conversation key
 (model + system prompt + first user message) is distinct, so concurrent agents
 get independent DeepSeek conversations automatically — no per-agent setup.
 
-Set `"maxUpstream"` in the config (default `3`, clamped to 1-16) to cap how
+Set `"maxUpstream"` in the config (default `2`, clamped to 1-16) to cap how
 many requests hit DeepSeek at the same time; extras queue FIFO and take the
 first freed slot. This protects the single web session from parallel-swarm
 rate limits without serializing every request. The queue is observable:

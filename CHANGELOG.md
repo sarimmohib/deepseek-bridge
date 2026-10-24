@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.2
+
+- Lowered the default `maxUpstream` from 3 to 2. Measured under load:
+  DeepSeek reliably serves ~2 parallel generations per account, while 3+
+  concurrent generations increasingly return empty replies (a 10-way burst
+  produced empty completions for 20% of requests even after retries; a
+  sequential trickle produced none in 33 requests). Set `maxUpstream` higher
+  in the config if your account tolerates it — the queue still caps
+  everything FIFO and surfaced failures are clean retriable 502s.
+
 ## 0.6.1
 
 - Hardened reply integrity end to end: a `/chat/resume_stream` replay that

@@ -58,7 +58,7 @@ export function loadConfig({ persist = true } = {}) {
     // Conversation-intelligence knobs.
     contextSwitchAt: clampFraction(saved.contextSwitchAt, 0.8), // fraction of the context window; 0 < v <= 1
     maxFreshTranscriptChars: clampInt(saved.maxFreshTranscriptChars, 200000, 1),
-    maxUpstream: clampInt(saved.maxUpstream, 3, 1, 16),
+    maxUpstream: clampInt(saved.maxUpstream, 2, 1, 16),
     systemPrompt: typeof saved.systemPrompt === 'string' ? saved.systemPrompt : '',
     systemPreset: typeof saved.systemPreset === 'string' ? saved.systemPreset : '',
   };
