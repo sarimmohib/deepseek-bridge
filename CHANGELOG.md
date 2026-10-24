@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.7
+
+- DEGENERATE DSML LOOP detection: under rate pressure DeepSeek can fall
+  into emitting a wall of empty DSML tags (hundreds of <｜｜DSML｜｜>
+  pairs — observed on the Gummy Bears build with the Continue button
+  offered after each wall). The wall is not a usable reply, it poisons the
+  session's context (the model conditions on its own garbage and keeps
+  looping), and auto-Continue only feeds it. The bridge now detects the
+  wall (>30 empty-name DSML tags with no salvaged tool call and no usable
+  text), drops the poisoned session, notes the throttle valve, and
+  surfaces a retriable degenerate_reply error — so the client's retry
+  replays into a fresh, clean session. Walls that contain real text or a
+  real tool call keep the old strip/salvage behavior.
+
 ## 0.7.6
 
 - FILE-UPLOAD rate limits handled properly: uploads draw from their own

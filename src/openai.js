@@ -581,16 +581,21 @@ export async function handleChatCompletions(req, res, body, ctx) {
       // throttling that outlives the cool-down valve) recover the same way:
       // abandon the bloated session and replay into a fresh one.
       const emptyReply = err?.code === 'empty_reply';
+      // A degenerate DSML wall poisons the DeepSeek session: restart from a
+      // fresh one even though the wall technically streamed (it was garbage,
+      // and the fresh replay carries the real transcript).
+      const degenerate = err?.code === 'degenerate_reply';
       if (
         activePlan.continuation &&
-        (invalidParent || emptyReply) &&
-        !content &&
-        !reasoning
+        (invalidParent || emptyReply || degenerate) &&
+        (!content && !reasoning || degenerate)
       ) {
         log(
-          emptyReply
-            ? 'persistent empty replies from DeepSeek; retrying from a fresh session'
-            : 'saved DeepSeek parent was rejected; retrying from a fresh session',
+          degenerate
+            ? 'degenerate DSML loop; retrying from a fresh session'
+            : emptyReply
+              ? 'persistent empty replies from DeepSeek; retrying from a fresh session'
+              : 'saved DeepSeek parent was rejected; retrying from a fresh session',
         );
         store.deleteConversation?.(key);
         // The fresh prompt replays the whole transcript, but `attachments` was
@@ -627,6 +632,25 @@ export async function handleChatCompletions(req, res, body, ctx) {
     const toolCalls = toolsActive
       ? extractToolCalls(fullContent, { toolNames, paramToolIndex })
       : { calls: [], cleaned: fullContent, hadBlock: false };
+
+    // Degenerate DSML loop: under rate pressure the model can fall into
+    // emitting a wall of empty DSML tags (<｜｜DSML｜｜>). The wall is not a
+    // usable reply — it poisons the session's context (the model conditions
+    // on its own garbage and keeps looping), and auto-Continue would only
+    // feed it. Drop the stored session so the client's retry replays into a
+    // fresh one, and surface a retriable error.
+    const emptyTagWall = (fullContent.match(/<\s*\/?\s*[｜|]+\s*DSML\s*[｜|]+\s*>/gi) || []).length;
+    const usableAfterStrip = toolsActive ? toolCalls.cleaned.trim() : '';
+    if (emptyTagWall > 30 && toolCalls.calls.length === 0 && !usableAfterStrip) {
+      noteUpstreamThrottleEvent();
+      log(`degenerate DSML loop detected (${emptyTagWall} empty tags); dropping the session`);
+      store.deleteConversation?.(key);
+      throw new BridgeError(
+        'DeepSeek fell into a degenerate loop and produced no usable output.',
+        'degenerate_reply',
+        502,
+      );
+    }
 
     if (toolCalls.calls.length === 0) {
       if (unemitted) {

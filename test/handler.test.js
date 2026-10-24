@@ -744,6 +744,39 @@ test('persistent empty replies restart from a fresh session', async () => {
   assert.equal(deletes, 1);
 });
 
+test('a degenerate DSML wall surfaces an error and drops the session', async () => {
+  upstreamThrottle.level = 0;
+  upstreamThrottle.until = 0;
+  let deleted = 0;
+  const wall = '<｜｜DSML｜｜>\n'.repeat(60);
+  const agent = {
+    async run(_request, handlers) {
+      handlers.onReady({ sessionId: 'sess_wall', messageId: 1 });
+      handlers.onDelta({ kind: 'content', text: wall });
+      return { usage: { completion: 10 }, finish: 'stop', sessionId: 'sess_wall', messageId: 1 };
+    },
+  };
+  const store = {
+    getConversation: () => ({ sessionId: 'sess_old', parentId: 1, digest: 'd', turns: 2 }),
+    deleteConversation: () => {
+      deleted++;
+    },
+    setConversation: () => {},
+  };
+  const res = new FakeResponse();
+  await handleChatCompletions(
+    {},
+    res,
+    { model: 'deepseek-reasoner', stream: false, messages: [{ role: 'user', content: 'continue the build' }] },
+    { agent, store, log: () => {}, config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto' } },
+  );
+  const body = JSON.parse(res.chunks.join(''));
+  assert.equal(body.error.code, 'degenerate_reply');
+  assert.equal(deleted, 1); // the poisoned session is dropped for the retry
+  upstreamThrottle.level = 0;
+  upstreamThrottle.until = 0;
+});
+
 test.after(() => {
   // the empty_reply tests raise the global upstream throttle; drop it so
   // later suites in this process are not paced by a leftover cooldown
