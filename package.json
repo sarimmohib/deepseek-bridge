@@ -1,6 +1,6 @@
 {
   "name": "deepseek-bridge",
-  "version": "0.7.5",
+  "version": "0.7.6",
   "private": true,
   "type": "module",
   "description": "OpenAI-compatible local API for chat.deepseek.com. Copies your web session once, then runs without Chrome.",

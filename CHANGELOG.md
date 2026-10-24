@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.6
+
+- FILE-UPLOAD rate limits handled properly: uploads draw from their own
+  stricter DeepSeek quota (observed: "rate limit reached" on image uploads
+  during a dsh agent run, with the harness's own 5×5 retries unable to
+  outlast the window). Upload rate-limit failures now use the long
+  throttle-aware retry schedule, raise the global cool-down valve so chat
+  requests pace too, and surface a clean error only after the window.
+- Uploaded file ids are cached by content hash (account-scoped on DeepSeek,
+  LRU-capped at 60): harness retries that re-send the same attachment
+  upload once per bridge lifetime instead of hammering the upload quota.
+
 ## 0.7.5
 
 - DSML SALVAGE for degraded tool calls: under sustained rate pressure

@@ -830,7 +830,7 @@ test('spaces consecutive uploads with a settle gap', async () => {
     },
   );
 
-  const second = { ...txtAttachment, name: 'b.txt' };
+  const second = { ...txtAttachment, name: 'b.txt', dataBase64: Buffer.from('different bytes for the settle gap').toString('base64') };
   const result = await client.run(
     { prompt: 'two files', thinking: true, search: false, attachments: [txtAttachment, second] },
     {},
@@ -1146,4 +1146,86 @@ test('a recovery replay that is itself stopped keeps resuming', async () => {
     { kind: 'content', text: ' two done' },
   ]);
   assert.equal(result.finish, 'stop');
+});
+
+test('rate-limited uploads retry on the long schedule and succeed', async () => {
+  saveSession({ token, cookies: [] });
+  const client = new DirectClient({ retryDelays: [0, 0, 0], emptyRetryDelays: [0, 0, 0] });
+  let uploadCalls = 0;
+
+  globalThis.fetch = baseFetch(
+    () =>
+      streamResponse([
+        'event: ready\ndata: {"request_message_id":1,"response_message_id":2}\n\n',
+        'data: {"v":{"response":{"fragments":[{"type":"RESPONSE","content":"done"}]}}}\n\n',
+        'event: close\ndata: {}\n\n',
+      ]),
+    null,
+    null,
+    () => {
+      uploadCalls++;
+      if (uploadCalls <= 2) {
+        return new Response(
+          JSON.stringify({ code: 0, msg: '', data: { biz_code: 1, biz_msg: 'rate limit reached' } }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          code: 0, msg: '', data: { biz_code: 0, biz_data: { id: 'file-ok-1', status: 'SUCCESS' } },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    },
+  );
+
+  const result = await client.run(
+    {
+      prompt: 'describe the image', thinking: false, search: false,
+      attachments: [{ kind: 'image', name: 'shot.png', mime: 'image/png', dataBase64: Buffer.from('pngbytes').toString('base64') }],
+    },
+    {},
+  );
+
+  assert.equal(uploadCalls, 3); // two rate-limited attempts, then success
+  assert.equal(result.finish, 'stop');
+  const { upstreamThrottle } = await import('../src/direct.js');
+  assert.ok(upstreamThrottle.level > 0, 'the valve should survive the success decay after two rate hits');
+  upstreamThrottle.level = 0;
+  upstreamThrottle.until = 0;
+});
+
+test('identical attachments upload once per client (content-hash cache)', async () => {
+  saveSession({ token, cookies: [] });
+  const client = new DirectClient({ retryDelays: [0, 0, 0] });
+  let uploadCalls = 0;
+
+  globalThis.fetch = baseFetch(
+    () =>
+      streamResponse([
+        'event: ready\ndata: {"request_message_id":1,"response_message_id":2}\n\n',
+        'data: {"v":{"response":{"fragments":[{"type":"RESPONSE","content":"ok"}]}}}\n\n',
+        'event: close\ndata: {}\n\n',
+      ]),
+    null,
+    null,
+    () => {
+      uploadCalls++;
+      return new Response(
+        JSON.stringify({
+          code: 0, msg: '', data: { biz_code: 0, biz_data: { id: 'file-' + uploadCalls, status: 'SUCCESS' } },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    },
+  );
+
+  const att = { kind: 'file', name: 'same.txt', mime: 'text/plain', dataBase64: Buffer.from('same bytes').toString('base64') };
+  await client.run({ prompt: 'one', thinking: false, search: false, attachments: [att] }, {});
+  await client.run({ prompt: 'two', thinking: false, search: false, attachments: [{ ...att }] }, {});
+
+  assert.equal(uploadCalls, 1); // the second run reused the cached file id
+  const { upstreamThrottle } = await import('../src/direct.js');
+  upstreamThrottle.level = 0;
+  upstreamThrottle.until = 0;
 });

@@ -5,6 +5,7 @@
  * Chrome does not have to stay open. The session (cookies + localStorage
  * userToken) is captured once by `deepseek --login`.
  */
+import crypto from 'node:crypto';
 import { Blob } from 'node:buffer';
 import { BridgeError } from './agent.js';
 import { solveChallenge } from './pow.js';
@@ -100,7 +101,8 @@ function isTransientError(err) {
     code === 'file_not_ready' ||
     // Retried by the start loop only while nothing reached the client; a
     // persistently empty model surfaces after MAX_START_ATTEMPTS.
-    code === 'empty_reply'
+    code === 'empty_reply' ||
+    code === 'upload_rate_limited'
   ) {
     return true;
   }
@@ -719,7 +721,13 @@ export class DirectClient {
       let code = 'upload_failed';
       if (res.status === 401 || res.status === 403 || /sign in|login|token|not logged/i.test(String(msg))) {
         code = 'not_signed_in';
-      } else if (isTransientStatus(res.status) || /busy|overload|rate.?limit|too many|try again|temporar/i.test(String(msg))) {
+      } else if (/rate.?limit/i.test(String(msg))) {
+        // Uploads draw from their own, stricter quota. Note the global valve
+        // so every client paces while the window is open, and use the long
+        // retry schedule (rate windows outlast the short backoff).
+        noteUpstreamThrottleEvent();
+        code = 'upload_rate_limited';
+      } else if (isTransientStatus(res.status) || /busy|overload|too many|try again|temporar/i.test(String(msg))) {
         code = 'server_busy';
       }
       throw new BridgeError(`file upload failed (${att.name || 'file'}): ${msg}`, code, res.status || 502);
@@ -744,7 +752,7 @@ export class DirectClient {
       }
       if (!isTransientError(last) || i === attempts - 1) throw last;
       this.log(`${label || 'DeepSeek request'} failed (${last.message}); retrying...`);
-      await sleep(this.nextRetryDelay(i, last.retryAfter), signal);
+      await sleep(this.nextRetryDelay(i, last.retryAfter, last.code === 'upload_rate_limited' || last.code === 'empty_reply' ? this.emptyRetryDelays : undefined), signal);
     }
   }
 
@@ -1148,8 +1156,18 @@ export class DirectClient {
 
       const fileIds = [];
       const attachments = payload.attachments || [];
+      // Uploaded file ids are account-scoped on DeepSeek, so the same bytes
+      // never need a second upload — harness retries re-send attachments.
+      if (!this.fileCache) this.fileCache = new Map();
       for (let i = 0; i < attachments.length; i++) {
         const att = attachments[i];
+        const contentKey = crypto.createHash('sha256').update(att.dataBase64 || '').digest('hex');
+        if (this.fileCache.has(contentKey)) {
+          const cached = this.fileCache.get(contentKey);
+          fileIds.push(cached);
+          if (debugLines) debugLines.push(`upload ${att.name || 'file'} cached -> ${cached}`);
+          continue;
+        }
         const t0 = Date.now();
         const fileId = await this.withTransientRetry((attemptSignal) => this.uploadAttachment(att, attemptSignal), {
           signal,
@@ -1157,6 +1175,8 @@ export class DirectClient {
           label: `upload ${att.name || 'file'}`,
           idleTimeout: UPLOAD_IDLE_TIMEOUT,
         });
+        this.fileCache.set(contentKey, fileId);
+        if (this.fileCache.size > 60) this.fileCache.delete(this.fileCache.keys().next().value);
         fileIds.push(fileId);
         if (debugLines) {
           debugLines.push(
