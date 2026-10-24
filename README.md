@@ -781,6 +781,14 @@ rate limits without serializing every request. The queue is observable:
 `/health` and `/v1/bridge/status` report `upstream: {active, queued, max}`,
 and `deepseek ui` shows the same counts in its health panel.
 
+Mind the account-level rate throttle on top of the parallelism cap: rapid
+bursts (measured trigger: ~13+ back-to-back requests, or a sustained heavy
+wave) trip a throttle window that can outlast the burst by a few minutes.
+Empty replies inside that window are retried on a dedicated 3s/9s/20s/35s
+backoff, so short windows are absorbed invisibly; a deep window surfaces a
+clean retriable `empty_reply` 502. After a heavy burst, give the account a
+few quiet minutes (or pace the swarm) before the next sustained load.
+
 ## How it works
 
 - **Direct session.** `deepseek --login` asks the extension for the
