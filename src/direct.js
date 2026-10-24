@@ -1273,7 +1273,8 @@ export class DirectClient {
         //    openai.js passes status/code through unchanged — and the client
         //    retries the whole request. fileRetryUsed caps this at one retry
         //    so a permanently stuck file cannot loop.
-        if (failure.code === 'empty_reply') noteUpstreamThrottleEvent();
+        if (failure.code === 'empty_reply' && !emitted.content && !emitted.reasoning)
+          noteUpstreamThrottleEvent();
         if (failure.code === 'file_not_ready') {
           if (fileRetryUsed || emitted.content || emitted.reasoning) throw failure;
           fileRetryUsed = true;
@@ -1291,8 +1292,9 @@ export class DirectClient {
           // Unreachable for file_not_ready (handled above), kept explicit so
           // the fresh-retry-vs-recover rule survives future reordering.
           failure.code !== 'file_not_ready' &&
-          // An empty reply must be retried as a fresh completion, not
-          // continued: the dangling message has nothing to resume.
+          // An empty or truncated reply must be retried as a fresh
+          // completion, not continued: the dangling message has nothing
+          // to resume.
           failure.code !== 'empty_reply';
         if (canRecover) {
           const recovered = await this.recover({
