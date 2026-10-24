@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.4
+
+- ROOT-CAUSE FIX for long builds halting: DeepSeek rate-stops long
+  generations and marks the message STOPPED (chat.deepseek.com shows a
+  "Continue" button) — the bridge mapped that status to null and delivered
+  the truncated fragment as a complete reply, so harness agents ended their
+  turns mid-build. STOPPED is now a first-class status: the bridge presses
+  Continue automatically (resume_stream first, then /chat/continue) and
+  rides the generation to a real FINISHED, deduplicating every replay
+  boundary — including nested stops inside the recovery itself.
+
 ## 0.7.3
 
 - Persistent empty replies on a long-lived DeepSeek session (a rate window

@@ -1043,3 +1043,107 @@ test('empty_reply raises the global throttle and success decays it', async () =>
 });
 
 
+
+test('a DeepSeek-stopped generation auto-resumes via resume_stream', async () => {
+  saveSession({ token, cookies: [] });
+  const client = new DirectClient({ retryDelays: [0, 0, 0] });
+  let completionCalls = 0;
+  let resumeCalls = 0;
+
+  globalThis.fetch = baseFetch(
+    () => {
+      completionCalls++;
+      return streamResponse([
+        'event: ready\ndata: {"request_message_id":1,"response_message_id":2}\n\n',
+        'data: {"v":{"response":{"status":"STOPPED","fragments":[{"type":"RESPONSE","content":"const SX=gx+1, SY=gy+1, SZ=gz+1;"}]}}}\n\n',
+        'event: close\ndata: {"click_behavior":"none","auto_resume":false}\n\n',
+      ]);
+    },
+    () => {
+      throw new Error('continue should not be needed when resume_stream works');
+    },
+    () => {
+      resumeCalls++;
+      return streamResponse([
+        'event: ready\ndata: {"request_message_id":1,"response_message_id":2}\n\n',
+        'data: {"v":{"response":{"status":"WIP","fragments":[{"type":"RESPONSE","content":"const SX=gx+1, SY=gy+1, SZ=gz+1;"}]}}}\n\n',
+        'data: {"p":"response/fragments/-1/content","o":"APPEND","v":"\\nfor each blob: {}"}\n\n',
+        'data: {"p":"response/status","o":"SET","v":"FINISHED"}\n\n',
+        'event: close\ndata: {"click_behavior":"none","auto_resume":false}\n\n',
+      ]);
+    },
+  );
+
+  const deltas = [];
+  const result = await client.run(
+    { prompt: 'long generation', thinking: true, search: false, attachments: [] },
+    { onDelta: (delta) => deltas.push(delta) },
+  );
+
+  assert.equal(completionCalls, 1); // the stopped completion is not retried from scratch
+  assert.equal(resumeCalls, 1);
+  assert.deepEqual(deltas, [
+    { kind: 'content', text: 'const SX=gx+1, SY=gy+1, SZ=gz+1;' },
+    { kind: 'content', text: '\nfor each blob: {}' },
+  ]);
+  assert.equal(result.finish, 'stop');
+});
+
+test('a recovery replay that is itself stopped keeps resuming', async () => {
+  saveSession({ token, cookies: [] });
+  const client = new DirectClient({ retryDelays: [0, 0, 0] });
+  let resumeCalls = 0;
+  let continueCalls = 0;
+
+  globalThis.fetch = baseFetch(
+    () =>
+      streamResponse([
+        'event: ready\ndata: {"request_message_id":1,"response_message_id":2}\n\n',
+        'data: {"v":{"response":{"status":"STOPPED","fragments":[{"type":"RESPONSE","content":"part one"}]}}}\n\n',
+        'event: close\ndata: {}\n\n',
+      ]),
+    () => {
+      continueCalls++;
+      return streamResponse([
+        'data: {"v":{"response":{"status":"WIP","fragments":[{"type":"RESPONSE","content":"part one + part two"}]}}}\n\n',
+        'data: {"p":"response/fragments/-1/content","o":"APPEND","v":" done"}\n\n',
+        'data: {"p":"response/status","o":"SET","v":"FINISHED"}\n\n',
+        'event: close\ndata: {}\n\n',
+      ]);
+    },
+    () => {
+      resumeCalls++;
+      if (resumeCalls === 1) {
+        // the resume replay is itself stopped mid-way
+        return streamResponse([
+          'event: ready\ndata: {"request_message_id":1,"response_message_id":2}\n\n',
+          'data: {"v":{"response":{"status":"STOPPED","fragments":[{"type":"RESPONSE","content":"part one + part"}]}}}\n\n',
+          'event: close\ndata: {}\n\n',
+        ]);
+      }
+      return streamResponse([
+        'data: {"v":{"response":{"status":"WIP","fragments":[{"type":"RESPONSE","content":"part one + part two"}]}}}\n\n',
+        'data: {"p":"response/fragments/-1/content","o":"APPEND","v":" done"}\n\n',
+        'data: {"p":"response/status","o":"SET","v":"FINISHED"}\n\n',
+        'event: close\ndata: {}\n\n',
+      ]);
+    },
+  );
+
+  const deltas = [];
+  const result = await client.run(
+    { prompt: 'nested stops', thinking: true, search: false, attachments: [] },
+    { onDelta: (delta) => deltas.push(delta) },
+  );
+
+  assert.equal(resumeCalls, 1); // first recovery attempt: resume_stream
+  assert.equal(continueCalls, 1); // then the loop falls back to /chat/continue
+  // each replay is deduped against what was already emitted, so the deltas
+  // follow the replay boundaries: part one | + part | two done
+  assert.deepEqual(deltas, [
+    { kind: 'content', text: 'part one' },
+    { kind: 'content', text: ' + part' },
+    { kind: 'content', text: ' two done' },
+  ]);
+  assert.equal(result.finish, 'stop');
+});
