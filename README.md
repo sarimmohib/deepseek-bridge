@@ -446,6 +446,7 @@ Add this to `~/.config/opencode/opencode.jsonc` (the file is normally mode
       "models": {
         "deepseek-reasoner": {
           "name": "DeepSeek V4.1 Flash Reasoner (web)",
+          "family": "deepseek",
           "capabilities": {
             "tools": true,
             "input": ["text", "image"],
@@ -459,6 +460,7 @@ Add this to `~/.config/opencode/opencode.jsonc` (the file is normally mode
         },
         "deepseek-search": {
           "name": "DeepSeek V4.1 Flash Search (web)",
+          "family": "deepseek",
           "capabilities": {
             "tools": true,
             "input": ["text", "image"],
