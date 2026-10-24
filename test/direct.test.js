@@ -1229,3 +1229,48 @@ test('identical attachments upload once per client (content-hash cache)', async 
   upstreamThrottle.level = 0;
   upstreamThrottle.until = 0;
 });
+
+test('an unknown non-FINISHED status (PAUSED) also triggers recovery', async () => {
+  saveSession({ token, cookies: [] });
+  const client = new DirectClient({ retryDelays: [0, 0, 0] });
+  let completionCalls = 0;
+  let resumeCalls = 0;
+
+  globalThis.fetch = baseFetch(
+    () => {
+      completionCalls++;
+      return streamResponse([
+        'event: ready\ndata: {"request_message_id":1,"response_message_id":2}\n\n',
+        'data: {"v":{"response":{"status":"PAUSED","fragments":[{"type":"RESPONSE","content":"mid-thought"}]}}}\n\n',
+        'event: close\ndata: {}\n\n',
+      ]);
+    },
+    () => {
+      throw new Error('continue should not be needed when resume_stream works');
+    },
+    () => {
+      resumeCalls++;
+      return streamResponse([
+        'event: ready\ndata: {"request_message_id":1,"response_message_id":2}\n\n',
+        'data: {"v":{"response":{"status":"WIP","fragments":[{"type":"RESPONSE","content":"mid-thought"}]}}}\n\n',
+        'data: {"p":"response/fragments/-1/content","o":"APPEND","v":" continued"}\n\n',
+        'data: {"p":"response/status","o":"SET","v":"FINISHED"}\n\n',
+        'event: close\ndata: {}\n\n',
+      ]);
+    },
+  );
+
+  const deltas = [];
+  const result = await client.run(
+    { prompt: 'paused mid-think', thinking: true, search: false, attachments: [] },
+    { onDelta: (delta) => deltas.push(delta) },
+  );
+
+  assert.equal(completionCalls, 1); // no retry from scratch — resume only
+  assert.equal(resumeCalls, 1);
+  assert.deepEqual(deltas, [
+    { kind: 'content', text: 'mid-thought' },
+    { kind: 'content', text: ' continued' },
+  ]);
+  assert.equal(result.finish, 'stop');
+});

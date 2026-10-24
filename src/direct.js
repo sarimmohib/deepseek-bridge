@@ -259,11 +259,10 @@ function normalizeStatus(value) {
   const upper = value.toUpperCase();
   if (upper === 'FINISHED') return 'FINISHED';
   if (upper === 'WIP') return 'WIP';
-  // DeepSeek halts generations under rate/length pressure and marks the
-  // message STOPPED — chat.deepseek.com then shows a "Continue" button.
-  // Treat it as resumable, not finished (observed on long builds).
-  if (upper === 'STOPPED' || upper === 'STOPPED_BY_USER' || upper === 'ABORTED') return 'STOPPED';
-  return null;
+  // ANY other observed status (STOPPED, PAUSED, whatever DeepSeek adds) is
+  // passed through uppercased: the completion gates treat "not explicitly
+  // FINISHED" as resumable, so new statuses are handled without changes here.
+  return upper;
 }
 
 /**
@@ -1065,7 +1064,7 @@ export class DirectClient {
         }
         const outcome = await this.readRecoveryResponse(res, { collected, attempt, debugLines });
         this.emitMissing(emitted, collected, emit);
-        if (outcome.status === 'WIP' || outcome.status === 'STOPPED') {
+        if (outcome.status && outcome.status !== 'FINISHED') {
           // The replay ended while the message was still generating — same
           // failure class as the primary-stream WIP gate. emitMissing already
           // kept the recovered suffix (and stays idempotent when the catch
@@ -1236,7 +1235,7 @@ export class DirectClient {
           if (stream.messageId != null) messageId = stream.messageId;
           if (stream.title) title = stream.title;
           if (stream.usage) usage = stream.usage;
-          if (stream.status === 'WIP' || stream.status === 'STOPPED') {
+          if (stream.status && stream.status !== 'FINISHED') {
             // The server sent its terminal marker while the message was still
             // generating. Same failure class as a truncation: recovery replays
             // the message and finishes it instead of returning a partial

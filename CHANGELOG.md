@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.8
+
+- Completion gate INVERTED to a whitelist: a stream is complete only if its
+  observed message status is explicitly FINISHED — ANY other status
+  (STOPPED, PAUSED, or whatever DeepSeek introduces later) now routes into
+  the resume/recovery machinery instead of being delivered as a complete
+  reply. Found on the Gummy build: DeepSeek stopped a generation mid-THINKING
+  with a status outside the previous blacklist, the cut reply passed as
+  complete, and the harness turn ended mid-sentence — while DeepSeek's own
+  Continue button resumed it perfectly. Statuses never seen before are
+  logged so new ones are visible in the bridge log.
+
 ## 0.7.7
 
 - DEGENERATE DSML LOOP detection: under rate pressure DeepSeek can fall
