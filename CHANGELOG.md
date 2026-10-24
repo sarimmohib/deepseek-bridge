@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.3
+
+- Empty replies are DeepSeek's per-account rate throttle, not a parallelism
+  limit (measured: 13 rapid-fire sequential requests trigger it; a slow
+  trickle never does). Empty-reply retries now back off on a dedicated
+  schedule (3s/9s/20s/35s ≈ 67s worst case) instead of the transient
+  schedule, so bursts ride out the throttle window transparently: the same
+  15-request rapid-fire run that surfaced 2 failures now passes 15/15.
+- `maxUpstream` stays a parallelism cap (default 2, from 0.6.2).
+
 ## 0.6.2
 
 - Lowered the default `maxUpstream` from 3 to 2. Measured under load:

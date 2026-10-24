@@ -847,7 +847,7 @@ test('spaces consecutive uploads with a settle gap', async () => {
 
 test('retries an empty reply and succeeds on the next attempt', async () => {
   saveSession({ token, cookies: [] });
-  const client = new DirectClient({ retryDelays: [0, 0, 0] });
+  const client = new DirectClient({ retryDelays: [0, 0, 0], emptyRetryDelays: [0, 0, 0] });
   let completionCalls = 0;
 
   globalThis.fetch = baseFetch(
@@ -886,7 +886,7 @@ test('retries an empty reply and succeeds on the next attempt', async () => {
 
 test('surfaces empty_reply after the start attempts are exhausted', async () => {
   saveSession({ token, cookies: [] });
-  const client = new DirectClient({ retryDelays: [0, 0, 0] });
+  const client = new DirectClient({ retryDelays: [0, 0, 0], emptyRetryDelays: [0, 0, 0] });
   let completionCalls = 0;
 
   globalThis.fetch = baseFetch(() => {

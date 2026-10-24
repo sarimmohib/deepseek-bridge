@@ -21,6 +21,10 @@ const SETUP_IDLE_TIMEOUT = 60 * 1000;
 // uploadAttachment never resets the idle timer, so this caps the whole upload.
 const UPLOAD_IDLE_TIMEOUT = 10 * 60 * 1000;
 const DEFAULT_RETRY_DELAYS = [700, 1800, 4000, 8000];
+// Empty replies are DeepSeek's per-account rate throttle (measured: ~13
+// rapid-fire sequential requests trigger it, ~10-15s to recover). Back off
+// properly instead of hammering through the window.
+const EMPTY_RETRY_DELAYS = [3000, 9000, 20000, 35000];
 const MAX_START_ATTEMPTS = 4;
 const MAX_RECOVERY_ATTEMPTS = 4;
 
@@ -505,15 +509,16 @@ function parseSetCookie(line) {
 /* --------------------------------------------------------------- client --- */
 
 export class DirectClient {
-  constructor({ log = () => {}, retryDelays = DEFAULT_RETRY_DELAYS } = {}) {
+  constructor({ log = () => {}, retryDelays = DEFAULT_RETRY_DELAYS, emptyRetryDelays = EMPTY_RETRY_DELAYS } = {}) {
     this.log = log;
     this.retryDelays = Array.isArray(retryDelays) && retryDelays.length ? retryDelays : DEFAULT_RETRY_DELAYS;
+    this.emptyRetryDelays =
+      Array.isArray(emptyRetryDelays) && emptyRetryDelays.length ? emptyRetryDelays : EMPTY_RETRY_DELAYS;
     this.session = loadSession();
   }
 
-  nextRetryDelay(index, retryAfter = 0) {
+  nextRetryDelay(index, retryAfter = 0, delays = this.retryDelays) {
     if (retryAfter > 0) return Math.min(60_000, retryAfter);
-    const delays = this.retryDelays;
     const base = delays[Math.min(index, delays.length - 1)];
     return base > 0 ? base + Math.floor(Math.random() * 250) : 0;
   }
@@ -1250,7 +1255,7 @@ export class DirectClient {
           if (fileRetryUsed || emitted.content || emitted.reasoning) throw failure;
           fileRetryUsed = true;
           this.log(`file ${failure.fileNames || 'attachment'} was still processing; retrying...`);
-          await sleep(this.nextRetryDelay(startFailures, failure.retryAfter), signal);
+          await sleep(this.nextRetryDelay(startFailures, failure.retryAfter, failure.code === 'empty_reply' ? this.emptyRetryDelays : undefined), signal);
           startFailures++;
           continue;
         }
@@ -1291,7 +1296,7 @@ export class DirectClient {
         if (!isTransientError(failure) || startFailures >= MAX_START_ATTEMPTS - 1) throw failure;
 
         this.log(`completion attempt failed (${failure.message}); retrying from the start...`);
-        await sleep(this.nextRetryDelay(startFailures, failure.retryAfter), signal);
+        await sleep(this.nextRetryDelay(startFailures, failure.retryAfter, failure.code === 'empty_reply' ? this.emptyRetryDelays : undefined), signal);
         startFailures++;
       }
     } catch (err) {
