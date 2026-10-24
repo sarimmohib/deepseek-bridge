@@ -25,6 +25,27 @@ const DEFAULT_RETRY_DELAYS = [700, 1800, 4000, 8000];
 // rapid-fire sequential requests trigger it, ~10-15s to recover). Back off
 // properly instead of hammering through the window.
 const EMPTY_RETRY_DELAYS = [3000, 9000, 20000, 35000];
+
+// Account-level throttle valve. DeepSeek's empty replies are a rate window,
+// and under concurrent harness load each client's private backoff still lets
+// the next client hammer straight into it. These helpers publish a GLOBAL
+// cool-down: every upstream acquisition waits it out, and successes decay it.
+export const upstreamThrottle = { until: 0, level: 0 };
+const THROTTLE_STEPS = [10_000, 20_000, 40_000, 80_000];
+
+export function noteUpstreamThrottleEvent() {
+  upstreamThrottle.level = Math.min(upstreamThrottle.level + 1, THROTTLE_STEPS.length);
+  upstreamThrottle.until = Date.now() + THROTTLE_STEPS[upstreamThrottle.level - 1];
+}
+
+export function noteUpstreamSuccess() {
+  upstreamThrottle.level = Math.max(0, upstreamThrottle.level - 1);
+  if (upstreamThrottle.level === 0) upstreamThrottle.until = 0;
+}
+
+export function upstreamCooldownMs() {
+  return Math.max(0, upstreamThrottle.until - Date.now());
+}
 const MAX_START_ATTEMPTS = 4;
 const MAX_RECOVERY_ATTEMPTS = 4;
 
@@ -1230,6 +1251,7 @@ export class DirectClient {
             // reached the client so the start-retry loop below reruns it.
             throw new BridgeError('DeepSeek returned an empty reply.', 'empty_reply', 502);
           }
+          noteUpstreamSuccess();
           return { sessionId, messageId, usage, title, finish: 'stop', debugLines };
         } catch (err) {
           failure = normalizeAttemptError(err, attempt, signal);
@@ -1251,6 +1273,7 @@ export class DirectClient {
         //    openai.js passes status/code through unchanged — and the client
         //    retries the whole request. fileRetryUsed caps this at one retry
         //    so a permanently stuck file cannot loop.
+        if (failure.code === 'empty_reply') noteUpstreamThrottleEvent();
         if (failure.code === 'file_not_ready') {
           if (fileRetryUsed || emitted.content || emitted.reasoning) throw failure;
           fileRetryUsed = true;
@@ -1282,6 +1305,7 @@ export class DirectClient {
             debugLines,
             cause: failure,
           });
+          noteUpstreamSuccess();
           if (emitted.content || emitted.reasoning) return recovered;
           // Recovery confirmed the reply is empty. Fall through to the same
           // fresh-start retry a clean empty stream gets, instead of failing

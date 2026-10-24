@@ -14,6 +14,7 @@ import {
   formatTurn,
 } from './prompt.js';
 import { BridgeError } from './agent.js';
+import { noteUpstreamThrottleEvent, upstreamCooldownMs } from './direct.js';
 
 export const MODELS = [
   {
@@ -70,6 +71,12 @@ async function withUpstreamSlot(cfg, fn) {
     const waiter = slotWaiters.shift();
     bridgeQueue.active++;
     waiter();
+  }
+  // Ride out a global throttle window while holding this slot: the account
+  // is rate-limited, so pacing every client beats letting each one hammer.
+  const cooldown = upstreamCooldownMs();
+  if (cooldown > 0) {
+    await new Promise((resolve) => setTimeout(resolve, cooldown));
   }
   if (bridgeQueue.active < bridgeQueue.max) {
     bridgeQueue.active++;
@@ -637,6 +644,7 @@ export async function handleChatCompletions(req, res, body, ctx) {
       // silently — surface a retriable error instead (stream clients get an
       // in-stream error event, others a 502 they can retry).
       log(`empty completion after conversion (raw ${fullContent.length}c); failing the request`);
+      noteUpstreamThrottleEvent();
       throw new BridgeError('The model returned no usable output.', 'empty_reply', 502);
     }
 

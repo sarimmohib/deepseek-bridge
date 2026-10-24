@@ -1002,3 +1002,42 @@ test('falls back to a fresh-start retry when recovery confirms an empty reply', 
   assert.deepEqual(deltas, [{ kind: 'content', text: 'second attempt content' }]);
   assert.equal(result.messageId, 4);
 });
+
+test('empty_reply raises the global throttle and success decays it', async () => {
+  saveSession({ token, cookies: [] });
+  const client = new DirectClient({ retryDelays: [0, 0, 0], emptyRetryDelays: [0, 0, 0] });
+  let completionCalls = 0;
+
+  globalThis.fetch = baseFetch(
+    () => {
+      completionCalls++;
+      return streamResponse([
+        'event: ready\ndata: {"request_message_id":1,"response_message_id":2}\n\n',
+        'event: close\ndata: {}\n\n',
+      ]);
+    },
+    null,
+    () => {
+      throw new Error('resume_stream should not be needed');
+    },
+  );
+
+  const { upstreamThrottle, upstreamCooldownMs } = await import('../src/direct.js');
+  const levelBefore = upstreamThrottle.level;
+  // All four attempts come back empty: the surfaced failure must leave the
+  // global throttle raised (a following success is what decays it).
+  await assert.rejects(
+    client.run(
+      { prompt: 'always empty', thinking: true, search: false, attachments: [] },
+      {},
+    ),
+    (err) => err.code === 'empty_reply',
+  );
+
+  assert.ok(upstreamThrottle.level > levelBefore, 'throttle level should rise on empty_reply');
+  assert.ok(upstreamCooldownMs() > 0, 'a cooldown window should be active');
+  assert.equal(completionCalls, 4); // MAX_START_ATTEMPTS attempts, all empty
+  upstreamThrottle.level = 0;
+  upstreamThrottle.until = 0;
+  assert.equal(upstreamCooldownMs(), 0);
+});

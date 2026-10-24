@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { handleChatCompletions, PRESET_SYSTEM_PROMPTS, bridgeQueue } from '../src/openai.js';
+import { upstreamThrottle } from '../src/direct.js';
 import { normalizeMessages, splitMessages, transcriptDigest, conversationKey } from '../src/prompt.js';
 
 const failingRollout = JSON.parse(
@@ -658,7 +659,16 @@ test('pure degenerate DSML non-stream returns a 502 empty_reply', async () => {
   assert.match(body.error.message, /no usable output/);
 });
 
+test.after(() => {
+  // the empty_reply tests raise the global upstream throttle; drop it so
+  // later suites in this process are not paced by a leftover cooldown
+  upstreamThrottle.level = 0;
+  upstreamThrottle.until = 0;
+});
+
 test('raising maxUpstream mid-queue wakes FIFO waiters instead of a new arrival', async () => {
+  upstreamThrottle.level = 0;
+  upstreamThrottle.until = 0;
   const startOrder = [];
   const agent = {
     async run(_request, handlers) {

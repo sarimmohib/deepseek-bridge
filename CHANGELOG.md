@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.2
+
+- Global adaptive throttle valve: when DeepSeek's rate window produces empty
+  replies, every upstream request now pauses behind an escalating cool-down
+  (10s/20s/40s/80s, decaying on success) instead of each client hammering
+  independently. Found under a 3-way concurrent dsh agent-loop stress run,
+  where one 22-turn task's LLM call surfaced an empty-reply failure after the
+  per-request backoff was exhausted; with the valve the same load rides the
+  window out.
+
 ## 0.7.1
 
 - Dashboard theme: richer ZCode-style dark palette (charcoal + warm orange
