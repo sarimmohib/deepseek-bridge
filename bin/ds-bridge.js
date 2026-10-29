@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { createServer } from '../src/server.js';
 import { loadConfig, saveConfig, Store, paths } from '../src/config.js';
 import { sessionSummary } from '../src/session.js';
+import { accountsSummary } from '../src/accounts.js';
 import { MODELS } from '../src/openai.js';
 import { VERSION } from '../src/version.js';
 
@@ -28,7 +29,9 @@ Usage:
   ds-bridge [--port 8787] [--reset-key] [--verbose]
 
 The bridge listens on 127.0.0.1 only. Run 'deepseek --login' once to copy the
-browser session into the terminal; extension/ is the optional fallback. Then call:
+browser session into the terminal; extension/ is the optional fallback. Add
+more accounts with 'deepseek --login --manual --token <userToken>' — the pool is
+unlimited and requests rotate automatically on per-account rate limits. Then call:
 
   curl http://127.0.0.1:8787/v1/chat/completions \\
     -H "authorization: Bearer $DS_BRIDGE_KEY" \\
@@ -49,6 +52,7 @@ if (value('--port')) config = saveConfig({ port: Number(value('--port')) });
 const store = new Store();
 store.startAutosave();
 const session = sessionSummary();
+const accountInfo = accountsSummary();
 const { server, close } = createServer({ config, store, log });
 log(`deepseek-bridge ${VERSION} starting on ${config.host}:${config.port}`);
 
@@ -92,11 +96,15 @@ console.log(`
   API key    ${config.key}
   Models     ${MODELS.map((m) => m.id).join(', ')}
 
-  Mode       ${session.available ? 'direct (terminal session)' : 'extension / not configured'}
+  Mode       ${session.available ? `direct (${accountInfo.count} account${accountInfo.count === 1 ? '' : 's'})` : 'extension / not configured'}
+  Accounts   ${accountInfo.count ? `${accountInfo.count} stored · ${accountInfo.ready} ready · ${accountInfo.cooling} cooling · unlimited pool` : 'none — run `deepseek --login` or `deepseek --login --manual`'}
   Session    ${session.available ? session.file : 'run `deepseek --login` to copy it from Chrome'}
 
   Next steps
 ${session.available ? '   1. Test:  deepseek chat "hello"' : '   1. Extension: chrome://extensions → Developer mode → Load unpacked\n      → select ' + extensionDir + '\n   2. Open the extension popup, set port ' + config.port + ' and paste the API key.\n   3. Sign in at https://chat.deepseek.com in a normal tab.\n   4. Run:  deepseek --login'}
+
+  Add more accounts any time:  deepseek --login --manual --token <userToken>
+  Inspect the pool:            deepseek accounts
 
   Config     ${paths.CONFIG_FILE}
   State      ${paths.STATE_FILE}

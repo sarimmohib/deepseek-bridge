@@ -9,7 +9,10 @@ const CONFIG_DIR =
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 const STATE_FILE = path.join(CONFIG_DIR, 'state.json');
 const PID_FILE = path.join(CONFIG_DIR, 'bridge.pid');
+// Legacy single-session file. New code stores an unbounded pool in
+// accounts.json and only reads session.json once, to migrate it.
 const SESSION_FILE = path.join(CONFIG_DIR, 'session.json');
+const ACCOUNTS_FILE = path.join(CONFIG_DIR, 'accounts.json');
 
 function readJSON(file, fallback) {
   try {
@@ -131,4 +134,4 @@ export class Store {
   }
 }
 
-export const paths = { CONFIG_DIR, CONFIG_FILE, STATE_FILE, PID_FILE, SESSION_FILE };
+export const paths = { CONFIG_DIR, CONFIG_FILE, STATE_FILE, PID_FILE, SESSION_FILE, ACCOUNTS_FILE };

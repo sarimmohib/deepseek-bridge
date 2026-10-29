@@ -744,6 +744,76 @@ test('persistent empty replies restart from a fresh session', async () => {
   assert.equal(deletes, 1);
 });
 
+test('pinned conversation account is dropped when it cools, replaying fresh', async () => {
+  upstreamThrottle.level = 0;
+  upstreamThrottle.until = 0;
+  const calls = [];
+  let deletes = 0;
+  const direct = {
+    reloadSession: () => ({ token: 'direct-test-token' }),
+    hasMultipleAccounts: true,
+    async run(request, handlers) {
+      calls.push({ continuation: request.continuation, accountId: request.accountId });
+      if (calls.length === 1) {
+        handlers.onReady({ sessionId: 'sess_a', messageId: 1, accountId: 'acct-aaaa' });
+        handlers.onDelta({ kind: 'content', text: 'hello one' });
+        return { usage: { completion: 5 }, finish: 'stop', sessionId: 'sess_a', messageId: 1, accountId: 'acct-aaaa' };
+      }
+      if (calls.length === 2) {
+        // The continuation is pinned to the account that owns the chat session;
+        // that account cooled down, so the runner refuses before any network.
+        assert.equal(request.continuation, true);
+        assert.equal(request.accountId, 'acct-aaaa');
+        const err = new Error('conversation account is cooling down');
+        err.code = 'account_switched';
+        err.status = 503;
+        throw err;
+      }
+      assert.equal(request.continuation, false);
+      assert.equal(request.accountId, null);
+      handlers.onReady({ sessionId: 'sess_b', messageId: 2, accountId: 'acct-bbbb' });
+      handlers.onDelta({ kind: 'content', text: 'RECOVERED ON B' });
+      return { usage: { completion: 6 }, finish: 'stop', sessionId: 'sess_b', messageId: 2, accountId: 'acct-bbbb' };
+    },
+  };
+  const stored = {};
+  const store = {
+    getConversation: () => (Object.keys(stored).length ? { ...stored } : null),
+    deleteConversation: () => {
+      deletes++;
+      for (const key of Object.keys(stored)) delete stored[key];
+    },
+    setConversation: (_key, value) => Object.assign(stored, value),
+  };
+  const ctx = { direct, store, log: () => {}, config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto' } };
+
+  const res1 = new FakeResponse();
+  await handleChatCompletions({}, res1, { model: 'deepseek-reasoner', stream: false, messages: [{ role: 'user', content: 'hello one' }] }, ctx);
+  assert.equal(calls.length, 1);
+  assert.equal(stored.accountId, 'acct-aaaa', 'conversation remembers its owning account');
+
+  const res2 = new FakeResponse();
+  await handleChatCompletions(
+    {},
+    res2,
+    {
+      model: 'deepseek-reasoner',
+      stream: false,
+      messages: [
+        { role: 'user', content: 'hello one' },
+        { role: 'assistant', content: 'hello one' },
+        { role: 'user', content: 'and now continue please' },
+      ],
+    },
+    ctx,
+  );
+  const body = JSON.parse(res2.chunks.join(''));
+  assert.equal(body.choices[0].message.content, 'RECOVERED ON B');
+  assert.equal(calls.length, 3, 'continuation + fresh replay');
+  assert.equal(deletes, 1);
+  assert.equal(stored.accountId, 'acct-bbbb', 'fresh replay stores the new account');
+});
+
 test('a degenerate DSML wall surfaces an error and drops the session', async () => {
   upstreamThrottle.level = 0;
   upstreamThrottle.until = 0;

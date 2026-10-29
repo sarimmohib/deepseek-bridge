@@ -7,15 +7,17 @@ import path from 'node:path';
 const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ds-bridge-session-'));
 process.env.DS_BRIDGE_HOME = home;
 const session = await import('../src/session.js');
+const accounts = await import('../src/accounts.js');
 const { paths } = await import('../src/config.js');
 
 const token = 'test-token-that-is-definitely-long-enough';
 
 test.after(() => {
+  accounts.clearAccounts();
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-test('stores only DeepSeek cookies and writes the file 0600', () => {
+test('stores only DeepSeek cookies and writes the pool file 0600', () => {
   session.clearSession();
   session.saveSession({
     token,
@@ -31,7 +33,9 @@ test('stores only DeepSeek cookies and writes the file 0600', () => {
   assert.equal(saved.token, token);
   assert.equal(saved.userAgent, 'test-agent');
   assert.deepEqual(saved.cookies.map((c) => c.name).sort(), ['root', 'sid']);
-  assert.equal(fs.statSync(paths.SESSION_FILE).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(paths.ACCOUNTS_FILE).mode & 0o777, process.platform === 'win32' ? 0o666 : 0o600);
+  assert.equal(accounts.accountCount(), 1);
+  assert.equal(fs.existsSync(paths.SESSION_FILE), false);
 });
 
 test('cookieHeader sends matching DeepSeek cookies and skips expired ones', () => {
@@ -66,12 +70,14 @@ test('a new login replaces old cookies; Set-Cookie updates merge', () => {
   assert.deepEqual(session.loadSession().cookies.map((c) => c.name).sort(), ['extra', 'new']);
 });
 
-test('summary omits credentials and clearSession removes the file', () => {
+test('summary omits credentials and clearSession removes the pool', () => {
   session.clearSession();
   session.saveSession({ token, cookies: [{ name: 'sid', value: 'abc', domain: '.deepseek.com', path: '/' }] });
   const summary = session.sessionSummary();
   assert.equal(summary.available, true);
   assert.equal(summary.cookies, 1);
+  assert.equal(summary.accounts, 1);
+  assert.equal(summary.file, paths.ACCOUNTS_FILE);
   assert.equal(JSON.stringify(summary).includes(token), false);
   assert.equal(session.clearSession(), true);
   assert.equal(session.loadSession(), null);

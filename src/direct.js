@@ -9,7 +9,22 @@ import crypto from 'node:crypto';
 import { Blob } from 'node:buffer';
 import { BridgeError } from './agent.js';
 import { solveChallenge } from './pow.js';
-import { cookieHeader, loadSession, updateSessionCookies } from './session.js';
+import { cookieHeader } from './cookies.js';
+import {
+  accountCount,
+  accountSession,
+  getAccount,
+  getPrimaryAccount,
+  hasAccounts,
+  loadAccounts,
+  markAccountExpired,
+  markAccountFailure,
+  markAccountSuccess,
+  markAccountThrottle,
+  nextAvailableAt,
+  pickAccount,
+  updateAccountCookies,
+} from './accounts.js';
 
 const API = 'https://chat.deepseek.com/api/v0';
 const ORIGIN = 'https://chat.deepseek.com';
@@ -26,6 +41,16 @@ const DEFAULT_RETRY_DELAYS = [700, 1800, 4000, 8000];
 // rapid-fire sequential requests trigger it, ~10-15s to recover). Back off
 // properly instead of hammering through the window.
 const EMPTY_RETRY_DELAYS = [3000, 9000, 20000, 35000];
+
+// Multi-account rotation. A request may park while every account is cooling
+// down, but must never stall a caller forever. The budget is one full
+// first-level account cooldown (15s, see ACCOUNT_COOLDOWN_STEPS[0]): a small
+// pool waits it out instead of surfacing pointless instant 503s (0.7.8 rode the
+// same window out with its 3-35s empty-reply backoff). Longer parks — expired
+// accounts get 5 minutes — are further away than the budget and surface a
+// retriable 503 immediately.
+const ROTATION_WAIT_BUDGET_MS = 15_000;
+const ROTATION_WAIT_STEP_MS = 2000;
 
 // Account-level throttle valve. DeepSeek's empty replies are a rate window,
 // and under concurrent harness load each client's private backoff still lets
@@ -49,6 +74,30 @@ export function upstreamCooldownMs() {
 }
 const MAX_START_ATTEMPTS = 4;
 const MAX_RECOVERY_ATTEMPTS = 4;
+
+// Account ids are hex digests; never log more than a short prefix (tokens are
+// credentials and must never reach a log line).
+function shortAccountId(id) {
+  return String(id || '').slice(0, 8) || '?';
+}
+
+function loadPrimarySession() {
+  const account = getPrimaryAccount();
+  return account ? accountSession(account) : null;
+}
+
+// A failure that says "this account is throttled or signed out", so another
+// account could serve the same request. Only acted upon when the pool has more
+// than one account: single-account deployments keep the 0.7.8 retry behavior.
+function isAccountLevelFailure(err) {
+  const code = err?.code;
+  return (
+    code === 'empty_reply' ||
+    code === 'upload_rate_limited' ||
+    code === 'not_signed_in' ||
+    Number(err?.status) === 429
+  );
+}
 
 function looksLikeHtml(text) {
   return /^\s*(?:<!doctype html|<html)/i.test(String(text || ''));
@@ -540,7 +589,10 @@ export class DirectClient {
     this.retryDelays = Array.isArray(retryDelays) && retryDelays.length ? retryDelays : DEFAULT_RETRY_DELAYS;
     this.emptyRetryDelays =
       Array.isArray(emptyRetryDelays) && emptyRetryDelays.length ? emptyRetryDelays : EMPTY_RETRY_DELAYS;
-    this.session = loadSession();
+    // Kept in sync for compatibility with the old single-session API; every
+    // run uses its own ctx={accountId,session} so concurrent runs never share
+    // (or race) a session.
+    this.session = loadPrimarySession();
   }
 
   nextRetryDelay(index, retryAfter = 0, delays = this.retryDelays) {
@@ -549,16 +601,26 @@ export class DirectClient {
     return base > 0 ? base + Math.floor(Math.random() * 250) : 0;
   }
 
+  /** More than one account: requests rotate instead of retrying one token. */
+  get hasMultipleAccounts() {
+    return accountCount() > 1;
+  }
+
   get available() {
-    return Boolean(this.session?.token);
+    return hasAccounts();
   }
 
   reloadSession() {
-    this.session = loadSession();
+    this.session = loadPrimarySession();
     return this.session;
   }
 
-  captureCookies(res) {
+  /** Per-run account context: the token/cookies snapshot plus its account id. */
+  contextFor(account) {
+    return { accountId: account.id, session: accountSession(account) };
+  }
+
+  captureCookies(res, ctx) {
     let lines = [];
     try {
       lines = res.headers.getSetCookie?.() || [];
@@ -572,12 +634,16 @@ export class DirectClient {
     if (!lines.length) return;
     const cookies = lines.map(parseSetCookie).filter(Boolean);
     if (!cookies.length) return;
-    const updated = updateSessionCookies(cookies);
-    if (updated) this.session = updated;
+    // Cookies belong to the account that made the request, never the singleton.
+    const updated = updateAccountCookies(ctx.accountId, cookies);
+    if (!updated) return;
+    ctx.session = accountSession(updated);
+    // Legacy single-account views still read this.session.
+    if (!this.hasMultipleAccounts) this.session = ctx.session;
   }
 
-  baseHeaders() {
-    const session = this.session;
+  baseHeaders(ctx) {
+    const session = ctx?.session;
     if (!session?.token) {
       throw new BridgeError(
         'No terminal DeepSeek session. Run `deepseek --login` in a terminal where the bridge extension can copy your browser session.',
@@ -603,8 +669,8 @@ export class DirectClient {
     return headers;
   }
 
-  async request(path, { method = 'POST', body, form = false, headers = {}, signal } = {}) {
-    const finalHeaders = { ...this.baseHeaders(), ...headers };
+  async request(path, ctx, { method = 'POST', body, form = false, headers = {}, signal } = {}) {
+    const finalHeaders = { ...this.baseHeaders(ctx), ...headers };
     if (!form) finalHeaders['content-type'] = 'application/json';
     const res = await fetch(`${API}${path}`, {
       method,
@@ -613,12 +679,12 @@ export class DirectClient {
       signal,
       redirect: 'follow',
     });
-    this.captureCookies(res);
+    this.captureCookies(res, ctx);
     return res;
   }
 
-  async api(path, { method = 'POST', body, headers = {}, signal } = {}) {
-    const res = await this.request(path, { method, body, headers, signal });
+  async api(path, ctx, { method = 'POST', body, headers = {}, signal } = {}) {
+    const res = await this.request(path, ctx, { method, body, headers, signal });
     const text = await res.text();
     let json;
     try {
@@ -657,10 +723,19 @@ export class DirectClient {
     return json.data?.biz_data ?? {};
   }
 
-  async verify(signal) {
+  async verify(signal, { accountId } = {}) {
     // /users is not consistently available to the web API. A PoW challenge is
     // a small authenticated call and proves the copied token and cookies work.
-    const data = await this.api('/chat/create_pow_challenge', {
+    const account = accountId ? getAccount(accountId) : getPrimaryAccount();
+    if (!account?.token) {
+      throw new BridgeError(
+        'No terminal DeepSeek session. Run `deepseek --login` first.',
+        'not_signed_in',
+        401,
+      );
+    }
+    const ctx = this.contextFor(account);
+    const data = await this.api('/chat/create_pow_challenge', ctx, {
       body: { target_path: '/api/v0/chat/completion' },
       signal,
     });
@@ -668,28 +743,28 @@ export class DirectClient {
     return null;
   }
 
-  async createSession(signal) {
-    const data = await this.api('/chat_session/create', { body: {}, signal });
+  async createSession(ctx, signal) {
+    const data = await this.api('/chat_session/create', ctx, { body: {}, signal });
     const id = data.chat_session?.id;
     if (!id) throw new BridgeError('DeepSeek did not create a chat session.', 'deepseek_error');
     return id;
   }
 
-  async powHeader(targetPath, signal) {
-    const data = await this.api('/chat/create_pow_challenge', { body: { target_path: targetPath }, signal });
+  async powHeader(targetPath, ctx, signal) {
+    const data = await this.api('/chat/create_pow_challenge', ctx, { body: { target_path: targetPath }, signal });
     const challenge = data.challenge;
     if (!challenge) throw new BridgeError('DeepSeek did not return a PoW challenge.', 'deepseek_error');
     const answer = solveChallenge(challenge);
     return Buffer.from(JSON.stringify(answer), 'utf8').toString('base64');
   }
 
-  async uploadAttachment(att, signal) {
+  async uploadAttachment(att, ctx, signal) {
     if (!att?.dataBase64) throw new BridgeError('Attachment has no data.', 'invalid_attachment', 400);
     const bytes = Buffer.from(att.dataBase64, 'base64');
     const form = new FormData();
     form.append('file', new Blob([bytes], { type: att.mime || 'application/octet-stream' }), att.name || 'file');
-    const pow = await this.powHeader('/api/v0/file/upload_file', signal);
-    const res = await this.request('/file/upload_file', {
+    const pow = await this.powHeader('/api/v0/file/upload_file', ctx, signal);
+    const res = await this.request('/file/upload_file', ctx, {
       form: true,
       body: form,
       headers: { 'x-ds-pow-response': pow, accept: '*/*' },
@@ -736,7 +811,10 @@ export class DirectClient {
     return id;
   }
 
-  async withTransientRetry(fn, { signal, deadline, label, idleTimeout = SETUP_IDLE_TIMEOUT, attempts = 4 } = {}) {
+  async withTransientRetry(
+    fn,
+    { signal, deadline, label, idleTimeout = SETUP_IDLE_TIMEOUT, attempts = 4, failFastAccountLevel = false } = {},
+  ) {
     for (let i = 0; i < attempts; i++) {
       if (signal?.aborted) throw cancelledError();
       if (Date.now() >= deadline) throw timeoutError();
@@ -750,6 +828,9 @@ export class DirectClient {
         attempt.dispose();
       }
       if (!isTransientError(last) || i === attempts - 1) throw last;
+      // With a pool, a rate-limited account is rotated instead of being
+      // hammered through the long empty-reply schedule.
+      if (failFastAccountLevel && isAccountLevelFailure(last)) throw last;
       this.log(`${label || 'DeepSeek request'} failed (${last.message}); retrying...`);
       await sleep(this.nextRetryDelay(i, last.retryAfter, last.code === 'upload_rate_limited' || last.code === 'empty_reply' ? this.emptyRetryDelays : undefined), signal);
     }
@@ -824,18 +905,21 @@ export class DirectClient {
     return err;
   }
 
-  async startCompletion({
-    sessionId,
-    parentMessageId,
-    prompt,
-    modelType,
-    thinking,
-    search,
-    fileIds,
-    pow,
-    signal,
-    debugLines,
-  }) {
+  async startCompletion(
+    {
+      sessionId,
+      parentMessageId,
+      prompt,
+      modelType,
+      thinking,
+      search,
+      fileIds,
+      pow,
+      signal,
+      debugLines,
+    },
+    ctx,
+  ) {
     const body = {
       chat_session_id: sessionId,
       parent_message_id: parentMessageId ?? null,
@@ -848,7 +932,7 @@ export class DirectClient {
       preempt: false,
     };
 
-    const res = await this.request('/chat/completion', {
+    const res = await this.request('/chat/completion', ctx, {
       body,
       headers: { 'x-ds-pow-response': pow, accept: '*/*' },
       signal,
@@ -868,7 +952,7 @@ export class DirectClient {
     return res;
   }
 
-  async consumeSSE(res, { onDelta, onReady, resetIdle, debugLines, signal }) {
+  async consumeSSE(res, { onDelta, onReady, resetIdle, debugLines, signal }, ctx) {
     if (!res.body?.getReader) {
       throw new BridgeError('DeepSeek returned an empty event stream.', 'stream_interrupted', 502);
     }
@@ -902,6 +986,7 @@ export class DirectClient {
           const responseId = data.response_message_id ?? data.responseMessageId ?? null;
           if (responseId != null) messageId = responseId;
           onReady?.({
+            accountId: ctx?.accountId ?? null,
             messageId: responseId,
             requestMessageId: data.request_message_id ?? data.requestMessageId ?? null,
           });
@@ -987,7 +1072,7 @@ export class DirectClient {
     return { messageId, title, usage, status, fileStatus };
   }
 
-  async readRecoveryResponse(res, { collected, attempt, debugLines }) {
+  async readRecoveryResponse(res, { collected, attempt, debugLines, ctx }) {
     const contentType = res.headers.get('content-type') || '';
     if (!res.ok || contentType.includes('application/json') || contentType.includes('text/html')) {
       const text = await res.text().catch(() => '');
@@ -1011,14 +1096,18 @@ export class DirectClient {
       throw this.recoveryError(res, text, json);
     }
 
-    return this.consumeSSE(res, {
-      onDelta: (delta) => {
-        collected[delta.kind] += delta.text;
+    return this.consumeSSE(
+      res,
+      {
+        onDelta: (delta) => {
+          collected[delta.kind] += delta.text;
+        },
+        resetIdle: attempt.resetIdle,
+        debugLines,
+        signal: attempt.signal,
       },
-      resetIdle: attempt.resetIdle,
-      debugLines,
-      signal: attempt.signal,
-    });
+      ctx,
+    );
   }
 
   emitMissing(emitted, collected, emit) {
@@ -1033,7 +1122,7 @@ export class DirectClient {
     }
   }
 
-  async recover({ sessionId, messageId, emit, emitted, signal, deadline, debugLines, cause }) {
+  async recover({ sessionId, messageId, emit, emitted, signal, deadline, debugLines, cause, ctx }) {
     let usage = null;
     let title = null;
 
@@ -1052,7 +1141,7 @@ export class DirectClient {
         this.log(`reply interrupted; resuming message ${messageId} (attempt ${i + 1}/${MAX_RECOVERY_ATTEMPTS})...`);
         const body = { chat_session_id: sessionId, message_id: messageId };
         if (i > 0) body.fallback_to_resume = true;
-        const res = await this.request(endpoint, {
+        const res = await this.request(endpoint, ctx, {
           body,
           headers: { accept: '*/*' },
           signal: attempt.signal,
@@ -1062,7 +1151,7 @@ export class DirectClient {
             `${endpoint.replace('/chat/', '')} http ${res.status} type=${res.headers.get('content-type')} len=${res.headers.get('content-length')}`,
           );
         }
-        const outcome = await this.readRecoveryResponse(res, { collected, attempt, debugLines });
+        const outcome = await this.readRecoveryResponse(res, { collected, attempt, debugLines, ctx });
         this.emitMissing(emitted, collected, emit);
         if (outcome.status && outcome.status !== 'FINISHED') {
           // The replay ended while the message was still generating — same
@@ -1119,97 +1208,199 @@ export class DirectClient {
     }
   }
 
-  async run(payload, handlers = {}, { signal } = {}) {
-    const session = this.reloadSession();
-    if (!session?.token) {
+  /* ---------------------------------------------------------- rotation --- */
+
+  /**
+   * Resolve the account for one run: the pinned account of a bound
+   * continuation, or a fresh pick from the pool.
+   */
+  async selectContext(payload, { excluded, signal, deadline }) {
+    if (!hasAccounts()) {
+      throw new BridgeError('No terminal DeepSeek session. Run `deepseek --login` first.', 'not_signed_in', 401);
+    }
+    if (payload.sessionId) return this.resolveBoundContext(payload);
+    if (!this.hasMultipleAccounts) {
+      const account = getPrimaryAccount();
+      if (!account?.token) {
+        throw new BridgeError('No terminal DeepSeek session. Run `deepseek --login` first.', 'not_signed_in', 401);
+      }
+      return this.contextFor(account);
+    }
+    return this.waitForAccount({ excluded, signal, deadline });
+  }
+
+  /**
+   * A DeepSeek chat_session_id exists only inside the account that created it.
+   * Continuations are pinned to that account and fail with `account_switched`
+   * BEFORE any network call when it is absent or cooling, so the caller can
+   * replay the transcript into a fresh session instead of cross-wiring
+   * accounts (which would leak one conversation into another account).
+   */
+  resolveBoundContext(payload) {
+    if (!this.hasMultipleAccounts) {
+      // Single-account deployments keep their old behavior; only a token swap
+      // (the stored accountId no longer exists) must not reuse the old id.
+      const account = getPrimaryAccount();
+      if (!account?.token) {
+        throw new BridgeError('No terminal DeepSeek session. Run `deepseek --login` first.', 'not_signed_in', 401);
+      }
+      if (payload.accountId && payload.accountId !== account.id) {
+        throw new BridgeError(
+          'The DeepSeek account that owns this conversation was replaced; replaying on a fresh session.',
+          'account_switched',
+          503,
+        );
+      }
+      return this.contextFor(account);
+    }
+    // Legacy conversation entries carry no accountId: they were created by the
+    // original single-token deployment, which the migration stored as the first
+    // account. Bind to that STORED account (not "first ready" — that could pick
+    // a different token and cross-wire the session id) and let the cooling
+    // check below fail the continuation instead.
+    const legacyOwner = loadAccounts()[0] || null;
+    const targetId = payload.accountId || legacyOwner?.id || null;
+    const account = targetId ? pickAccount({ preferId: targetId }) : null;
+    if (!account) {
       throw new BridgeError(
-        'No terminal DeepSeek session. Run `deepseek --login` first.',
-        'not_signed_in',
-        401,
+        'The DeepSeek account that owns this conversation is cooling down; replaying on a fresh session.',
+        'account_switched',
+        503,
       );
     }
+    return this.contextFor(account);
+  }
 
-    const debugLines = payload.debug === true ? [] : null;
-    const deadline = Date.now() + HARD_TIMEOUT;
-    const emitted = { content: '', reasoning: '' };
-    const emit = (delta) => {
-      if (!delta?.text) return;
-      if (delta.kind === 'reasoning') emitted.reasoning += delta.text;
-      else emitted.content += delta.text;
-      handlers.onDelta?.(delta);
-    };
-
-    try {
+  /**
+   * Fresh requests: least-recently-used ready account. When every account is
+   * cooling, wait briefly for the earliest one instead of failing instantly,
+   * but never park the caller for long: after ROTATION_WAIT_BUDGET_MS (or when
+   * the next account is further away) surface a retriable 503.
+   */
+  async waitForAccount({ excluded, signal, deadline }) {
+    const budgetEnd = Math.min(deadline, Date.now() + ROTATION_WAIT_BUDGET_MS);
+    for (;;) {
       if (signal?.aborted) throw cancelledError();
-      if (!session.token) {
-        throw new BridgeError('DeepSeek user token is missing. Run `deepseek --login` again.', 'not_signed_in', 401);
-      }
+      const account = pickAccount({ excludeIds: excluded });
+      if (account) return this.contextFor(account);
 
-      const sessionId =
-        payload.sessionId ||
-        (await this.withTransientRetry((attemptSignal) => this.createSession(attemptSignal), {
-          signal,
-          deadline,
-          label: 'DeepSeek session creation',
-        }));
-
-      const fileIds = [];
-      const attachments = payload.attachments || [];
-      // Uploaded file ids are account-scoped on DeepSeek, so the same bytes
-      // never need a second upload — harness retries re-send attachments.
-      if (!this.fileCache) this.fileCache = new Map();
-      for (let i = 0; i < attachments.length; i++) {
-        const att = attachments[i];
-        const contentKey = crypto.createHash('sha256').update(att.dataBase64 || '').digest('hex');
-        if (this.fileCache.has(contentKey)) {
-          const cached = this.fileCache.get(contentKey);
-          fileIds.push(cached);
-          if (debugLines) debugLines.push(`upload ${att.name || 'file'} cached -> ${cached}`);
-          continue;
-        }
-        const t0 = Date.now();
-        const fileId = await this.withTransientRetry((attemptSignal) => this.uploadAttachment(att, attemptSignal), {
-          signal,
-          deadline,
-          label: `upload ${att.name || 'file'}`,
-          idleTimeout: UPLOAD_IDLE_TIMEOUT,
-        });
-        this.fileCache.set(contentKey, fileId);
-        if (this.fileCache.size > 60) this.fileCache.delete(this.fileCache.keys().next().value);
-        fileIds.push(fileId);
-        if (debugLines) {
-          debugLines.push(
-            `upload ${att.name || 'file'} ${att.mime || '?'} ${Math.round((((att.dataBase64 || '').length * 0.75) / 1024))}k -> ${fileId} ${Date.now() - t0}ms`,
-          );
-        }
-        // DeepSeek ingests uploads asynchronously; back-to-back uploads raced
-        // and left later files PENDING at completion time. Give every upload
-        // except the last a short settle gap before the next one starts.
-        if (i < attachments.length - 1) await sleep(750, signal);
-      }
-
-      handlers.onReady?.({ sessionId });
-
-      let messageId = null;
-      let title = null;
-      let usage = null;
-      let startFailures = 0;
-      // One transparent file_not_ready retry, ever (see the failure handler).
-      let fileRetryUsed = false;
-
-      for (;;) {
-        if (signal?.aborted) throw cancelledError();
-        if (Date.now() >= deadline) throw timeoutError();
-
-        const pow = await this.withTransientRetry(
-          (attemptSignal) => this.powHeader('/api/v0/chat/completion', attemptSignal),
-          { signal, deadline, label: 'DeepSeek PoW challenge' },
+      const allExcluded = excluded.length >= accountCount();
+      const nextAt = nextAvailableAt({ excludeIds: allExcluded ? [] : excluded });
+      if (nextAt === Infinity) {
+        throw new BridgeError(
+          'No DeepSeek account can serve a request right now; add a token with `deepseek --login`.',
+          'account_unavailable',
+          503,
         );
+      }
+      const remaining = Math.max(0, nextAt - Date.now());
+      const budget = budgetEnd - Date.now();
+      if (remaining > ROTATION_WAIT_BUDGET_MS || budget <= 0) {
+        throw new BridgeError(
+          `Every DeepSeek account is cooling down; the next one is usable in ${Math.max(1, Math.ceil(remaining / 1000))}s. Try again shortly.`,
+          'account_unavailable',
+          503,
+        );
+      }
+      await sleep(Math.max(25, Math.min(remaining + 25, ROTATION_WAIT_STEP_MS, budget)), signal);
+      // Every account already failed once in this request: after the wait the
+      // next sweep may retry any of them (cooldowns are short).
+      if (allExcluded) excluded.length = 0;
+    }
+  }
 
-        const attempt = createAttempt({ signal, deadline, idleTimeout: STREAM_IDLE_TIMEOUT });
-        let failure = null;
-        try {
-          const res = await this.startCompletion({
+  /** Record per-account health so scheduling/CLI can see why an account was skipped. */
+  recordAccountFailure(accountId, failure) {
+    const code = failure?.code || 'error';
+    if (code === 'not_signed_in') {
+      markAccountExpired(accountId, failure?.message || '');
+      return;
+    }
+    markAccountThrottle(accountId, { retryAfterMs: Number(failure?.retryAfter) || 0, code });
+  }
+
+  /**
+   * One full attempt on one account: session creation, attachment uploads, PoW
+   * and the completion stream. Throws the normalized failure so run() can pick
+   * between an in-account retry (single account) and a rotation.
+   */
+  async runAttempt(payload, handlers, { signal, deadline, emitted, emit, debugLines, ctx, bound }) {
+    const session = ctx.session;
+    if (!session?.token) {
+      throw new BridgeError('DeepSeek user token is missing. Run `deepseek --login` again.', 'not_signed_in', 401);
+    }
+    // With a pool, an account-level failure rotates immediately instead of
+    // sleeping through the empty-reply schedule on the same throttled token.
+    const failFastAccountLevel = this.hasMultipleAccounts && !bound;
+
+    const sessionId =
+      payload.sessionId ||
+      (await this.withTransientRetry((attemptSignal) => this.createSession(ctx, attemptSignal), {
+        signal,
+        deadline,
+        label: 'DeepSeek session creation',
+        failFastAccountLevel,
+      }));
+
+    const fileIds = [];
+    const attachments = payload.attachments || [];
+    // Uploaded file ids are account-scoped on DeepSeek: the same bytes re-upload
+    // when a request rotates to another account, but never twice per account.
+    if (!this.fileCache) this.fileCache = new Map();
+    for (let i = 0; i < attachments.length; i++) {
+      const att = attachments[i];
+      const contentKey = `${ctx.accountId}|${crypto.createHash('sha256').update(att.dataBase64 || '').digest('hex')}`;
+      if (this.fileCache.has(contentKey)) {
+        const cached = this.fileCache.get(contentKey);
+        fileIds.push(cached);
+        if (debugLines) debugLines.push(`upload ${att.name || 'file'} cached -> ${cached}`);
+        continue;
+      }
+      const t0 = Date.now();
+      const fileId = await this.withTransientRetry((attemptSignal) => this.uploadAttachment(att, ctx, attemptSignal), {
+        signal,
+        deadline,
+        label: `upload ${att.name || 'file'}`,
+        idleTimeout: UPLOAD_IDLE_TIMEOUT,
+        failFastAccountLevel,
+      });
+      this.fileCache.set(contentKey, fileId);
+      if (this.fileCache.size > 60) this.fileCache.delete(this.fileCache.keys().next().value);
+      fileIds.push(fileId);
+      if (debugLines) {
+        debugLines.push(
+          `upload ${att.name || 'file'} ${att.mime || '?'} ${Math.round((((att.dataBase64 || '').length * 0.75) / 1024))}k -> ${fileId} ${Date.now() - t0}ms`,
+        );
+      }
+      // DeepSeek ingests uploads asynchronously; back-to-back uploads raced
+      // and left later files PENDING at completion time. Give every upload
+      // except the last a short settle gap before the next one starts.
+      if (i < attachments.length - 1) await sleep(750, signal);
+    }
+
+    handlers.onReady?.({ sessionId, accountId: ctx.accountId });
+
+    let messageId = null;
+    let title = null;
+    let usage = null;
+    let startFailures = 0;
+    // One transparent file_not_ready retry, ever (see the failure handler).
+    let fileRetryUsed = false;
+
+    for (;;) {
+      if (signal?.aborted) throw cancelledError();
+      if (Date.now() >= deadline) throw timeoutError();
+
+      const pow = await this.withTransientRetry(
+        (attemptSignal) => this.powHeader('/api/v0/chat/completion', ctx, attemptSignal),
+        { signal, deadline, label: 'DeepSeek PoW challenge', failFastAccountLevel },
+      );
+
+      const attempt = createAttempt({ signal, deadline, idleTimeout: STREAM_IDLE_TIMEOUT });
+      let failure = null;
+      try {
+        const res = await this.startCompletion(
+          {
             sessionId,
             parentMessageId: payload.parentMessageId ?? null,
             prompt: payload.prompt,
@@ -1220,9 +1411,13 @@ export class DirectClient {
             pow,
             signal: attempt.signal,
             debugLines,
-          });
+          },
+          ctx,
+        );
 
-          const stream = await this.consumeSSE(res, {
+        const stream = await this.consumeSSE(
+          res,
+          {
             onDelta: emit,
             onReady: (info) => {
               if (info.messageId != null) messageId = info.messageId;
@@ -1231,122 +1426,241 @@ export class DirectClient {
             resetIdle: attempt.resetIdle,
             debugLines,
             signal: attempt.signal,
-          });
-          if (stream.messageId != null) messageId = stream.messageId;
-          if (stream.title) title = stream.title;
-          if (stream.usage) usage = stream.usage;
-          if (stream.status && stream.status !== 'FINISHED') {
-            // The server sent its terminal marker while the message was still
-            // generating. Same failure class as a truncation: recovery replays
-            // the message and finishes it instead of returning a partial
-            // reply as complete. Flows that never send a status (status null)
-            // and finished streams keep today's success behavior.
-            throw new BridgeError(
-              'DeepSeek stream closed while the reply was still generating.',
-              'stream_interrupted',
-              502,
-            );
-          }
-          // Readiness gate: a file referenced while DeepSeek was still ingesting
-          // it produced answers that silently ignored the file (observed live:
-          // the model cannot read a PENDING file, even minutes later). Only
-          // files the stream actually reported as not-ready gate here; files
-          // the stream never mentioned keep today's behavior.
-          const fileStatus = stream.fileStatus || {};
-          const notReady = fileIds.filter((id) => {
-            const fileState = fileStatus[id]?.status;
-            return fileState === 'PENDING' || fileState === 'ERROR' || fileState === 'FAILED';
-          });
-          if (notReady.length) {
-            const names = notReady.map((id) => fileStatus[id]?.name || id).join(', ');
-            const err = new BridgeError(
-              `DeepSeek had not finished processing ${names} when the reply was generated.`,
-              'file_not_ready',
-              504,
-            );
-            err.fileNames = names;
-            throw err;
-          }
-          if (!emitted.content && !emitted.reasoning) {
-            // Live-observed failure mode: a clean stream (close, sometimes
-            // FINISHED) whose message contains zero fragments. Useless as a
-            // reply and transient in practice — throw while nothing has
-            // reached the client so the start-retry loop below reruns it.
-            throw new BridgeError('DeepSeek returned an empty reply.', 'empty_reply', 502);
-          }
-          noteUpstreamSuccess();
-          return { sessionId, messageId, usage, title, finish: 'stop', debugLines };
-        } catch (err) {
-          failure = normalizeAttemptError(err, attempt, signal);
-        } finally {
-          attempt.dispose();
+          },
+          ctx,
+        );
+        if (stream.messageId != null) messageId = stream.messageId;
+        if (stream.title) title = stream.title;
+        if (stream.usage) usage = stream.usage;
+        if (stream.status && stream.status !== 'FINISHED') {
+          // The server sent its terminal marker while the message was still
+          // generating. Same failure class as a truncation: recovery replays
+          // the message and finishes it instead of returning a partial
+          // reply as complete. Flows that never send a status (status null)
+          // and finished streams keep today's success behavior.
+          throw new BridgeError(
+            'DeepSeek stream closed while the reply was still generating.',
+            'stream_interrupted',
+            502,
+          );
         }
-
-        if (failure.code === 'cancelled' || failure.code === 'timeout') throw failure;
-
-        // file_not_ready: one of our uploads was still being ingested when the
-        // reply was generated. Two deliberate tradeoffs:
-        //  - Retry as a FRESH completion, never via recover()/continue: a
-        //    continue would append a second answer to a turn that already
-        //    ignored the file, while a fresh start re-references the files in
-        //    a new message, which have had time to ingest by now.
-        //  - A retried completion re-streams the full answer, so a transparent
-        //    retry is only safe before anything was emitted. Once text is on
-        //    the wire the error is surfaced to the client instead (504) —
-        //    openai.js passes status/code through unchanged — and the client
-        //    retries the whole request. fileRetryUsed caps this at one retry
-        //    so a permanently stuck file cannot loop.
-        if (failure.code === 'empty_reply' && !emitted.content && !emitted.reasoning)
-          noteUpstreamThrottleEvent();
-        if (failure.code === 'file_not_ready') {
-          if (fileRetryUsed || emitted.content || emitted.reasoning) throw failure;
-          fileRetryUsed = true;
-          this.log(`file ${failure.fileNames || 'attachment'} was still processing; retrying...`);
-          await sleep(this.nextRetryDelay(startFailures, failure.retryAfter, failure.code === 'empty_reply' ? this.emptyRetryDelays : undefined), signal);
-          startFailures++;
-          continue;
+        // Readiness gate: a file referenced while DeepSeek was still ingesting
+        // it produced answers that silently ignored the file (observed live:
+        // the model cannot read a PENDING file, even minutes later). Only
+        // files the stream actually reported as not-ready gate here; files
+        // the stream never mentioned keep today's behavior.
+        const fileStatus = stream.fileStatus || {};
+        const notReady = fileIds.filter((id) => {
+          const fileState = fileStatus[id]?.status;
+          return fileState === 'PENDING' || fileState === 'ERROR' || fileState === 'FAILED';
+        });
+        if (notReady.length) {
+          const names = notReady.map((id) => fileStatus[id]?.name || id).join(', ');
+          const err = new BridgeError(
+            `DeepSeek had not finished processing ${names} when the reply was generated.`,
+            'file_not_ready',
+            504,
+          );
+          err.fileNames = names;
+          throw err;
         }
-
-        const canRecover =
-          messageId != null &&
-          failure.code !== 'invalid_parent' &&
-          failure.code !== 'not_signed_in' &&
-          failure.code !== 'invalid_pow' &&
-          // Unreachable for file_not_ready (handled above), kept explicit so
-          // the fresh-retry-vs-recover rule survives future reordering.
-          failure.code !== 'file_not_ready' &&
-          // An empty or truncated reply must be retried as a fresh
-          // completion, not continued: the dangling message has nothing
-          // to resume.
-          failure.code !== 'empty_reply';
-        if (canRecover) {
-          const recovered = await this.recover({
-            sessionId,
-            messageId,
-            emit,
-            emitted,
-            signal,
-            deadline,
-            debugLines,
-            cause: failure,
-          });
-          noteUpstreamSuccess();
-          if (emitted.content || emitted.reasoning) return recovered;
-          // Recovery confirmed the reply is empty. Fall through to the same
-          // fresh-start retry a clean empty stream gets, instead of failing
-          // the client on the first try.
-          messageId = recovered.messageId ?? messageId;
-          if (recovered.usage) usage = recovered.usage;
-          if (recovered.title) title = recovered.title;
-          failure = new BridgeError('DeepSeek returned an empty reply.', 'empty_reply', 502);
+        if (!emitted.content && !emitted.reasoning) {
+          // Live-observed failure mode: a clean stream (close, sometimes
+          // FINISHED) whose message contains zero fragments. Useless as a
+          // reply and transient in practice — throw while nothing has
+          // reached the client so the start-retry loop below reruns it.
+          throw new BridgeError('DeepSeek returned an empty reply.', 'empty_reply', 502);
         }
+        noteUpstreamSuccess();
+        return { sessionId, messageId, usage, title, finish: 'stop', debugLines };
+      } catch (err) {
+        failure = normalizeAttemptError(err, attempt, signal);
+      } finally {
+        attempt.dispose();
+      }
 
-        if (emitted.content || emitted.reasoning) throw failure;
-        if (!isTransientError(failure) || startFailures >= MAX_START_ATTEMPTS - 1) throw failure;
+      if (failure.code === 'cancelled' || failure.code === 'timeout') throw failure;
 
-        this.log(`completion attempt failed (${failure.message}); retrying from the start...`);
+      // With a pool the first account-level failure ends this attempt so run()
+      // can rotate; the same account is never hammered through the empty-reply
+      // schedule. Single-account deployments fall through to 0.7.8 behavior.
+      if (failFastAccountLevel && !emitted.content && !emitted.reasoning && isAccountLevelFailure(failure)) {
+        throw failure;
+      }
+
+      // file_not_ready: one of our uploads was still being ingested when the
+      // reply was generated. Two deliberate tradeoffs:
+      //  - Retry as a FRESH completion, never via recover()/continue: a
+      //    continue would append a second answer to a turn that already
+      //    ignored the file, while a fresh start re-references the files in
+      //    a new message, which have had time to ingest by now.
+      //  - A retried completion re-streams the full answer, so a transparent
+      //    retry is only safe before anything was emitted. Once text is on
+      //    the wire the error is surfaced to the client instead (504) —
+      //    openai.js passes status/code through unchanged — and the client
+      //    retries the whole request. fileRetryUsed caps this at one retry
+      //    so a permanently stuck file cannot loop.
+      // The process-global valve only models a single-account deployment; with
+      // a pool the account cools down on its own and requests rotate. (A fresh
+      // multi-account attempt never reaches here: it throws at the fail-fast
+      // above; bound continuations retry the pinned account, and the caller
+      // replays fresh anyway.)
+      if (failure.code === 'empty_reply' && !emitted.content && !emitted.reasoning && !this.hasMultipleAccounts)
+        noteUpstreamThrottleEvent();
+      if (failure.code === 'file_not_ready') {
+        if (fileRetryUsed || emitted.content || emitted.reasoning) throw failure;
+        fileRetryUsed = true;
+        this.log(`file ${failure.fileNames || 'attachment'} was still processing; retrying...`);
         await sleep(this.nextRetryDelay(startFailures, failure.retryAfter, failure.code === 'empty_reply' ? this.emptyRetryDelays : undefined), signal);
         startFailures++;
+        continue;
+      }
+
+      const canRecover =
+        messageId != null &&
+        failure.code !== 'invalid_parent' &&
+        failure.code !== 'not_signed_in' &&
+        failure.code !== 'invalid_pow' &&
+        // Unreachable for file_not_ready (handled above), kept explicit so the
+        // fresh-retry-vs-recover rule survives future reordering.
+        failure.code !== 'file_not_ready' &&
+        // An empty or truncated reply must be retried as a fresh
+        // completion, not continued: the dangling message has nothing
+        // to resume.
+        failure.code !== 'empty_reply';
+      if (canRecover) {
+        const recovered = await this.recover({
+          sessionId,
+          messageId,
+          emit,
+          emitted,
+          signal,
+          deadline,
+          debugLines,
+          cause: failure,
+          ctx,
+        });
+        noteUpstreamSuccess();
+        if (emitted.content || emitted.reasoning) return recovered;
+        // Recovery confirmed the reply is empty. Fall through to the same
+        // fresh-start retry a clean empty stream gets, instead of failing
+        // the client on the first try.
+        messageId = recovered.messageId ?? messageId;
+        if (recovered.usage) usage = recovered.usage;
+        if (recovered.title) title = recovered.title;
+        failure = new BridgeError('DeepSeek returned an empty reply.', 'empty_reply', 502);
+      }
+
+      if (emitted.content || emitted.reasoning) throw failure;
+      if (!isTransientError(failure) || startFailures >= MAX_START_ATTEMPTS - 1) throw failure;
+
+      this.log(`completion attempt failed (${failure.message}); retrying from the start...`);
+      await sleep(this.nextRetryDelay(startFailures, failure.retryAfter, failure.code === 'empty_reply' ? this.emptyRetryDelays : undefined), signal);
+      startFailures++;
+    }
+  }
+
+  /**
+   * Run one request, rotating across accounts on account-level throttling.
+   *
+   * Single-account deployments: exactly the previous behavior (that account is
+   * retried through the empty-reply schedule inside runAttempt).
+   * Multi-account deployments: a fresh request picks the least-recently-used
+   * ready account; when it is throttled/expired the whole setup (session, file
+   * uploads, PoW, stream) transparently restarts on the next account. A bound
+   * continuation is never moved: it fails with `account_switched` so the caller
+   * can replay the transcript into a fresh session.
+   */
+  async run(payload, handlers = {}, { signal } = {}) {
+    const debugLines = payload.debug === true ? [] : null;
+    const deadline = Date.now() + HARD_TIMEOUT;
+    const emitted = { content: '', reasoning: '' };
+    const emit = (delta) => {
+      if (!delta?.text) return;
+      if (delta.kind === 'reasoning') emitted.reasoning += delta.text;
+      else emitted.content += delta.text;
+      handlers.onDelta?.(delta);
+    };
+
+    const bound = Boolean(payload.sessionId);
+    const excluded = [];
+    const maxRotations = bound ? 0 : accountCount() + 2;
+    let rotations = 0;
+    let previousAccountId = null;
+    let lastFailureCode = null;
+
+    try {
+      for (;;) {
+        if (signal?.aborted) throw cancelledError();
+        if (Date.now() >= deadline) throw timeoutError();
+
+        const ctx = await this.selectContext(payload, { excluded, signal, deadline });
+        if (previousAccountId && previousAccountId !== ctx.accountId) {
+          this.log(
+            `rotated account ${shortAccountId(previousAccountId)} -> ${shortAccountId(ctx.accountId)}` +
+              ` after ${lastFailureCode || 'failure'}`,
+          );
+        }
+        previousAccountId = ctx.accountId;
+
+        try {
+          const result = await this.runAttempt(payload, handlers, {
+            signal,
+            deadline,
+            emitted,
+            emit,
+            debugLines,
+            ctx,
+            bound,
+          });
+          markAccountSuccess(ctx.accountId);
+          return { ...result, accountId: ctx.accountId };
+        } catch (err) {
+          if (signal?.aborted) throw cancelledError();
+          const failure = err instanceof BridgeError ? err : normalizeAttemptError(err, null, signal);
+          const empty = !emitted.content && !emitted.reasoning;
+          const accountLevel = isAccountLevelFailure(failure);
+
+          if (accountLevel) this.recordAccountFailure(ctx.accountId, failure);
+          else if (empty && failure.code !== 'cancelled' && failure.code !== 'timeout') {
+            markAccountFailure(ctx.accountId, failure.code || 'error');
+          }
+
+          if (bound) {
+            // A chat session belongs to the account that created it: never send
+            // its session id under a different token. The caller replays into a
+            // fresh session instead. Single-account deployments keep surfacing
+            // the original failure (0.7.8 behavior).
+            if (empty && accountLevel && this.hasMultipleAccounts) {
+              throw new BridgeError(
+                'The DeepSeek account that owns this conversation is cooling down; replaying on a fresh session.',
+                'account_switched',
+                503,
+              );
+            }
+            throw failure;
+          }
+
+          if (!(empty && accountLevel && this.hasMultipleAccounts)) throw failure;
+
+          lastFailureCode = failure.code || (Number(failure.status) === 429 ? 'server_busy' : 'error');
+          this.log(
+            `account ${shortAccountId(ctx.accountId)} failed (${lastFailureCode}); rotating to another account`,
+          );
+          excluded.push(ctx.accountId);
+          // Very small pools: once every account failed once in this request,
+          // stop excluding them so the next sweep may retry after cooldowns.
+          if (excluded.length >= accountCount()) excluded.length = 0;
+          rotations++;
+          if (rotations > maxRotations) {
+            throw new BridgeError(
+              `DeepSeek is rate-limiting every configured account (${accountCount()} accounts). ` +
+                'Try again shortly or add another token with `deepseek --login`.',
+              'account_unavailable',
+              503,
+            );
+          }
+        }
       }
     } catch (err) {
       if (signal?.aborted) throw cancelledError();

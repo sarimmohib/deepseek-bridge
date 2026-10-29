@@ -188,6 +188,30 @@ export const dashboardHtml = `<!DOCTYPE html>
     border-radius: 5px; padding: 1px 5px;
   }
 
+  /* ---------- accounts ---------- */
+  .acct-list { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+  .acct-row {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px;
+    border: 1px solid var(--border); border-radius: 9px; background: var(--panel2);
+    padding: 8px 10px; font-size: 12.5px;
+  }
+  .acct-id { font-family: var(--mono); font-size: 12px; color: var(--accent); }
+  .acct-label { font-weight: 600; min-width: 70px; overflow: hidden; text-overflow: ellipsis; max-width: 220px; }
+  .state-badge {
+    font-size: 11px; padding: 1px 8px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--muted); white-space: nowrap;
+  }
+  .state-badge.ready { color: var(--good); border-color: var(--good); background: rgba(63, 185, 80, 0.08); }
+  .state-badge.cooling { color: var(--warn); border-color: var(--warn); background: rgba(210, 153, 34, 0.1); }
+  .acct-meta {
+    display: flex; flex-wrap: wrap; gap: 3px 12px; color: var(--muted);
+    font-size: 11.5px; flex: 1 1 auto; min-width: 200px;
+  }
+  .acct-add { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
+  .acct-add input { flex: 1 1 170px; min-width: 140px; }
+  .acct-add input#acct-label { flex: 0 1 160px; }
+  .acct-note { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+
   /* ---------- conversations ---------- */
   .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; }
   #search { flex: 1 1 170px; min-width: 150px; }
@@ -308,6 +332,25 @@ export const dashboardHtml = `<!DOCTYPE html>
     </div>
   </section>
   <section>
+    <h2>Accounts <span class="muted" id="accounts-chip">–</span></h2>
+    <div class="card">
+      <div class="muted">Unlimited DeepSeek accounts. Requests rotate automatically when one account hits a rate limit; a conversation stays pinned to the account that started it. Tokens are never shown here.</div>
+      <div class="acct-list" id="accounts-list"><div class="empty">Waiting for API key…</div></div>
+      <div class="acct-add">
+        <input id="acct-token" type="password" placeholder="userToken (hidden)" autocomplete="off">
+        <input id="acct-label" type="text" placeholder="label (optional)" autocomplete="off" maxlength="80">
+        <button class="btn primary" id="btn-account-add" type="button">Add account</button>
+        <button class="btn" id="btn-accounts-clear" type="button" title="remove every stored account">Clear all accounts</button>
+        <button class="btn sm" id="btn-accounts-refresh" type="button" title="refresh accounts">↻</button>
+      </div>
+      <div class="acct-note">
+        <span class="muted">Each token is verified with DeepSeek before it is kept. Prefer the terminal:</span>
+        <code>deepseek --login --manual --token &lt;token&gt;</code>
+      </div>
+      <div class="token-meta muted" id="accounts-meta"></div>
+    </div>
+  </section>
+  <section>
     <h2>Conversations</h2>
     <div class="toolbar">
       <input id="search" type="search" placeholder="Search preview or model…" autocomplete="off">
@@ -387,12 +430,24 @@ export const dashboardHtml = `<!DOCTYPE html>
   var tokenState = {
     pending: false,
     token: '',
+    accountId: '',
     cookies: 0,
     updatedAt: 0,
     revealed: false,
     noSession: false,
     oldBridge: false,
     err: ''
+  };
+  var accountState = {
+    pending: false,
+    list: [],
+    count: 0,
+    ready: 0,
+    cooling: 0,
+    source: 'bridge',
+    err: '',
+    armed: false,
+    armTimer: null
   };
   try { state.key = localStorage.getItem('dsb.key') || ''; } catch (e) {}
 
@@ -417,6 +472,25 @@ export const dashboardHtml = `<!DOCTYPE html>
     if (s < 3600) return Math.floor(s / 60) + 'm';
     if (s < 86400) return Math.floor(s / 3600) + 'h';
     return Math.floor(s / 86400) + 'd';
+  }
+  function fmtDur(ms) {
+    if (typeof ms !== 'number' || !isFinite(ms) || ms <= 0) return '–';
+    var s = Math.ceil(ms / 1000);
+    if (s < 60) return s + 's';
+    if (s < 3600) return Math.floor(s / 60) + 'm' + (s % 60 ? (s % 60) + 's' : '');
+    return Math.floor(s / 3600) + 'h' + (s % 3600 ? Math.floor((s % 3600) / 60) + 'm' : '');
+  }
+  function shortId(id) {
+    var text = String(id || '');
+    return text.length > 8 ? text.slice(0, 8) : text;
+  }
+  function acctLabel(a) {
+    if (!a) return '';
+    if (a.label) return String(a.label);
+    var u = a.user;
+    if (typeof u === 'string' && u) return u;
+    if (u && typeof u === 'object') return String(u.email || u.name || '');
+    return '';
   }
 
   /* ---------------- toasts ---------------- */
@@ -461,6 +535,31 @@ export const dashboardHtml = `<!DOCTYPE html>
       state.lastPollErr = now;
       toast(label + ': ' + err.message, 'error');
     }
+  }
+  function apiJson(path, method, body) {
+    var headers = { 'Content-Type': 'application/json' };
+    if (state.key) headers['Authorization'] = 'Bearer ' + state.key;
+    return fetch(path, { method: method || 'POST', headers: headers, body: JSON.stringify(body || {}) })
+      .then(function (res) {
+        if (res.status === 401) {
+          var had = !!state.key;
+          clearKey();
+          if (had) toast('Unauthorized — key cleared', 'error');
+          throw new Error('unauthorized');
+        }
+        return res.text().then(function (text) {
+          var d = null;
+          try { d = text ? JSON.parse(text) : null; } catch (e) {}
+          if (!res.ok) {
+            var msg = d && d.error && d.error.message ? d.error.message : 'HTTP ' + res.status;
+            var err = new Error(msg);
+            err.status = res.status;
+            err.code = d && d.error ? d.error.code : '';
+            throw err;
+          }
+          return d || {};
+        });
+      });
   }
 
   /* ---------------- unlock ---------------- */
@@ -632,6 +731,7 @@ export const dashboardHtml = `<!DOCTYPE html>
     v.textContent = shown;
     $('token-cmd').textContent = 'deepseek --login --manual --token ' + shown;
     var parts = [];
+    if (tokenState.accountId) parts.push('account ' + shortId(tokenState.accountId));
     if (num(tokenState.cookies)) parts.push(num(tokenState.cookies) + ' cookies');
     if (num(tokenState.updatedAt)) parts.push('updated ' + fmtAge(tokenState.updatedAt) + ' ago');
     $('token-meta').textContent = parts.join(' · ');
@@ -646,6 +746,7 @@ export const dashboardHtml = `<!DOCTYPE html>
     tokenState.pending = true;
     tokenState.noSession = false;
     tokenState.oldBridge = false;
+    tokenState.accountId = '';
     tokenState.err = '';
     renderToken();
     fetch('/v1/bridge/session/token', { headers: { 'Authorization': 'Bearer ' + state.key } }).then(function (res) {
@@ -670,6 +771,7 @@ export const dashboardHtml = `<!DOCTYPE html>
           tokenState.noSession = true;
         } else {
           tokenState.token = d.token;
+          tokenState.accountId = typeof d.accountId === 'string' ? d.accountId : '';
           tokenState.cookies = num(d.cookiesCount);
           tokenState.updatedAt = typeof d.updatedAt === 'number' ? d.updatedAt : 0;
         }
@@ -697,6 +799,161 @@ export const dashboardHtml = `<!DOCTYPE html>
       copyText(JSON.stringify(out, null, 2), btn);
     }).catch(function (err) {
       toast('Session JSON failed: ' + (err && err.message ? err.message : 'error'), 'error');
+    });
+  }
+
+  /* ---------------- accounts ---------------- */
+  function renderAccounts() {
+    var host = $('accounts-list');
+    var list = accountState.list || [];
+    var count = typeof accountState.count === 'number' ? accountState.count : list.length;
+    var chip = $('accounts-chip');
+    if (count) chip.textContent = count + ' stored · ' + num(accountState.ready) + ' ready · ' + num(accountState.cooling) + ' cooling';
+    else chip.textContent = 'none';
+    if (!state.key) {
+      host.innerHTML = '<div class="empty">Waiting for API key…</div>';
+      $('accounts-meta').textContent = '';
+      return;
+    }
+    if (!list.length) {
+      var emptyMsg = 'No accounts yet. Add one above or run <code>deepseek --login --manual</code>.';
+      if (accountState.pending) emptyMsg = 'Loading…';
+      else if (accountState.err) emptyMsg = 'Could not load accounts: ' + esc(accountState.err);
+      host.innerHTML = '<div class="empty">' + emptyMsg + '</div>';
+    } else {
+      var html = '';
+      for (var i = 0; i < list.length; i++) {
+        var a = list[i] || {};
+        var coolingMs = num(a.cooldownMs);
+        var cooling = a.state === 'cooling' || coolingMs > 0;
+        var stateText = cooling ? 'cooling ' + fmtDur(coolingMs) : 'ready';
+        var label = acctLabel(a);
+        html += '<div class="acct-row">'
+          + '<span class="acct-id" title="' + esc(a.id) + '">' + esc(shortId(a.id)) + '</span>'
+          + '<span class="acct-label" title="' + esc(label || 'no label') + '">' + esc(label || '(no label)') + '</span>'
+          + '<span class="state-badge ' + (cooling ? 'cooling' : 'ready') + '">' + esc(stateText) + '</span>'
+          + '<span class="acct-meta">'
+          + '<span>' + fmtNum(a.cookies) + ' cookies</span>'
+          + '<span>' + fmtNum(a.successCount) + ' ok / ' + fmtNum(a.failureCount) + ' failed</span>'
+          + '<span>throttle ' + fmtNum(a.throttleHits) + ' (lvl ' + fmtNum(a.throttleLevel) + ')</span>'
+          + '<span>used ' + (a.lastUsedAt ? fmtAge(a.lastUsedAt) + ' ago' : 'never') + '</span>'
+          + (a.lastError && a.lastError.code ? '<span>last error ' + esc(a.lastError.code) + '</span>' : '')
+          + '</span>'
+          + '<button class="del" type="button" data-acct="' + esc(a.id) + '" title="remove account" aria-label="remove account">✕</button>'
+          + '</div>';
+      }
+      host.innerHTML = html;
+    }
+    var meta = [];
+    if (accountState.source === 'local') meta.push('older bridge — accounts API unavailable, restart the bridge');
+    if (count) meta.push('verified tokens only · token values are never displayed');
+    $('accounts-meta').textContent = meta.join(' · ');
+  }
+  function refreshAccounts() {
+    accountState.pending = false;
+    loadAccounts();
+  }
+  function loadAccounts() {
+    if (!state.key) {
+      accountState.list = [];
+      accountState.count = 0;
+      accountState.ready = 0;
+      accountState.cooling = 0;
+      renderAccounts();
+      return;
+    }
+    if (accountState.pending) return;
+    accountState.pending = true;
+    accountState.err = '';
+    renderAccounts();
+    fetch('/v1/bridge/accounts', { headers: { 'Authorization': 'Bearer ' + state.key } }).then(function (res) {
+      if (res.status === 401) {
+        var had = !!state.key;
+        clearKey();
+        if (had) toast('Unauthorized — key cleared', 'error');
+        accountState.list = [];
+        accountState.count = 0;
+        accountState.err = 'unauthorized';
+        return null;
+      }
+      if (res.status === 404) {
+        accountState.source = 'local';
+        accountState.err = 'this bridge build has no accounts API (restart it after updating)';
+        return null;
+      }
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    }).then(function (d) {
+      if (!d) return;
+      accountState.source = 'bridge';
+      accountState.list = (d && d.accounts) || [];
+      accountState.count = num(d && d.count) || accountState.list.length;
+      accountState.ready = num(d && d.ready);
+      accountState.cooling = num(d && d.cooling);
+      accountState.err = '';
+    }).catch(function (err) {
+      accountState.err = err && err.message ? err.message : 'network error';
+    }).then(function () {
+      accountState.pending = false;
+      renderAccounts();
+    });
+  }
+  function addAccount() {
+    var tokenEl = $('acct-token');
+    var token = tokenEl.value.trim();
+    if (!token) { toast('Paste a userToken first', 'error'); return; }
+    var label = $('acct-label').value.trim();
+    var btn = $('btn-account-add');
+    btn.disabled = true;
+    btn.textContent = 'Verifying…';
+    var payload = { token: token };
+    if (label) payload.label = label;
+    apiJson('/v1/bridge/accounts', 'POST', payload).then(function (d) {
+      tokenEl.value = '';
+      $('acct-label').value = '';
+      var a = d && d.account ? d.account : null;
+      toast('Account ' + (a ? shortId(a.id) : '') + ' verified' + (d && d.duplicate ? ' (already stored, health reset)' : ''), 'ok');
+      refreshAccounts();
+    }).catch(function (err) {
+      if (err && err.message !== 'unauthorized') toast('Add failed: ' + err.message, 'error');
+    }).then(function () {
+      btn.disabled = false;
+      btn.textContent = 'Add account';
+    });
+  }
+  function removeAccountRow(id) {
+    api('/v1/bridge/accounts/' + encodeURIComponent(id), { method: 'DELETE' }).then(function () {
+      toast('Account ' + shortId(id) + ' removed', 'ok');
+      refreshAccounts();
+    }).catch(function (err) {
+      if (err && err.message !== 'unauthorized') toast('Remove failed: ' + err.message, 'error');
+    });
+  }
+  function disarmAccounts() {
+    accountState.armed = false;
+    var b = $('btn-accounts-clear');
+    if (b) {
+      b.classList.remove('armed');
+      b.textContent = 'Clear all accounts';
+    }
+    if (accountState.armTimer) { clearTimeout(accountState.armTimer); accountState.armTimer = null; }
+  }
+  function clearAccountsClick() {
+    if (!accountState.count) { toast('No accounts to remove', 'error'); return; }
+    if (!accountState.armed) {
+      accountState.armed = true;
+      var b = $('btn-accounts-clear');
+      b.classList.add('armed');
+      b.textContent = 'Remove all ' + accountState.count + '?';
+      accountState.armTimer = setTimeout(disarmAccounts, 4000);
+      return;
+    }
+    disarmAccounts();
+    api('/v1/bridge/accounts', { method: 'DELETE' }).then(function (d) {
+      toast('Removed ' + num(d && d.removed) + ' account(s)', 'ok');
+      refreshAccounts();
+    }).catch(function (err) {
+      if (err && err.message !== 'unauthorized') toast('Clear failed: ' + err.message, 'error');
     });
   }
 
@@ -798,6 +1055,7 @@ export const dashboardHtml = `<!DOCTYPE html>
       renderModelFilter();
       renderConvos();
     }).catch(function (err) { pollError('conversations', err); });
+    loadAccounts();
     api('/v1/models').then(function (d) {
       state.models = (d && d.data) || [];
       renderModels();
@@ -844,6 +1102,18 @@ export const dashboardHtml = `<!DOCTYPE html>
     $('btn-token-json').addEventListener('click', function () { copySessionJson(this); });
     $('btn-token-cmd').addEventListener('click', function () {
       if (tokenState.token) copyText('deepseek --login --manual --token ' + tokenState.token, this);
+    });
+    $('btn-accounts-refresh').addEventListener('click', refreshAccounts);
+    $('btn-account-add').addEventListener('click', addAccount);
+    $('acct-token').addEventListener('keydown', function (e) { if (e.key === 'Enter') addAccount(); });
+    $('btn-accounts-clear').addEventListener('click', clearAccountsClick);
+    $('accounts-list').addEventListener('click', function (ev) {
+      var btn = ev.target && ev.target.closest ? ev.target.closest('button[data-acct]') : null;
+      if (!btn) return;
+      var id = btn.getAttribute('data-acct');
+      if (!id) return;
+      btn.disabled = true;
+      removeAccountRow(id);
     });
     $('models-row').addEventListener('click', function (ev) {
       var btn = ev.target && ev.target.closest ? ev.target.closest('button[data-idx]') : null;

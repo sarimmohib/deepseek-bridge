@@ -64,7 +64,7 @@ export function clampMaxUpstream(v) {
   return Math.min(16, Math.max(1, n));
 }
 
-async function withUpstreamSlot(cfg, fn) {
+async function withUpstreamSlot(cfg, direct, fn) {
   bridgeQueue.max = clampMaxUpstream(cfg?.maxUpstream);
   // A raised limit must benefit queued waiters first: hand out the freed
   // capacity here (synchronously, so no new arrival can jump the FIFO).
@@ -73,11 +73,16 @@ async function withUpstreamSlot(cfg, fn) {
     bridgeQueue.active++;
     waiter();
   }
-  // Ride out a global throttle window while holding this slot: the account
-  // is rate-limited, so pacing every client beats letting each one hammer.
-  const cooldown = upstreamCooldownMs();
-  if (cooldown > 0) {
-    await new Promise((resolve) => setTimeout(resolve, cooldown));
+  // Ride out a global throttle window while holding this slot: one account is
+  // rate-limited, so pacing every client beats letting each one hammer. With
+  // multiple accounts the throttled account cools down on its own and the
+  // DirectClient rotates away, so a process-global stall would only slow down
+  // healthy accounts.
+  if (!direct?.hasMultipleAccounts) {
+    const cooldown = upstreamCooldownMs();
+    if (cooldown > 0) {
+      await new Promise((resolve) => setTimeout(resolve, cooldown));
+    }
   }
   if (bridgeQueue.active < bridgeQueue.max) {
     bridgeQueue.active++;
@@ -427,6 +432,7 @@ export async function handleChatCompletions(req, res, body, ctx) {
       continuation: false,
       sessionId: null,
       parentMessageId: null,
+      accountId: null,
       prompt: head ? `${head}\n\n${transcript.text}` : transcript.text,
       baseTurns: 0,
     };
@@ -446,6 +452,11 @@ export async function handleChatCompletions(req, res, body, ctx) {
         continuation: true,
         sessionId: prev.sessionId,
         parentMessageId: prev.parentId,
+        // A DeepSeek chat session belongs to the account that created it. Pin
+        // the continuation to that account; if it is cooling, the runner
+        // raises account_switched and this request replays fresh instead of
+        // sending another account's session id.
+        accountId: prev.accountId ?? null,
         prompt: [hint, flattenTurns(tail)].filter(Boolean).join('\n\n'),
         baseTurns: prev.turns,
       };
@@ -539,13 +550,14 @@ export async function handleChatCompletions(req, res, body, ctx) {
     const runPlan = (currentPlan) =>
       // Hold one of the process-global upstream slots for the whole runner
       // execution; excess concurrent requests queue FIFO until a slot frees.
-      withUpstreamSlot(cfg, () =>
+      withUpstreamSlot(cfg, ctx.direct, () =>
         runner.run(
           {
             prompt: currentPlan.prompt,
             continuation: currentPlan.continuation,
             sessionId: currentPlan.sessionId,
             parentMessageId: currentPlan.parentMessageId,
+            accountId: currentPlan.accountId ?? null,
             modelType: opts.modelType,
             thinking: opts.thinking,
             search: opts.search,
@@ -585,17 +597,23 @@ export async function handleChatCompletions(req, res, body, ctx) {
       // fresh one even though the wall technically streamed (it was garbage,
       // and the fresh replay carries the real transcript).
       const degenerate = err?.code === 'degenerate_reply';
+      // The pinned account became unavailable (cooling/expired) before any
+      // network call, so the stored chat_session_id cannot be continued on
+      // another account. Replay the whole transcript into a fresh session.
+      const accountSwitched = err?.code === 'account_switched';
       if (
         activePlan.continuation &&
-        (invalidParent || emptyReply || degenerate) &&
+        (invalidParent || emptyReply || degenerate || accountSwitched) &&
         (!content && !reasoning || degenerate)
       ) {
         log(
           degenerate
             ? 'degenerate DSML loop; retrying from a fresh session'
-            : emptyReply
-              ? 'persistent empty replies from DeepSeek; retrying from a fresh session'
-              : 'saved DeepSeek parent was rejected; retrying from a fresh session',
+            : accountSwitched
+              ? 'conversation account is cooling down; retrying from a fresh session'
+              : emptyReply
+                ? 'persistent empty replies from DeepSeek; retrying from a fresh session'
+                : 'saved DeepSeek parent was rejected; retrying from a fresh session',
         );
         store.deleteConversation?.(key);
         // The fresh prompt replays the whole transcript, but `attachments` was
@@ -724,6 +742,9 @@ export async function handleChatCompletions(req, res, body, ctx) {
         digest,
         model,
       };
+      // DeepSeek chat sessions are account-scoped: remember who owns this one
+      // so continuation is pinned to it (or replayed fresh after a rotation).
+      if (result.accountId) entry.accountId = result.accountId;
       const firstUser = rest.find((m) => m.role === 'user');
       if (firstUser) entry.preview = String(firstUser.content || '').slice(0, 80);
       if (usage) {
@@ -802,7 +823,8 @@ export async function handleChatCompletions(req, res, body, ctx) {
 
     log(
       `chat ok mode=${mode} model=${model} thinking=${opts.thinking} effort=${opts.effort ?? '-'} search=${opts.search} ` +
-        `cont=${plan.continuation} att=${attachments.length} session=${sessionId || '?'} msg=${messageId || '?'} ` +
+        `cont=${plan.continuation} att=${attachments.length} account=${result.accountId ? String(result.accountId).slice(0, 8) : '-'} ` +
+        `session=${sessionId || '?'} msg=${messageId || '?'} ` +
         `out=${content.length}c/${reasoning.length}c ${Date.now() - started}ms`,
     );
   } catch (err) {

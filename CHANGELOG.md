@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.8.0
+
+- **Multiple DeepSeek accounts with automatic rotation.** The single
+  `session.json` is replaced by an unbounded pool in `accounts.json`
+  (`0600`, atomic writes, per-account cookie/user-agent state). Add as many
+  `userToken`s as you have accounts; each one is verified with DeepSeek before
+  it is kept, duplicates dedupe by token hash, and nothing has a pool-size cap.
+  - When an account hits DeepSeek's per-account rate window (clean empty
+    reply, upload rate limit, 429/server-busy) it cools down for
+    15s/45s/120s/300s/600s — escalating while it keeps hitting the window and
+    decaying on success — and the request transparently restarts on another
+    ready account (session create, attachment re-upload, fresh PoW). A token
+    DeepSeek rejects (`not_signed_in`) is parked until it is re-added.
+  - Conversations are account-scoped. A continuation is pinned to the account
+    that created its `chat_session_id`; if that account is unavailable the
+    request replays into a fresh session on a healthy account instead of
+    leaking a session id across accounts. Uploaded file ids are cached per
+    account (`accountId|sha256`), so rotation re-uploads correctly.
+  - The process-global empty-reply valve no longer stalls healthy accounts when
+    more than one is stored; per-account cool-downs do the pacing.
+- **REST API:** `GET/POST /v1/bridge/accounts`, `DELETE /v1/bridge/accounts/:id`,
+  `DELETE /v1/bridge/accounts`; `/health` and `/v1/bridge/status` report
+  `{count, ready, cooling}`; `/v1/bridge/session/token` returns the primary
+  account plus its `accountId`; `/v1/bridge/session/export` now upserts an
+  account instead of replacing the pool; `/v1/bridge/session` DELETE clears all
+  accounts and the legacy file. Account payloads are redacted — tokens never
+  appear in a list/summary response.
+- **Security:** `GET /v1/bridge/session/token` is now behind the bridge API-key
+  gate like every other credential-bearing route. In 0.7.8 it sat before the
+  auth check, so a local process could read the stored DeepSeek token without
+  the key. The dashboard already sends the key; other clients must too.
+- **CLI:** `deepseek accounts` (list / `--json` / `remove <id|index>` /
+  `clear --yes`) reads from the running bridge or `accounts.json` directly.
+  `deepseek --login --manual --token ...` appends an account (with `--replace`
+  to reset the pool, `--label` to name it); the extension login upserts too.
+  `deepseek --logout` now clears the whole pool and reports how many accounts
+  were removed. `status`, `session`, help text and the startup banner show
+  account counts and cooling state.
+- **Dashboard:** new Accounts panel listing id, label, cookies, ready/cooling
+  state, throttle hits and last use, with per-row delete, an add-token form
+  (verified by the bridge) and a double-confirm "Clear all accounts". Token
+  values are never rendered.
+- **Migration:** an existing `session.json` is imported once into the pool on
+  first load and left on disk until `--logout`/`accounts clear`. Older
+  single-session bridges keep working; the CLI warns to restart when a running
+  bridge predates the accounts API.
+- Version bumped to 0.8.0. New tests: `test/accounts.test.js`,
+  `test/rotation.test.js`, `test/accounts-api.test.js`.
+
 ## 0.7.8
 
 - Completion gate INVERTED to a whitelist: a stream is complete only if its

@@ -1,9 +1,9 @@
 {
   "name": "deepseek-bridge",
-  "version": "0.7.8",
+  "version": "0.8.0",
   "private": true,
   "type": "module",
-  "description": "OpenAI-compatible local API for chat.deepseek.com. Copies your web session once, then runs without Chrome.",
+  "description": "OpenAI-compatible local API for chat.deepseek.com with an unlimited account pool and automatic rotation. Copies your web session once, then runs without Chrome.",
   "license": "Unlicense",
   "repository": {
     "type": "git",
@@ -35,7 +35,7 @@
     "start": "node bin/ds-bridge.js",
     "serve": "node bin/deepseek.js serve",
     "chat": "node bin/ds-chat.js",
-    "test": "node test/pow.test.js && node test/session.test.js && node test/direct.test.js && node test/prompt.test.js && node test/guard.test.js && node test/models.test.js && node test/version.test.js && node test/handler.test.js && node test/modelinfo.test.js"
+    "test": "node test/pow.test.js && node test/session.test.js && node test/accounts.test.js && node test/direct.test.js && node test/rotation.test.js && node test/prompt.test.js && node test/guard.test.js && node test/models.test.js && node test/version.test.js && node test/handler.test.js && node test/modelinfo.test.js && node test/accounts-api.test.js"
   },
   "engines": {
     "node": ">=18"

@@ -27,7 +27,12 @@ mode.
 
 - **Direct mode:** no Chrome process, extension, or open tab needed at runtime.
 - **One-command login:** `deepseek --login` copies only `chat.deepseek.com`
-  cookies and the site's `userToken` into a `0600` session file.
+  cookies and the site's `userToken` into a `0600` account file.
+- **Unlimited accounts + automatic rotation:** store any number of DeepSeek web
+  logins; when one hits DeepSeek's per-account rate window it cools down and the
+  request transparently continues on another account. Conversations stay pinned
+  to the account that started them, so a rotated request never leaks a
+  `chat_session_id` across accounts.
 - **Extension fallback:** the original same-origin extension path remains.
 - **Transient-failure recovery:** network errors, server-busy replies, WAF
   challenges, and truncated SSE streams are retried; an interrupted reply is
@@ -183,11 +188,12 @@ sites' cookies.
    Expected output:
 
    ```text
-   DeepSeek session copied to the terminal
+   DeepSeek account added to the pool
 
      Mode        direct (Chrome not required)
      Cookies     1
-     Session     ~/.config/deepseek-bridge/session.json
+     Accounts    1 stored (unlimited pool)
+     Session     ~/.config/deepseek-bridge/accounts.json
 
      Chrome and the extension are no longer needed for requests.
    ```
@@ -198,9 +204,11 @@ sites' cookies.
    deepseek chat "Reply with exactly: DIRECT_OK"
    ```
 
-`deepseek --login` prints no token or cookie values. The session file is
-created with mode `0600` on Linux/macOS and lives under your user profile on
-Windows.
+`deepseek --login` prints no token or cookie values. The account pool
+(`accounts.json`) is created with mode `0600` on Linux/macOS and lives under
+your user profile on Windows. Run the same login again with another account to
+grow the pool; see
+[Multiple accounts + automatic rotation](#multiple-accounts--automatic-rotation).
 
 ### No extension at all (manual token)
 
@@ -220,11 +228,16 @@ If you do not want to install the extension even once, use the manual flow:
    deepseek --login --manual --token-file token.txt
    deepseek --login --manual --token <userToken>
    DEEPSEEK_TOKEN=<userToken> deepseek --login --manual
+   deepseek --login --manual --token <userToken> --replace   # reset the pool
    ```
 
 4. At the hidden prompt, paste the token and press Enter. The prompt reads from
    a terminal, piped stdin, or the explicit options above; it does not require a
    trailing newline when input is piped.
+
+Each manual login **appends one account** to an unlimited pool (the same token
+re-added is a health reset, not a duplicate). `--replace` clears the pool first;
+if DeepSeek rejects the new token the previous pool is restored.
 
 `--token` can expose the value in your shell history, so prefer
 `--token-file`, `DEEPSEEK_TOKEN`, or the hidden prompt. This stores only
@@ -241,16 +254,22 @@ happens, requests fail with `not_signed_in` and a message telling you to run:
 deepseek --login
 ```
 
-To delete the terminal session and go back to extension mode:
+With more than one account stored, the bridge rotates that failure away to a
+healthy account and parks the expired one (`not_signed_in` in
+`deepseek accounts`) until you re-add its token.
+
+To delete every stored terminal account and go back to extension mode:
 
 ```bash
 deepseek --logout
 ```
 
-To inspect the stored session metadata without printing credentials:
+It prints how many accounts were removed. To inspect the stored account pool
+without printing credentials:
 
 ```bash
 deepseek session
+deepseek accounts
 ```
 
 ### What gets copied
@@ -263,9 +282,87 @@ deepseek session
 Nothing else. Cookies for Google, GitHub, banking, or any other site are never
 read or stored.
 
+## Multiple accounts + automatic rotation
+
+DeepSeek rate-limits per account: after a burst of generations the web gateway
+answers with clean empty replies for a while, and uploads have a stricter quota
+of their own. The bridge therefore keeps an **unbounded pool** of accounts in
+`accounts.json` and rotates requests across them.
+
+### Add accounts
+
+Every login appends one account:
+
+```bash
+deepseek --login --manual --token <userToken>               # append
+deepseek --login --manual --token-file token.txt            # append from a file
+DEEPSEEK_TOKEN=<userToken> deepseek --login --manual         # append from env
+deepseek --login --manual --token <userToken> --label work  # name it
+deepseek --login                                             # copy from Chrome
+deepseek --login --manual --token <userToken> --replace     # reset the pool
+```
+
+- Each token is verified against DeepSeek before it is kept. A rejected token
+  is removed again and the rest of the pool is untouched.
+- Re-adding a token that is already stored is a health reset (its cooldown and
+  failure state clear), not a second entry.
+- `--replace` clears the pool first; the previous pool is restored if the new
+  token is rejected.
+- There is no maximum. Each account carries its own cookies, user agent and
+  stats (`lastUsedAt`, cool-down, throttle hits, success/failure counts).
+- A token is a credential. `accounts.json` is `0600` and excluded from git.
+
+### Inspect and remove
+
+```bash
+deepseek accounts                  # id, label/user, cookies, ready/cooling, throttle hits, last used
+deepseek accounts --json           # machine-readable (never contains token values)
+deepseek accounts remove 2         # by 1-based index
+deepseek accounts remove 1a2b3c4d  # by (partial) account id
+deepseek accounts clear            # show what would be removed
+deepseek accounts clear --yes      # remove every account + legacy session.json
+deepseek --logout                  # same effect, kept for compatibility
+```
+
+`deepseek accounts` reads a running bridge when one is up (its stats are
+freshest) and `accounts.json` directly when it is not.
+
+### Rotation behavior
+
+- A clean empty reply, an upload rate limit, or HTTP 429/server-busy on an
+  account starts its cool-down: **15s → 45s → 2m → 5m → 10m** while it keeps
+  hitting the window; a success decays the level one step. A rejected token
+  (`not_signed_in`) is parked (a short 5-minute re-probe window) until it is
+  re-added; re-adding the token resets its state immediately.
+- The same request is transparently restarted on another ready account —
+  chat session create, PoW and attachment uploads are redone on that account.
+  The bridge log records which account served and when it rotated; account ids
+  are truncated to 8 characters and tokens never appear in logs.
+- A conversation is pinned to the account that created its DeepSeek
+  `chat_session_id`. Continuations never send that session id under another
+  account; if the pinned account is unavailable the turn is replayed into a
+  fresh session on a healthy account (the client still sees a normal reply).
+- Uploaded file ids are cached per account (`accountId|sha256`), because
+  DeepSeek file ids are account-scoped, so rotation re-uploads correctly.
+- With one account stored nothing rotates and the original single-session
+  behavior (including the global empty-reply valve) is preserved.
+- `maxUpstream` still caps concurrent DeepSeek generations across the whole
+  bridge (default `2`); raise it if you add many accounts and want more
+  parallelism.
+- If a *running* bridge predates 0.8.0, the CLI stores the account locally and
+  asks you to restart it (`deepseek stop && deepseek`) so the new pool is
+  loaded.
+
+### Migration from session.json
+
+On first start after upgrading, an existing `session.json` is imported once as
+the first account and left in place. `deepseek --logout` /
+`deepseek accounts clear --yes` removes both files. Extension mode still takes
+over when the pool is empty and the extension is connected.
+
 ## Extension mode (fallback)
 
-If no `session.json` exists, the bridge uses the original extension path:
+If no stored account exists, the bridge uses the original extension path:
 
 ```text
 terminal / agent / SDK
@@ -285,7 +382,7 @@ The extension creates the chat session, solves the PoW challenge, and
 translates the site's patch-based SSE stream into OpenAI chunks.
 
 `deepseek --logout` switches back to this mode if the extension is connected.
-Direct mode takes precedence whenever `session.json` exists.
+Direct mode takes precedence whenever the account pool is non-empty.
 
 ## CLI reference
 
@@ -296,10 +393,16 @@ Direct mode takes precedence whenever `session.json` exists.
 | `deepseek serve` | Run the bridge in the foreground; logs stream to the terminal |
 | `deepseek stop` | Stop the background bridge using its PID file |
 | `deepseek status` | Show base URL, mode, session/extension state, config, and log path |
-| `deepseek --login` | Copy the Chrome web session into the terminal (once per login) |
-| `deepseek --login --manual` | Paste `userToken` from DevTools (or use `--token`, `--token-file`, `DEEPSEEK_TOKEN`); no extension needed |
-| `deepseek --logout` | Delete the terminal session and fall back to extension mode |
-| `deepseek session` | Show stored session metadata, never the token |
+| `deepseek --login` | Copy the Chrome web session into the terminal as one account (appends to the pool) |
+| `deepseek --login --manual` | Paste `userToken` from DevTools (or use `--token`, `--token-file`, `DEEPSEEK_TOKEN`); appends one account |
+| `deepseek --login --manual --token <userToken> --replace` | Replace the whole account pool with this token |
+| `deepseek --login --manual --token <userToken> --label NAME` | Name the account in lists and the dashboard |
+| `deepseek accounts` | List the stored account pool: id, label, cookies, ready/cooling, throttle hits, last use |
+| `deepseek accounts --json` | Machine-readable account list (never contains token values) |
+| `deepseek accounts remove <id\|index>` | Remove one account by full/partial id or 1-based index |
+| `deepseek accounts clear --yes` | Remove every account and the legacy `session.json` |
+| `deepseek --logout` | Remove every stored account and fall back to extension mode |
+| `deepseek session` | Show stored account metadata, never the token |
 | `deepseek version` | Show the local version, commit, and GitHub `main` version |
 | `deepseek update --check` | Check GitHub without changing files |
 | `deepseek update` | Fast-forward a clean `main` git checkout and optionally restart the bridge |
@@ -345,6 +448,10 @@ your browser's localStorage and sent only to the bridge). Panels:
 - **Models** — the advertised models with context/output limits and a
   "Copy OpenCode config" button that mirrors the working
   `~/.config/opencode/opencode.jsonc` entry.
+- **Accounts** — every stored account with id, label, cookie count,
+  ready/cooling state, throttle hits and last use; per-row delete, an add-token
+  form (the bridge verifies the token before keeping it) and a double-confirm
+  "Clear all accounts". Token values are never rendered.
 - **Conversations** — searchable, filterable, sortable table of cached
   conversations (model, turns, input/output and session token counts, age,
   preview) with per-row delete and a double-confirm "Clear all".
@@ -505,11 +612,16 @@ printed at startup and stored in the config file.
 | --- | --- | --- |
 | `POST` | `/v1/chat/completions` | Chat, streaming or non-streaming |
 | `GET` | `/v1/models` | Model list |
-| `GET` | `/v1/bridge/status` | Mode, direct session, extension state, queue |
-| `GET` | `/v1/bridge/session` | Stored session metadata (no credentials) |
-| `POST` | `/v1/bridge/session/export` | Ask Chrome for a fresh session (used by `--login`) |
-| `POST` | `/v1/bridge/session/verify` | Verify the stored session with a small authenticated call |
-| `DELETE` | `/v1/bridge/session` | Delete the stored terminal session |
+| `GET` | `/v1/bridge/status` | Mode, account/direct summary, extension state, queue |
+| `GET` | `/v1/bridge/accounts` | Account pool summary (redacted; never includes tokens) |
+| `POST` | `/v1/bridge/accounts` | Add and verify one account; `{replace: true}` resets the pool first |
+| `DELETE` | `/v1/bridge/accounts/:id` | Remove one account |
+| `DELETE` | `/v1/bridge/accounts` | Remove every account |
+| `GET` | `/v1/bridge/session` | Stored account metadata (no credentials) |
+| `GET` | `/v1/bridge/session/token` | Primary token + `accountId` for the dashboard (auth required) |
+| `POST` | `/v1/bridge/session/export` | Ask Chrome for a fresh session; upserts it into the pool |
+| `POST` | `/v1/bridge/session/verify` | Verify the primary account with a small authenticated call |
+| `DELETE` | `/v1/bridge/session` | Delete every stored account (and legacy `session.json`) |
 | `GET` | `/v1/bridge/conversations` | Cached conversations with token counts and previews |
 | `GET` | `/v1/conversations` | Cached session map |
 | `DELETE` | `/v1/conversations` | Forget cached sessions |
@@ -843,9 +955,17 @@ The bridge speaks plain OpenAI Chat Completions, so any harness can point at
 ## How it works
 
 - **Direct session.** `deepseek --login` asks the extension for the
-  `chat.deepseek.com` cookies and `localStorage.userToken`, then stores them in
-  `session.json` (`0600`). The Node client sends those values as an ordinary
-  `Cookie` header and `Authorization: Bearer <userToken>`.
+  `chat.deepseek.com` cookies and `localStorage.userToken`, then upserts them as
+  one entry in `accounts.json` (`0600`). The Node client sends those values as
+  an ordinary `Cookie` header and `Authorization: Bearer <userToken>`.
+- **Account pool.** Every account keeps its own token, cookies, user agent and
+  health stats. A scheduler picks the least-recently-used ready account per
+  fresh request; cool-downs are per account (15s → 45s → 2m → 5m → 10m,
+  decaying on success) and a rejected token is parked until re-added.
+- **Rotation.** An account-level throttle with nothing streamed yet restarts
+  the whole upstream setup on another account; a continuation bound to a
+  cooling/expired account fails fast with `account_switched` and the OpenAI
+  layer replays it into a fresh session instead of mixing accounts.
 - **Proof of work.** `create_pow_challenge` returns a hash challenge; the site
   hashes `salt_expireAt_nonce` with a Keccak-f[1600] sponge that differs from
   stock SHA3-256 (round constants 1..23, and a rho step that swaps lane halves
@@ -861,37 +981,52 @@ The bridge speaks plain OpenAI Chat Completions, so any harness can point at
   and emits native `tool_calls` deltas. Ordinary JSON fences are released as
   soon as their fence is complete.
 - **Sessions.** The bridge reuses the DeepSeek `chat_session_id` for matching
-  transcripts and sends only the new tail with `parent_message_id`. This keeps
-  context and tool results consistent without resending the whole conversation
-  to the website on every turn.
-- **Fallback.** If `session.json` is absent, the bridge pushes the same job to
+  transcripts and sends only the new tail with `parent_message_id`. A session
+  belongs to the account that created it, so cached conversations also record
+  `accountId`; a continuation stays pinned to that account (or replays fresh).
+  This keeps context and tool results consistent without resending the whole
+  conversation to the website on every turn.
+- **Fallback.** If no account is stored, the bridge pushes the same job to
   the extension over its authenticated loopback WebSocket. The extension
   executes it in the real site origin.
 
 ## Security
 
-- The session file is `~/.config/deepseek-bridge/session.json` and is written
-  with mode `0600` on Linux/macOS (under your user profile on Windows). The
-  config directory is `0700` where POSIX modes apply.
+- The account pool is `~/.config/deepseek-bridge/accounts.json` and is written
+  with mode `0600` (atomic rename) on Linux/macOS, under your user profile on
+  Windows. The config directory is `0700` where POSIX modes apply. A legacy
+  `session.json` from pre-0.8.0 installs is migrated once and then ignored until
+  it is removed.
 - Only `deepseek.com` cookies are copied. The extension never enumerates or
   exports cookies for other sites.
 - The bridge prints only a truncated API key in the HTML status page and never
-  prints the DeepSeek token or cookie values.
+  prints the DeepSeek token or cookie values. Account list/summary responses
+  (`/v1/bridge/accounts`, `/health`, `/v1/bridge/status`) are redacted, and log
+  lines truncate account ids to 8 characters.
 - The bridge listens on `127.0.0.1` only. The API key protects the loopback
-  HTTP API; anyone with both local access and that key can use your session.
-- `deepseek --logout` deletes the session file. Deleting it does not log out
-  your browser; use DeepSeek's own logout for that.
-- Copied web sessions are personal credentials. Do not commit `session.json`,
-  paste it in issues, or share it. The repository's `.gitignore` excludes it.
+  HTTP API; anyone with both local access and that key can use your accounts
+  (and the auth-gated session token endpoint explicitly returns the primary
+  token so the dashboard and another machine can bootstrap a login).
+- `deepseek --logout` (or `deepseek accounts clear --yes`) deletes
+  `accounts.json` and any legacy `session.json`. It does not log out your
+  browser; use DeepSeek's own logout for that.
+- Copied web sessions are personal credentials. Do not commit `accounts.json` or
+  `session.json`, paste them in issues, or share them. The repository's
+  `.gitignore` excludes both.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 | --- | --- |
 | `deepseek --login` says Chrome is not connected | Open Chrome, load/reload the extension from the folder printed by `deepseek`, and keep the popup port/key correct. Sign in at chat.deepseek.com. Then retry; Chrome may need up to 30 s to wake the extension worker. |
-| `not_signed_in` / session expired | Run `deepseek --login` again. Direct mode does not fall back automatically, so an expired stored session is reported clearly. |
+| `not_signed_in` / session expired | Run `deepseek --login` again. With two or more accounts the bridge rotates to a healthy one and parks the expired account (`deepseek accounts` shows `not_signed_in`); re-add its token to reset it. |
+| `deepseek accounts` shows `cooling 45s` | Normal: that account hit DeepSeek's per-account rate window. Requests use other ready accounts; wait out the countdown or add another account. |
+| Every account is cooling / empty replies continue | All stored accounts are inside their rate window. Add another account or wait for the longest cool-down; the bridge errors with `empty_reply` only when no account can serve. |
+| Only one account, no rotation | Rotation needs at least two stored accounts. Check with `deepseek accounts` and add one (`deepseek --login --manual --token ...`). |
+| `deepseek accounts` says the bridge has no accounts API | The running bridge is older than 0.8.0. Restart it (`deepseek stop && deepseek`) so it loads the new pool. |
+| A re-added token did not create a second account | Tokens dedupe by hash. The re-add is a health reset of the existing entry; add a different account's token to grow the pool. |
 | `deepseek --login` says Chrome returned an incomplete session | The content script was stale. Reload the extension in `chrome://extensions`, refresh the `chat.deepseek.com` tab, then retry. |
-| `extension disconnected` / `extension_offline` | You are in extension mode (no `session.json`) or you requested `--login` with Chrome closed. Start Chrome and keep a signed-in `chat.deepseek.com` tab open. |
+| `extension disconnected` / `extension_offline` | You are in extension mode (the account pool is empty) or you requested `--login` with Chrome closed. Start Chrome and keep a signed-in `chat.deepseek.com` tab open. |
 | `INVALID_POW_RESPONSE` | Solved challenges are single-use. The bridge automatically requests a fresh challenge and retries. If it persists, restart with `deepseek stop && deepseek`. |
 | Empty completion, `HTTP 200` | The site returned a JSON error body instead of SSE. The bridge retries transient errors; if it still fails, retry the request or run `deepseek --login` again. |
 | Reply stops midway / `stream_interrupted` | The bridge detects a missing stream terminator, asks DeepSeek to continue the same assistant message, and appends only the missing text. If DeepSeek refuses to continue, the error is surfaced instead of silently truncating. |
@@ -925,10 +1060,12 @@ request.
 npm test
 ```
 
-The suite covers the PoW vector, session storage and cookie filtering,
-prompt/tool parsing, the streaming guard, semantic version comparison and the
-GitHub version fetch, and a full HTTP replay of every accepted tool-call format,
-including the failing ZCode rollout payloads and the empty-DSML loop.
+The suite covers the PoW vector, account-pool storage and rotation (per-account
+cool-downs, migration, redaction), the accounts REST API, session storage and
+cookie filtering, prompt/tool parsing, the streaming guard, semantic version
+comparison and the GitHub version fetch, and a full HTTP replay of every
+accepted tool-call format, including the failing ZCode rollout payloads and the
+empty-DSML loop.
 
 End-to-end harness (throwaway Chrome profile; it injects a token into
 localStorage and never touches your real profile):
@@ -962,12 +1099,14 @@ because the previous worker does not know that message.
 
 ## Notes and limits
 
-- Personal-use bridge: it rides your own web session. Bulk or commercial use
+- Personal-use bridge: it rides your own web sessions. Bulk or commercial use
   will hit account rate limits and the site's terms.
-- One account, one session. Direct-mode requests share the copied web session
-  with that browser login; running both paths with the same account is fine,
-  but they are not isolated accounts.
-- The session file is a credential. Treat it like a browser cookie export.
+- Unlimited accounts, one pool. Direct-mode requests rotate across the stored
+  accounts automatically; each account has its own web session and health
+  state. Running the browser and the bridge with the same account is fine, but
+  they are not isolated accounts.
+- The account pool is a credential. Treat `accounts.json` (and any legacy
+  `session.json`) like a browser cookie export.
 - Image/file attachments are supported through the web upload endpoint, with a
   bridge cap of 10 MB per file and 20 MB total per request. Text files are
   additionally budgeted against the model context window; see
@@ -978,7 +1117,7 @@ because the previous worker does not know that message.
 - Both advertised models always reason. `reasoning_effort` is accepted but the
   web gateway ignores numeric effort; `low`/`max` add a small prompt hint.
 - The bridge is not a security boundary. Keep it on loopback and protect the
-  API key and `session.json`.
+  API key and `accounts.json`.
 
 ## License
 
