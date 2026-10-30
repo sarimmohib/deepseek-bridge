@@ -618,23 +618,88 @@ const DSML_TAG_RE = new RegExp(
   'gi',
 );
 
+// DeepSeek does not always write DSML attributes with ASCII punctuation. The
+// observed corruptions are full-width `＝` (U+FF1D) and typographic quotes
+// (`name=“command”`), usually while the model is under load. A naive attribute
+// regex then finds no `name`, the parameter is dropped, and the harness sees a
+// tool call that is missing required properties even though the model emitted
+// them — the failure mode reported as "missing required property" on a call
+// that visibly contained the property. Normalize the look-alikes first.
+const ATTR_EQUALS = /[\uFF1D]/g;
+const ATTR_DQUOTE = /[\uFF02\u201C\u201D\u2033]/g;
+const ATTR_SQUOTE = /[\u2018\u2019]/g;
+
+function normalizeAttrPunctuation(text) {
+  return String(text || '')
+    .replace(ATTR_EQUALS, '=')
+    .replace(ATTR_DQUOTE, '"')
+    .replace(ATTR_SQUOTE, "'");
+}
+
+const ATTR_RE = /([a-zA-Z_][\w:-]*)?\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+
 function parseAttrs(text) {
   const out = {};
-  for (const m of String(text || '').matchAll(/([a-zA-Z_][\w:-]*)\s*=\s*"([^"]*)"/g)) out[m[1]] = m[2];
+  for (const m of normalizeAttrPunctuation(text).matchAll(ATTR_RE)) {
+    if (m[1]) out[m[1]] = m[2] ?? m[3] ?? '';
+  }
   return out;
 }
 
 function parseTagSpec(raw) {
-  const text = String(raw || '').trim();
-  if (!text) return { name: '', attrs: {} };
+  const text = normalizeAttrPunctuation(raw).trim();
+  if (!text) return { name: '', attrs: {}, bare: '' };
   const match = text.match(/^([A-Za-z_][\w-]*)\b([\s\S]*)$/);
-  if (!match) return { name: '', attrs: parseAttrs(text) };
-  return { name: match[1].toLowerCase(), attrs: parseAttrs(match[2]) };
+  if (!match) return { name: '', attrs: parseAttrs(text), bare: '' };
+  const rest = match[2];
+  const attrs = parseAttrs(rest);
+  // `<parameter="command" string="true">` — the attribute NAME is missing and
+  // the quoted value is the parameter/tool name. Only accept a leading bare
+  // value: a junk attribute later in the tag is not a name.
+  let bare = '';
+  const leading = rest.match(/^\s*=\s*(?:"([^"]*)"|'([^']*)')/);
+  // Only an identifier-shaped value can be a dropped attribute name; anything
+  // else (`parameter="/tmp/a.js"`) is a nameless value, handled positionally.
+  if (leading && /^[A-Za-z_][\w-]*$/.test((leading[1] ?? leading[2] ?? '').trim())) {
+    bare = (leading[1] ?? leading[2] ?? '').trim();
+  }
+  return { name: match[1].toLowerCase(), attrs, bare };
+}
+
+// Shape check used only when a parameter's name is unreadable: never assign a
+// huge code block to a `number` slot (or an object to a string slot).
+function schemaFits(schema, value) {
+  const type = schema?.type;
+  if (!type) return true;
+  if (type === 'string') return typeof value === 'string';
+  if (type === 'number' || type === 'integer') {
+    return typeof value === 'number' ? Number.isFinite(value) : /^-?\d+(?:\.\d+)?$/.test(String(value ?? '').trim());
+  }
+  if (type === 'boolean') return typeof value === 'boolean' || /^(true|false)$/i.test(String(value ?? '').trim());
+  if (type === 'array') return Array.isArray(value);
+  if (type === 'object') return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+  return true;
+}
+
+function tryParseJsonObject(text) {
+  const raw = String(text ?? '').trim();
+  if (!raw.startsWith('{') || !raw.endsWith('}')) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 function parameterValue(param) {
   const raw = param.value ?? '';
-  if (String(param.string).toLowerCase() === 'true') return raw;
+  const flag = String(param.string ?? '').toLowerCase();
+  // Observed corruption: the value lands in the attribute list instead of the
+  // element body - `<parameter name="description" string="Screenshot it">`.
+  // A `string` attribute that is neither `true` nor `false` is that value.
+  if (!raw && param.fallback) return param.fallback;
+  if (flag === 'true') return raw;
   try {
     return JSON.parse(raw);
   } catch {
@@ -645,6 +710,7 @@ function parameterValue(param) {
 function extractDsml(text, { paramToolIndex = null } = {}) {
   const source = String(text || '');
   const calls = [];
+  const repairs = [];
   let saw = false;
   let cleaned = '';
   let cursor = 0;
@@ -657,13 +723,47 @@ function extractDsml(text, { paramToolIndex = null } = {}) {
   let callsBody = '';
   let callsAtStart = 0;
 
+  // Assign parameters whose name attribute could not be read at all. The
+  // model emits them in schema order, so the first unused property of the
+  // inferred tool is the honest guess; dropping the value (the old behavior)
+  // produced calls that were missing required properties.
+  const resolveUnnamed = (call, name) => {
+    if (!call.unnamed?.length) return;
+    const unnamed = call.unnamed;
+    call.unnamed = [];
+    const schema = name ? paramToolIndex?.get(name) : null;
+    const keys = schema ? [...schema.keys()] : [];
+    const used = new Set(Object.keys(call.args));
+    for (const value of unnamed) {
+      const obj = typeof value === 'string' ? tryParseJsonObject(value) : value;
+      if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+        // A bare JSON payload was split over unnamed parameters.
+        Object.assign(call.args, obj);
+        repairs.push(`${name || 'call'}: unnamed parameter carried a JSON object`);
+        continue;
+      }
+      const next = keys.find((key) => !used.has(key) && schemaFits(schema.get(key), value));
+      if (!next) {
+        repairs.push(`${name || 'call'}: unnamed parameter dropped (no compatible schema slot)`);
+        continue;
+      }
+      used.add(next);
+      call.args[next] = value;
+      repairs.push(`${name || 'call'}: unnamed parameter mapped to "${next}"`);
+    }
+  };
+
   const finishParam = () => {
     if (!currentParam) return;
     const param = currentParam;
     currentParam = null;
     inParam = false;
-    if (!currentCall || !param.name) return;
+    if (!currentCall) return;
     const value = parameterValue(param);
+    if (!param.name) {
+      currentCall.unnamed.push(value);
+      return;
+    }
     if (param.name === 'arguments' || param.name === 'args') currentCall.argPayload = value;
     else if (['name', 'tool', 'tool_name'].includes(param.name)) {
       if (!currentCall.name) currentCall.name = String(value ?? '').trim();
@@ -691,6 +791,7 @@ function extractDsml(text, { paramToolIndex = null } = {}) {
       }
     }
     if (!name) return;
+    resolveUnnamed(call, name);
     if (call.argPayload !== undefined) {
       let parsed = call.argPayload;
       if (typeof parsed === 'string') {
@@ -736,7 +837,7 @@ function extractDsml(text, { paramToolIndex = null } = {}) {
     saw = true;
 
     const closing = Boolean(match[1]);
-    const { name, attrs } = parseTagSpec(match[2]);
+    const { name, attrs, bare } = parseTagSpec(match[2]);
 
     if (!closing) {
       if (name === 'calls' || name === 'tool_calls') {
@@ -751,8 +852,9 @@ function extractDsml(text, { paramToolIndex = null } = {}) {
         inCalls = true;
         inInvoke = true;
         currentCall = {
-          name: attrs.name || attrs.tool || attrs.tool_name || '',
+          name: attrs.name || attrs.tool || attrs.tool_name || bare || '',
           args: {},
+          unnamed: [],
           argPayload: undefined,
         };
         callsBody = '';
@@ -766,9 +868,15 @@ function extractDsml(text, { paramToolIndex = null } = {}) {
           // close via paramToolIndex.
           inCalls = true;
           inInvoke = true;
-          currentCall = { name: '', args: {}, argPayload: undefined };
+          currentCall = { name: '', args: {}, unnamed: [], argPayload: undefined };
         }
-        currentParam = { name: attrs.name || '', string: attrs.string, value: '' };
+        const stringFlag = String(attrs.string ?? '').toLowerCase();
+        currentParam = {
+          name: attrs.name || bare || '',
+          string: attrs.string,
+          fallback: stringFlag && stringFlag !== 'true' && stringFlag !== 'false' ? attrs.string : '',
+          value: '',
+        };
         inParam = true;
       }
     } else if (name === 'parameter' || name === 'param') {
@@ -810,7 +918,7 @@ function extractDsml(text, { paramToolIndex = null } = {}) {
   }
   if (inCalls) finishCalls();
 
-  return { calls, cleaned: cleaned.replace(/\n{3,}/g, '\n\n').trim(), had: saw };
+  return { calls, cleaned: cleaned.replace(/\n{3,}/g, '\n\n').trim(), had: saw, repairs };
 }
 
 
@@ -918,6 +1026,7 @@ export function extractToolCalls(text, { toolNames = null, paramToolIndex = null
   const source = text || '';
   const names = normalizeToolNames(toolNames);
   const calls = [];
+  const repairs = [];
   let sawBlock = false;
   let match;
 
@@ -951,6 +1060,7 @@ export function extractToolCalls(text, { toolNames = null, paramToolIndex = null
     sawBlock = true;
     cleaned = dsml.cleaned;
     calls.push(...dsml.calls);
+    if (dsml.repairs?.length) repairs.push(...dsml.repairs);
   }
 
   if (calls.length === 0 && !sawBlock) {
@@ -972,9 +1082,15 @@ export function extractToolCalls(text, { toolNames = null, paramToolIndex = null
     calls,
     cleaned: cleaned.replace(/\n{3,}/g, '\n\n').trim(),
     hadBlock: sawBlock || calls.length > 0,
+    repairs,
   };
 }
 
+/**
+ * Map every tool name to its argument schema, keyed by property. The Map keeps
+ * declaration order (a last-resort positional hint) and the per-key schema
+ * (used to reject impossible assignments).
+ */
 export function buildParamToolIndex(tools) {
   const index = new Map();
   for (const tool of Array.isArray(tools) ? tools : []) {
@@ -982,8 +1098,8 @@ export function buildParamToolIndex(tools) {
     const name = String(fn?.name || '').trim();
     if (!name) continue;
     const props = fn?.parameters?.properties ?? {};
-    const keys = Object.keys(props || {});
-    if (keys.length) index.set(name, new Set(keys));
+    const entries = Object.entries(props || {});
+    if (entries.length) index.set(name, new Map(entries));
   }
   return index;
 }

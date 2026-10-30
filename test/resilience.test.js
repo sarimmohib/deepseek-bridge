@@ -18,7 +18,12 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const BRIDGE = path.join(ROOT, 'bin', 'ds-bridge.js');
-const BAD_FILE = process.platform === 'win32' ? 'Z:/definitely/not/here/state.json' : '/definitely/not/here/state.json';
+// A path that cannot be a state file even for root: the parent is an existing
+// regular file, so mkdir fails with ENOTDIR. (`/definitely/not/here/...` was
+// created happily when the suite ran as root, which made this test pass/fail
+// depending on who ran it.)
+const BAD_FILE =
+  process.platform === 'win32' ? 'Z:/definitely/not/here/state.json' : '/etc/hostname/state.json';
 
 function tempHome(label) {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'dsb-resilience-' + label + '-'));

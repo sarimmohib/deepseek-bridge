@@ -1012,3 +1012,79 @@ test('raising maxUpstream mid-queue wakes FIFO waiters instead of a new arrival'
   assert.equal(bridgeQueue.active, 0);
   assert.equal(bridgeQueue.queued, 0);
 });
+
+// --- corrupted DSML attribute keys (end-to-end) ------------------------------
+// The pagoda session transcript: the model emitted both bash parameters, but
+// wrote the second one as `parameter name＝"command"` (full-width equals). The
+// parser dropped it, so the harness rejected a call that visibly contained the
+// property, and the model retried the same call until it gave up.
+const DSML_BAR = '\uFF5C\uFF5CDSML\uFF5C\uFF5C';
+const dsmlBlock = (lines) =>
+  [`<${DSML_BAR} calls>`, `<${DSML_BAR} invoke name="bash">`, ...lines, `</${DSML_BAR} invoke>`, `</${DSML_BAR} calls>`].join('\n');
+
+async function replayBash(argLines) {
+  const res = new FakeResponse();
+  const text = dsmlBlock(argLines);
+  const agent = {
+    async run(_request, handlers) {
+      handlers.onReady({ sessionId: 'sess_attr', messageId: 'msg_attr' });
+      handlers.onDelta({ kind: 'content', text });
+      return { usage: { completion: 1 }, finish: 'stop', sessionId: 'sess_attr', messageId: 'msg_attr' };
+    },
+  };
+  await handleChatCompletions(
+    {},
+    res,
+    {
+      model: 'deepseek-reasoner',
+      messages: [{ role: 'user', content: 'screenshot it' }],
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'bash',
+            description: 'Run a command',
+            parameters: {
+              type: 'object',
+              properties: { description: { type: 'string' }, command: { type: 'string' } },
+              required: ['description', 'command'],
+            },
+          },
+        },
+      ],
+      stream: false,
+    },
+    {
+      agent,
+      store: { getConversation: () => null, setConversation: () => {} },
+      log: () => {},
+      config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto' },
+    },
+  );
+  return JSON.parse(res.chunks.join(''));
+}
+
+test('a bash call whose command uses a full-width equals still reaches the client intact', async () => {
+  const completion = await replayBash([
+    `<${DSML_BAR} parameter name="description" string="true">Screenshot the page headlessly</${DSML_BAR} parameter>`,
+    `<${DSML_BAR} parameter name\uFF1D"command" string\uFF1D"true">chromium --headless=new --screenshot=/tmp/pg/shot1.png file:///tmp/pg/pagoda.html</${DSML_BAR} parameter>`,
+  ]);
+  const call = completion.choices[0].message.tool_calls[0];
+  assert.equal(call.function.name, 'bash');
+  assert.deepEqual(JSON.parse(call.function.arguments), {
+    description: 'Screenshot the page headlessly',
+    command: 'chromium --headless=new --screenshot=/tmp/pg/shot1.png file:///tmp/pg/pagoda.html',
+  });
+});
+
+test('both parameters survive when the model drops the name= key entirely', async () => {
+  const completion = await replayBash([
+    `<${DSML_BAR} parameter="description" string="true">List the test dir</${DSML_BAR} parameter>`,
+    `<${DSML_BAR} parameter="command" string="true">ls -l /tmp/pg; wc -c /tmp/pg/app.js</${DSML_BAR} parameter>`,
+  ]);
+  const call = completion.choices[0].message.tool_calls[0];
+  assert.deepEqual(JSON.parse(call.function.arguments), {
+    description: 'List the test dir',
+    command: 'ls -l /tmp/pg; wc -c /tmp/pg/app.js',
+  });
+});

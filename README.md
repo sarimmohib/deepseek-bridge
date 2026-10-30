@@ -894,6 +894,20 @@ tool calls out of the answer into real OpenAI `tool_calls`:
   the markup is stripped instead of being streamed as assistant prose. The
   request finishes normally with no fake tool call, and the bridge logs how many
   markup characters were removed.
+- **Corrupted argument names:** DeepSeek sometimes writes a parameter tag with
+  full-width or typographic punctuation (`name＝"command"`, `name=“command”`),
+  drops the `name=` key (`parameter="command" string="true"`), or puts the value
+  in the attribute list (`name="description" string="Screenshot it"`). Each of
+  those used to drop the parameter silently, so the harness rejected the call
+  with `missing required property "command"` even though the model had emitted
+  it, and the model kept retrying the identical call. All of those shapes are
+  now read correctly. A parameter whose name is unreadable is mapped onto the
+  tool's first unused schema slot that can hold the value (schema type checked),
+  and every repair is logged as `tool call repaired (N): ...` so it is visible
+  in `bridge.log` instead of surfacing as a confusing harness error.
+- **Debug capture:** set `DS_BRIDGE_DUMP_DIR=/some/dir` to write the raw SSE
+  frames and the exact assistant text the parser saw, per request. Nothing is
+  written when the variable is unset.
 - **Continuation:** send results as normal
   `{"role": "tool", "tool_call_id": ...}` messages; the bridge renders them back
   into the DeepSeek transcript.

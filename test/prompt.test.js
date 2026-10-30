@@ -10,6 +10,7 @@ import {
   transcriptDigest,
   splitMessages,
   extractToolCalls,
+  buildParamToolIndex,
   toolPreamble,
   resolveAttachments,
   splitOversizedText,
@@ -632,4 +633,134 @@ test('without a param index the malformed block stays stripped (legacy behavior)
   const out = extractToolCalls(malformed, { toolNames: ['Bash'] });
   assert.equal(out.calls.length, 0);
   assert.doesNotMatch(out.cleaned, /DSML/);
+});
+
+// --- corrupted DSML attribute keys -------------------------------------------
+// The failure this covers: DeepSeek writes the parameter name with full-width
+// punctuation or drops the `name=` key entirely, e.g.
+//   <parameter name＝"command" string="true">  (U+FF1D)
+//   <parameter="command" string="true">
+// The parser used to drop every such parameter silently and emit a call that
+// was missing required properties, so the harness reported "missing required
+// property" for a property the model had actually emitted. These are the exact
+// shapes from the pagoda session transcript.
+
+const DSML_OPEN = '<\uFF5C\uFF5CDSML\uFF5C\uFF5C';
+const DSML_CLOSE = '</\uFF5C\uFF5CDSML\uFF5C\uFF5C';
+
+function dsmlCall(tool, params) {
+  return [
+    `${DSML_OPEN} calls>`,
+    `${DSML_OPEN} invoke name="${tool}">`,
+    ...params.map(([spec, value]) => `${DSML_OPEN} ${spec}>${value}${DSML_CLOSE} parameter>`),
+    `${DSML_CLOSE} invoke>`,
+    `${DSML_CLOSE} calls>`,
+  ].join('\n');
+}
+
+const BASH_TOOLS = new Set(['bash']);
+
+const corruptedNameVariants = [
+  ['full-width equals', 'parameter name\uFF1D"command" string="true"'],
+  ['missing name key', 'parameter="command" string="true"'],
+  ['smart double quotes', 'parameter name=\u201Ccommand\u201D string="true"'],
+  ['full-width quotes', 'parameter name=\uFF02command\uFF02 string="true"'],
+  ['single quotes', "parameter name='command' string='true'"],
+  ['spaced equals', 'parameter name = "command" string = "true"'],
+];
+
+for (const [label, spec] of corruptedNameVariants) {
+  test(`a parameter name written with ${label} is still read`, () => {
+    const text = dsmlCall('bash', [
+      [spec, 'chromium --headless=new --screenshot=/tmp/shot1.png file:///tmp/pg/pagoda.html'],
+      ['parameter name="description" string="true"', 'Screenshot the page headlessly'],
+    ]);
+    const out = extractToolCalls(text, { toolNames: BASH_TOOLS });
+    assert.equal(out.calls.length, 1);
+    assert.equal(out.calls[0].name, 'bash');
+    assert.deepEqual(out.calls[0].arguments, {
+      command: 'chromium --headless=new --screenshot=/tmp/shot1.png file:///tmp/pg/pagoda.html',
+      description: 'Screenshot the page headlessly',
+    });
+    assert.match(out.calls[0].arguments.command, /--headless=new --screenshot=\/tmp\/shot1\.png/);
+  });
+}
+
+test('a value that lands in the attribute list instead of the element body is recovered', () => {
+  // Reported shape: `"description" string="Screenshot the page headlessly"` —
+  // the value is an XML attribute, the element body is empty.
+  const text = dsmlCall('bash', [
+    ['parameter name="description" string="Screenshot the page headlessly"', ''],
+    ['parameter name="command" string="true"', 'ls -l /sdcard/Download'],
+  ]);
+  const out = extractToolCalls(text, { toolNames: BASH_TOOLS });
+  assert.equal(out.calls.length, 1);
+  assert.deepEqual(out.calls[0].arguments, {
+    description: 'Screenshot the page headlessly',
+    command: 'ls -l /sdcard/Download',
+  });
+});
+
+test('readable call with a full-width equals in one parameter still gets every parameter', () => {
+  // The actual failure that blocked the render: description parsed, command
+  // dropped, so the harness rejected the call ten times in a row.
+  const text = dsmlCall('bash', [
+    ['parameter name="description" string="true"', 'Render headless screenshot of page'],
+    ['parameter name\uFF1D"command" string\uFF1D"true"', 'timeout 120 chromium --headless=new --no-sandbox --screenshot=/tmp/pg/shot1.png file:///tmp/pg/pagoda.html'],
+  ]);
+  const out = extractToolCalls(text, { toolNames: BASH_TOOLS });
+  assert.equal(out.calls.length, 1);
+  assert.deepEqual(Object.keys(out.calls[0].arguments), ['description', 'command']);
+  assert.match(out.calls[0].arguments.command, /--screenshot=\/tmp\/pg\/shot1\.png/);
+});
+
+test('unnamed parameters are mapped to schema slots instead of being dropped', () => {
+  const tools = [
+    {
+      type: 'function',
+      function: {
+        name: 'write',
+        parameters: {
+          type: 'object',
+          properties: { file_path: { type: 'string' }, content: { type: 'string' } },
+          required: ['file_path', 'content'],
+        },
+      },
+    },
+  ];
+  const index = buildParamToolIndex(tools);
+  const body = '/* ===== app.js ===== */\n\n(function () {\n  var a = 1;\n\n  var b = 2;\n})();\n';
+  const text = dsmlCall('write', [
+    ['parameter foo="not-a-name"', '/tmp/pg/app.js'],
+    ['parameter name="content" string="true"', body],
+  ]);
+  const out = extractToolCalls(text, { toolNames: new Set(['write']), paramToolIndex: index });
+  assert.equal(out.calls.length, 1);
+  assert.equal(out.calls[0].arguments.file_path, '/tmp/pg/app.js');
+  assert.equal(out.calls[0].arguments.content, body);
+  assert.ok(out.repairs.some((line) => /mapped to "file_path"/.test(line)));
+});
+
+test('positional recovery respects the schema type and never fills a number slot with code', () => {
+  const tools = [
+    {
+      type: 'function',
+      function: {
+        name: 'bash',
+        parameters: {
+          type: 'object',
+          properties: { timeoutMs: { type: 'number' }, command: { type: 'string' } },
+        },
+      },
+    },
+  ];
+  const index = buildParamToolIndex(tools);
+  const text = dsmlCall('bash', [
+    ['parameter name="command" string="true"', 'ls'],
+    ['parameter junk="x"', 'line1\n\nline2'],
+  ]);
+  const out = extractToolCalls(text, { toolNames: new Set(['bash']), paramToolIndex: index });
+  assert.equal(out.calls.length, 1);
+  assert.equal(out.calls[0].arguments.command, 'ls');
+  assert.equal(out.calls[0].arguments.timeoutMs, undefined);
 });

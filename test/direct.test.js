@@ -1274,3 +1274,58 @@ test('an unknown non-FINISHED status (PAUSED) also triggers recovery', async () 
   ]);
   assert.equal(result.finish, 'stop');
 });
+
+test('a mid-stream message snapshot does not re-emit text that was already sent', async () => {
+  // DeepSeek replays the whole message object mid-stream. The accumulator used
+  // to key "already emitted" on the fragment OBJECT, so the replayed snapshot
+  // looked new and the entire reply was emitted again. For a tool call that
+  // duplicated parameters (and spliced JSON), which the model then saw as a
+  // malformed call it had already written correctly.
+  saveSession({ token, cookies: [] });
+  const client = new DirectClient({ retryDelays: [0, 0, 0] });
+
+  globalThis.fetch = baseFetch(() =>
+    streamResponse([
+      'event: ready\ndata: {"request_message_id":1,"response_message_id":2}\n\n',
+      'data: {"v":{"response":{"id":"msg_1","fragments":[{"type":"RESPONSE","content":"const a = 1;"}]}}}\n\n',
+      'data: {"p":"response/fragments/-1/content","o":"APPEND","v":"\\n\\nconst b = 2;"}\n\n',
+      // Full-state replay of the same message, then more text.
+      'data: {"v":{"response":{"id":"msg_1","fragments":[{"type":"RESPONSE","content":"const a = 1;\\n\\nconst b = 2;"}]}}}\n\n',
+      'data: {"p":"response/fragments/-1/content","o":"APPEND","v":"\\n\\nconst c = 3;"}\n\n',
+      'data: {"p":"response/status","o":"SET","v":"FINISHED"}\n\n',
+      'event: close\ndata: {"click_behavior":"none","auto_resume":false}\n\n',
+    ]),
+  );
+
+  const deltas = [];
+  await client.run(
+    { prompt: 'write the file', thinking: true, search: false, attachments: [] },
+    { onDelta: (delta) => deltas.push(delta) },
+  );
+
+  const text = deltas.map((delta) => delta.text).join('');
+  assert.equal(text, 'const a = 1;\n\nconst b = 2;\n\nconst c = 3;');
+  assert.equal(text.match(/const a = 1;/g).length, 1);
+});
+
+test('a snapshot for a different message still emits its own text', async () => {
+  saveSession({ token, cookies: [] });
+  const client = new DirectClient({ retryDelays: [0, 0, 0] });
+
+  globalThis.fetch = baseFetch(() =>
+    streamResponse([
+      'event: ready\ndata: {"request_message_id":1,"response_message_id":2}\n\n',
+      'data: {"v":{"response":{"id":"msg_1","fragments":[{"type":"RESPONSE","content":"first"}]}}}\n\n',
+      'data: {"v":{"response":{"id":"msg_2","fragments":[{"type":"RESPONSE","content":"second"}]}}}\n\n',
+      'data: {"p":"response/status","o":"SET","v":"FINISHED"}\n\n',
+      'event: close\ndata: {"click_behavior":"none","auto_resume":false}\n\n',
+    ]),
+  );
+
+  const deltas = [];
+  await client.run(
+    { prompt: 'x', thinking: true, search: false, attachments: [] },
+    { onDelta: (delta) => deltas.push(delta) },
+  );
+  assert.equal(deltas.map((delta) => delta.text).join(''), 'firstsecond');
+});

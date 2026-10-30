@@ -10,6 +10,7 @@ import { Blob } from 'node:buffer';
 import { BridgeError } from './agent.js';
 import { solveChallenge } from './pow.js';
 import { cookieHeader } from './cookies.js';
+import { dumpAppend, dumpEnabled } from './dump.js';
 import {
   accountCount,
   accountSession,
@@ -385,18 +386,44 @@ function collectFileStatus(data, into) {
 
 function createAccumulator(emit) {
   const state = { response: null, lastPath: null };
+  // Emission bookkeeping is keyed by fragment POSITION, not object identity.
+  // DeepSeek replays full message snapshots mid-stream (`{v:{response:...}}`),
+  // which replaces the fragment objects; tracking `__emitted` on the object
+  // made the replay look brand new, so the whole text was emitted a second
+  // time. Downstream that duplicated tool-call parameters and spliced JSON,
+  // producing exactly the "argument appeared twice / half the call vanished"
+  // corruption reported against long replies.
+  const seen = [];
+  let seenResponseId = null;
+
+  function emitFragment(frag, text) {
+    if (!text) return;
+    const kind = frag.type === 'THINK' ? 'reasoning' : frag.type === 'RESPONSE' ? 'content' : null;
+    if (kind) emit({ kind, text });
+  }
 
   function flush() {
     const frags = state.response?.fragments;
     if (!Array.isArray(frags)) return;
-    for (const frag of frags) {
-      const prev = frag.__emitted || 0;
-      const text = typeof frag.content === 'string' ? frag.content : '';
-      if (text.length > prev) {
-        const kind = frag.type === 'THINK' ? 'reasoning' : frag.type === 'RESPONSE' ? 'content' : null;
-        if (kind) emit({ kind, text: text.slice(prev) });
-        frag.__emitted = text.length;
+    // A different response message starts its own fragment sequence. Only a
+    // real id change (both sides known) resets: snapshots without an id must
+    // not make the same message look new.
+    const responseId = state.response?.id ?? null;
+    if (responseId != null && seenResponseId != null && responseId !== seenResponseId) seen.length = 0;
+    if (responseId != null) seenResponseId = responseId;
+    for (let i = 0; i < frags.length; i++) {
+      const frag = frags[i];
+      if (!frag) continue;
+      const text = typeof frag?.content === 'string' ? frag.content : '';
+      const record = seen[i];
+      if (!record || record.type !== frag.type) {
+        // First sight of this fragment (or a type flip): emit what it holds.
+        seen[i] = { type: frag.type, text };
+        emitFragment(frag, text);
+        continue;
       }
+      if (text.length > record.text.length) emitFragment(frag, text.slice(record.text.length));
+      if (text !== record.text) seen[i] = { type: frag.type, text };
     }
   }
 
@@ -519,6 +546,7 @@ function sseHandler(handlers) {
       eventName = null;
       dataLines = [];
       if (handlers.debugLines) handlers.debugLines.push(`${name} ${raw}${raw ? '' : '(empty)'}`.slice(0, 300));
+      handlers.onRaw?.(name, raw);
       if (!raw) {
         // close/finish events are often sent with no data. The stream reader
         // must still see them, otherwise a clean EOF looks like a truncation.
@@ -979,8 +1007,14 @@ export class DirectClient {
       if (seen === 'FINISHED' || status !== 'FINISHED') status = seen;
     };
     const observeFiles = (data) => collectFileStatus(data, fileStatus);
+    const dumpId = dumpEnabled()
+      ? `${ctx?.requestId || 'request'}-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`
+      : '';
     const handler = sseHandler({
       debugLines,
+      onRaw: dumpId
+        ? (name, raw) => dumpAppend(dumpId, 'sse.txt', `event: ${name}\ndata: ${raw}\n\n`)
+        : null,
       onEvent(name, data) {
         if (name === 'ready') {
           const responseId = data.response_message_id ?? data.responseMessageId ?? null;
@@ -1595,6 +1629,9 @@ export class DirectClient {
         if (Date.now() >= deadline) throw timeoutError();
 
         const ctx = await this.selectContext(payload, { excluded, signal, deadline });
+        // Correlate the raw SSE dump with the assistant-text dump written by
+        // the OpenAI handler (same request id).
+        if (payload.requestId) ctx.requestId = payload.requestId;
         if (previousAccountId && previousAccountId !== ctx.accountId) {
           this.log(
             `rotated account ${shortAccountId(previousAccountId)} -> ${shortAccountId(ctx.accountId)}` +

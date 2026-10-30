@@ -15,6 +15,7 @@ import {
 } from './prompt.js';
 import { BridgeError } from './agent.js';
 import { buildParamToolIndex } from './prompt.js';
+import { dumpAppend } from './dump.js';
 import { noteUpstreamThrottleEvent, upstreamCooldownMs } from './direct.js';
 import { learnRule, renderRulesSection } from './rules.js';
 
@@ -407,6 +408,15 @@ export async function handleChatCompletions(req, res, body, ctx) {
   const toolsActive = Boolean(tools?.length) && toolChoice !== 'none' && ctx.config.toolMode !== 'off';
   const toolNames = toolsActive ? new Set(tools.map((tool) => tool?.function?.name).filter(Boolean)) : null;
   const paramToolIndex = toolsActive ? buildParamToolIndex(tools) : null;
+  // Required-argument map for diagnostics only: a call that reaches the client
+  // without them is rejected there with a message that never names the real
+  // cause, so record the truth in bridge.log.
+  const requiredByTool = new Map(
+    (tools || [])
+      .map((tool) => tool?.function || tool)
+      .filter((fn) => fn?.name)
+      .map((fn) => [fn.name, Array.isArray(fn.parameters?.required) ? fn.parameters.required : []]),
+  );
   const preamble = toolsActive ? toolPreamble(tools, toolChoice) : '';
   const hint = opts.thinking && opts.effortExplicit ? effortHint(opts.effort) : '';
 
@@ -666,6 +676,29 @@ export async function handleChatCompletions(req, res, body, ctx) {
     const toolCalls = toolsActive
       ? extractToolCalls(fullContent, { toolNames, paramToolIndex })
       : { calls: [], cleaned: fullContent, hadBlock: false };
+    if (toolCalls.repairs?.length) {
+      const shown = toolCalls.repairs.slice(0, 8).join('; ');
+      log(`tool call repaired (${toolCalls.repairs.length}): ${shown}`);
+    }
+    for (const call of toolCalls.calls) {
+      const required = requiredByTool.get(call.name);
+      const missing = (required || []).filter((key) => call.arguments?.[key] === undefined);
+      if (missing.length) {
+        log(
+          `tool call "${call.name}" is still missing required arguments (${missing.join(', ')}); raw reply ${fullContent.length}c`,
+        );
+      }
+    }
+    if (process.env.DS_BRIDGE_DUMP_DIR) {
+      dumpAppend(
+        id,
+        'assistant.txt',
+        `--- mode=${mode} tools=${toolsActive} finish=${result.finish || 'stop'} ---\n` +
+          `--- reasoning (${reasoning.length}c) ---\n${reasoning}\n` +
+          `--- content (${fullContent.length}c) ---\n${fullContent}\n` +
+          `--- calls ---\n${JSON.stringify(toolCalls.calls, null, 2)}\n`,
+      );
+    }
 
     // Degenerate DSML loop: under rate pressure the model can fall into
     // emitting a wall of empty DSML tags (<｜｜DSML｜｜>). The wall is not a

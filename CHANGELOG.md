@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.9.1
+
+- **Fixed: tool calls arrived with parameters the model had emitted.**
+  `missing required property "command"` (and `file_path`, `content`,
+  `old_string`, `description`) was reported for calls whose parameters were
+  present in the raw reply. Root cause: DeepSeek writes the DSML parameter name
+  with full-width or typographic punctuation under load (`name＝"command"`,
+  `name=“command”`), drops the `name=` key (`parameter="command" string="true"`),
+  or puts the value in the attribute list (`name="description" string="Screenshot
+  it"`). The attribute reader only accepted `name="ascii"`, so every other shape
+  dropped the parameter silently. Confirmed against the session transcript where
+  the model itself notes *"my parameter attribute uses a full-width bracket,
+  causing the field name to be wrong"*.
+  - Attribute punctuation is normalized (`＝`, full-width/smart quotes, single
+    quotes, spaced `=`).
+  - A leading bare quoted value on a parameter/invoke tag is read as its name.
+  - A `string=` attribute that is neither `true` nor `false` is used as the
+    value when the element body is empty.
+  - A parameter whose name stays unreadable is mapped to the tool's first
+    unused schema property that can hold the value (type checked), instead of
+    being dropped.
+  - Repairs are logged (`tool call repaired (N): ...`) and a call that still
+    lacks required arguments is logged with the names of the missing ones.
+- **Fixed: mid-stream snapshot replay duplicated the reply.** DeepSeek replays
+  the whole message object during a stream (`{v:{response:{fragments:...}}}`).
+  The accumulator tracked "already emitted" on the fragment object, so the
+  replayed objects looked new and the entire text was emitted again — the
+  duplicated-argument / spliced-JSON corruption seen on long replies. Emission
+  bookkeeping is now keyed by fragment position and resets only when the
+  response message id changes.
+- **New: opt-in raw capture.** `DS_BRIDGE_DUMP_DIR=<dir>` writes the raw SSE
+  frames and the exact assistant text the tool-call parser received, per
+  request. Off by default.
+- **Tests:** regression coverage for every corrupted-attribute shape, the
+  positional schema repair, and the snapshot-replay accumulator; the autosave
+  resilience test no longer depends on the suite not running as root.
+- Version 0.9.1 (package.json and extension/manifest.json).
+
 ## 0.9.0
 
 - **DeepSeek Harness only.** OpenCode support surfaces are gone: the
