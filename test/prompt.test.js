@@ -764,3 +764,150 @@ test('positional recovery respects the schema type and never fills a number slot
   assert.equal(out.calls[0].arguments.command, 'ls');
   assert.equal(out.calls[0].arguments.timeoutMs, undefined);
 });
+
+// --- Regression coverage from the 2026-10-31 session (see DS-ERRORS) --------
+
+const TOOL = (name, properties, required) => ({
+  type: 'function',
+  function: { name, parameters: { type: 'object', properties, required } },
+});
+const SKILL_TOOLS = [TOOL('skill', { name: { type: 'string' } }, ['name'])];
+const FILE_TOOLS = [
+  TOOL('edit', { file_path: { type: 'string' }, old_string: { type: 'string' }, new_string: { type: 'string' } }, ['file_path', 'old_string', 'new_string']),
+  TOOL('read', { file_path: { type: 'string' }, offset: { type: 'number' } }, ['file_path']),
+  TOOL('read_image', { file_path: { type: 'string' } }, ['file_path']),
+];
+const BASH_TOOL = [
+  TOOL('bash', { command: { type: 'string' }, description: { type: 'string' } }, ['command', 'description']),
+];
+
+test('a tool with an argument literally named "name" keeps it (skill)', () => {
+  // The bridge used to treat `<parameter name="name">` as the tool name, delete
+  // it, and hand the harness `skill({})` -> "missing required property name".
+  const text = dsmlCall('skill', [['parameter name="name" string="true"', 'fast-exam-study-guide']]);
+  const out = extractToolCalls(text, { toolNames: new Set(['skill']), paramToolIndex: buildParamToolIndex(SKILL_TOOLS) });
+  assert.equal(out.calls.length, 1);
+  assert.equal(out.calls[0].name, 'skill');
+  assert.deepEqual(out.calls[0].arguments, { name: 'fast-exam-study-guide' });
+});
+
+test('the short <|parameter> marker without the DSML word is still read', () => {
+  // Observed as `skill({})`: the whole parameter was invisible to the parser.
+  const text = [
+    '<|calls>',
+    '<|invoke name="skill">',
+    '<|parameter name="name" string="true">fast-exam-study-guide</|parameter>',
+    '</|invoke>',
+    '</|calls>',
+  ].join('\n');
+  const out = extractToolCalls(text, { toolNames: new Set(['skill']), paramToolIndex: buildParamToolIndex(SKILL_TOOLS) });
+  assert.equal(out.calls.length, 1);
+  assert.equal(out.calls[0].arguments.name, 'fast-exam-study-guide');
+});
+
+test('a bash description written with the short marker stays its own argument', () => {
+  // Observed: "Inspect skill filesystem discovery" was appended to the end of
+  // the command value, so the harness rejected the call for missing description.
+  const text = [
+    `${DSML_OPEN} calls>`,
+    `${DSML_OPEN} invoke name="bash">`,
+    `${DSML_OPEN} parameter name="command" string="true">grep -n roots lib/index.js | head -40${DSML_CLOSE} parameter>`,
+    '<|parameter name="description" string="true">Inspect skill filesystem discovery</|parameter>',
+    `${DSML_CLOSE} invoke>`,
+    `${DSML_CLOSE} calls>`,
+  ].join('\n');
+  const out = extractToolCalls(text, { toolNames: new Set(['bash']), paramToolIndex: buildParamToolIndex(BASH_TOOL) });
+  assert.equal(out.calls.length, 1);
+  assert.equal(out.calls[0].arguments.command, 'grep -n roots lib/index.js | head -40');
+  assert.equal(out.calls[0].arguments.description, 'Inspect skill filesystem discovery');
+});
+
+test('a command written with the short marker is not dropped', () => {
+  // Observed: bash arrived with only `description` and was rejected.
+  const text = [
+    `${DSML_OPEN} calls>`,
+    `${DSML_OPEN} invoke name="bash">`,
+    '<|parameter name="command" string="true">ls -l /tmp/pg</|parameter>',
+    `${DSML_OPEN} parameter name="description" string="true">List the pagoda files${DSML_CLOSE} parameter>`,
+    `${DSML_CLOSE} invoke>`,
+    `${DSML_CLOSE} calls>`,
+  ].join('\n');
+  const out = extractToolCalls(text, { toolNames: new Set(['bash']), paramToolIndex: buildParamToolIndex(BASH_TOOL) });
+  assert.equal(out.calls.length, 1);
+  assert.equal(out.calls[0].arguments.command, 'ls -l /tmp/pg');
+  assert.equal(out.calls[0].arguments.description, 'List the pagoda files');
+});
+
+test('a literal DSML marker inside a parameter value is preserved', () => {
+  // Observed: a heredoc that documented the marker token lost the rest of the
+  // line (the parser consumed the token as markup), silently.
+  const marker = `${DSML_OPEN.slice(0, 1)}${'\uFF5C'}DSML${'\uFF5C'}` + '>';
+  const body = `cat > note.md <<'EOF'\nthe tag is ${marker} here\nEOF`;
+  const text = dsmlCall('bash', [
+    ['parameter name="command" string="true"', body],
+    ['parameter name="description" string="true"', 'Write the note'],
+  ]);
+  const out = extractToolCalls(text, { toolNames: new Set(['bash']), paramToolIndex: buildParamToolIndex(BASH_TOOL) });
+  assert.equal(out.calls.length, 1);
+  assert.equal(out.calls[0].arguments.command, body);
+});
+
+test('a nameless read call carrying only file_path is inferred as read, not edit', () => {
+  // Observed twice: the third call of a parallel batch was dispatched as
+  // `edit` and rejected for missing old_string/new_string.
+  const text = [
+    `${DSML_OPEN} calls>`,
+    `${DSML_OPEN} invoke name="read">`,
+    `${DSML_OPEN} parameter name="file_path" string="true">/tmp/a.txt${DSML_CLOSE} parameter>`,
+    `${DSML_CLOSE} invoke>`,
+    `${DSML_OPEN} invoke>`,
+    `${DSML_OPEN} parameter name="file_path" string="true">/tmp/b.txt${DSML_CLOSE} parameter>`,
+    `${DSML_CLOSE} invoke>`,
+    `${DSML_CLOSE} calls>`,
+  ].join('\n');
+  const out = extractToolCalls(text, { toolNames: new Set(['edit', 'read', 'read_image']), paramToolIndex: buildParamToolIndex(FILE_TOOLS) });
+  assert.equal(out.calls.length, 2);
+  assert.equal(out.calls[1].name, 'read');
+  assert.deepEqual(out.calls[1].arguments, { file_path: '/tmp/b.txt' });
+});
+
+test('a nameless sibling of a read_image batch repeats read_image', () => {
+  const text = [
+    `${DSML_OPEN} calls>`,
+    `${DSML_OPEN} invoke name="read_image">`,
+    `${DSML_OPEN} parameter name="file_path" string="true">/tmp/q-1.png${DSML_CLOSE} parameter>`,
+    `${DSML_CLOSE} invoke>`,
+    `${DSML_OPEN} invoke>`,
+    `${DSML_OPEN} parameter name="file_path" string="true">/tmp/q-5.png${DSML_CLOSE} parameter>`,
+    `${DSML_CLOSE} invoke>`,
+    `${DSML_CLOSE} calls>`,
+  ].join('\n');
+  const out = extractToolCalls(text, { toolNames: new Set(['edit', 'read', 'read_image']), paramToolIndex: buildParamToolIndex(FILE_TOOLS) });
+  assert.equal(out.calls.length, 2);
+  assert.equal(out.calls[1].name, 'read_image');
+});
+
+test('unquoted attribute values are accepted', () => {
+  const text = [
+    '<|calls>',
+    '<|invoke name=read>',
+    '<|parameter name=file_path string=true>/tmp/c.txt</|parameter>',
+    '</|invoke>',
+    '</|calls>',
+  ].join('\n');
+  const out = extractToolCalls(text, { toolNames: new Set(['read']), paramToolIndex: buildParamToolIndex(FILE_TOOLS) });
+  assert.equal(out.calls.length, 1);
+  assert.equal(out.calls[0].name, 'read');
+  assert.deepEqual(out.calls[0].arguments, { file_path: '/tmp/c.txt' });
+});
+
+test('a JSON body inside an invoke becomes the arguments', () => {
+  const text = [
+    `${DSML_OPEN} calls>`,
+    `${DSML_OPEN} invoke name="read">{"file_path":"/tmp/d.txt"}${DSML_CLOSE} invoke>`,
+    `${DSML_CLOSE} calls>`,
+  ].join('\n');
+  const out = extractToolCalls(text, { toolNames: new Set(['read']), paramToolIndex: buildParamToolIndex(FILE_TOOLS) });
+  assert.equal(out.calls.length, 1);
+  assert.deepEqual(out.calls[0].arguments, { file_path: '/tmp/d.txt' });
+});

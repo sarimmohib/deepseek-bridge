@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.9.2
+
+- **Fixed: `skill` (and any tool with a `name` argument) arrived with `{}`.**
+  `finishParam` treated a parameter literally named `name`/`tool`/`tool_name`
+  as the *tool* name and discarded it, so `skill` lost its required `name` and
+  the harness rejected it with `missing required property "name"`. Every named
+  parameter now stays an argument; an invoke that lost its own name can still
+  consume a `name` argument, but only when that value is a real tool and no
+  tool would accept it as an argument instead.
+- **Fixed: the short `<|parameter>` marker was invisible.** Under load DeepSeek
+  drops the `DSML` word and writes `<|parameter name="command" ...>` /
+  `<|invoke name="read">`. Those tags were not tokenized, so the body flowed
+  into the previous parameter (a bash `description` ended up appended to the
+  end of `command`) or into the invoke body, which was discarded (bash arrived
+  with only `description`, or `skill` with no arguments). The tokenizer now
+  accepts the short marker as well as `<｜｜DSML｜｜ …>`.
+- **Fixed: literal DSML markers inside a value were eaten.** A bash heredoc that
+  documented the marker token lost everything from the token to the next tag,
+  with exit code 0. Inside a parameter, only real structural tags are treated
+  as markup; anything else is kept as literal text.
+- **Fixed: nameless parallel calls were retargeted.** A call whose invoke tag
+  lost its `name` and carried only `file_path` was inferred as `edit` (both
+  `read` and `edit` have `file_path`, and `edit` is declared first), so it was
+  rejected for missing `old_string`/`new_string`. Inference now requires every
+  *required* argument to be present, scores by required-argument coverage,
+  prefers repeating the previous call's tool (the parallel-batch intent), and
+  never selects a tool that would still be missing a required argument.
+- **Also recovered:** unquoted attribute values (`name=read`), JSON bodies and
+  `arguments="…"` on an invoke tag, which used to yield `{}`.
+- **Tests:** regression coverage for all of the above, including an end-to-end
+  `handleChatCompletions` replay of a composite real-world corrupted reply.
+- Version 0.9.2 (package.json and extension/manifest.json).
+
 ## 0.9.1
 
 - **Fixed: tool calls arrived with parameters the model had emitted.**

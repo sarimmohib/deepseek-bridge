@@ -1088,3 +1088,66 @@ test('both parameters survive when the model drops the name= key entirely', asyn
     command: 'ls -l /tmp/pg; wc -c /tmp/pg/app.js',
   });
 });
+
+async function replayParsed(text, tools) {
+  const res = new FakeResponse();
+  const agent = {
+    async run(_request, handlers) {
+      handlers.onReady({ sessionId: 'sess_parsed', messageId: 'msg_parsed' });
+      for (const char of Array.from(text)) handlers.onDelta({ kind: 'content', text: char });
+      return { usage: { completion: 1 }, finish: 'stop', sessionId: 'sess_parsed', messageId: 'msg_parsed' };
+    },
+  };
+  const store = { getConversation: () => null, setConversation: () => {} };
+  await handleChatCompletions(
+    {},
+    res,
+    { model: 'deepseek-reasoner', messages: [{ role: 'user', content: 'use a tool' }], tools, stream: false },
+    { agent, store, log: () => {}, config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto' } },
+  );
+  return JSON.parse(res.chunks.join(''));
+}
+
+test('HTTP response keeps every argument of a real-world corrupted DSML reply', async () => {
+  // Composite of the 2026-10-31 failures: short `<|parameter>` marker for the
+  // `skill` name, a bash description written after the command, and a nameless
+  // sibling call in a parallel batch that must not be retargeted to `edit`.
+  const B = '\uFF5C';
+  const open = `<${B}DSML${B}`;
+  const close = `</${B}DSML${B}`;
+  const text = [
+    `${open} calls>`,
+    `${open} invoke name="skill">`,
+    '<|parameter name="name" string="true">fast-exam-study-guide</|parameter>',
+    `${close} invoke>`,
+    `${open} invoke name="bash">`,
+    `${open} parameter name="command" string="true">ls -l /tmp/pg</${B}DSML${B} parameter>`,
+    '<|parameter name="description" string="true">List the pagoda files</|parameter>',
+    `${close} invoke>`,
+    `${open} invoke name="read">`,
+    `${open} parameter name="file_path" string="true">/tmp/a.txt${close} parameter>`,
+    `${close} invoke>`,
+    `${open} invoke>`,
+    `${open} parameter name="file_path" string="true">/tmp/b.txt${close} parameter>`,
+    `${close} invoke>`,
+    `${close} calls>`,
+  ].join('\n');
+
+  const tools = [
+    { type: 'function', function: { name: 'skill', parameters: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } } },
+    { type: 'function', function: { name: 'bash', parameters: { type: 'object', properties: { command: { type: 'string' }, description: { type: 'string' } }, required: ['command', 'description'] } } },
+    { type: 'function', function: { name: 'edit', parameters: { type: 'object', properties: { file_path: { type: 'string' }, old_string: { type: 'string' }, new_string: { type: 'string' } }, required: ['file_path', 'old_string', 'new_string'] } } },
+    { type: 'function', function: { name: 'read', parameters: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } } },
+  ];
+  const body = await replayParsed(text, tools);
+  const calls = (body.choices?.[0]?.message?.tool_calls || []).map((call) => ({
+    name: call.function.name,
+    args: JSON.parse(call.function.arguments),
+  }));
+  assert.deepEqual(calls, [
+    { name: 'skill', args: { name: 'fast-exam-study-guide' } },
+    { name: 'bash', args: { command: 'ls -l /tmp/pg', description: 'List the pagoda files' } },
+    { name: 'read', args: { file_path: '/tmp/a.txt' } },
+    { name: 'read', args: { file_path: '/tmp/b.txt' } },
+  ]);
+});

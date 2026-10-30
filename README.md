@@ -905,6 +905,14 @@ tool calls out of the answer into real OpenAI `tool_calls`:
   tool's first unused schema slot that can hold the value (schema type checked),
   and every repair is logged as `tool call repaired (N): ...` so it is visible
   in `bridge.log` instead of surfacing as a confusing harness error.
+- **Corrupted tags and names:** the short marker `<|parameter name="x">` (no
+  `DSML` word) is read like the full tag; unquoted attribute values
+  (`name=read`) are accepted; a JSON body or `arguments="…"` on an `invoke` is
+  used as the arguments. A parameter literally named `name` is kept as an
+  argument (`skill` has one), and a nameless call in a parallel batch is inferred
+  from its arguments with required-argument checks — it repeats the previous
+  call's tool rather than being retargeted to a different schema. Literal DSML
+  markers inside a value (a heredoc that documents the marker) are preserved.
 - **Debug capture:** set `DS_BRIDGE_DUMP_DIR=/some/dir` to write the raw SSE
   frames and the exact assistant text the parser saw, per request. Nothing is
   written when the variable is unset.

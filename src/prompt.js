@@ -613,10 +613,36 @@ const XML_TOOL = /<(?:tool_call|tool_calls)>([\s\S]*?)<\/(?:tool_call|tool_calls
 // array instead of invoke/parameter tags. Tokenize the tags instead of relying
 // on one strict regex so every one of those shapes is recovered.
 const DSML_BAR = String.raw`[\uFF5C|]+`;
+// Under load DeepSeek drops the `DSML` word from the marker and emits
+// `<|parameter name="command" ...>` or `<|invoke name="read">`. Those tags used
+// to be invisible to the tokenizer: the parameter body then flowed into the
+// previous parameter (a bash `description` landed at the end of `command`), or
+// into the invoke body, which was discarded — so the harness saw a call that
+// was missing properties the model had emitted. Accept the short marker too.
 const DSML_TAG_RE = new RegExp(
-  String.raw`<\s*(\/?)\s*` + DSML_BAR + String.raw`\s*DSML\s*` + DSML_BAR + String.raw`\s*([^>]*)>`,
+  String.raw`<\s*(\/?)\s*(?:` + DSML_BAR + String.raw`\s*DSML\s*)?` + DSML_BAR + String.raw`\s*([^>]*)>`,
   'gi',
 );
+
+// Tags that carry structure. Anything else between angle brackets inside a
+// parameter value is literal text: a bash heredoc that writes the DSML marker
+// itself used to lose everything from the marker to the next tag.
+const STRUCTURAL_TAGS = new Set([
+  'calls',
+  'tool_calls',
+  'invoke',
+  'tool',
+  'tool_call',
+  'parameter',
+  'param',
+]);
+
+function isStructuralTag(name, closing) {
+  if (name) return STRUCTURAL_TAGS.has(name);
+  // `</｜｜DSML｜｜>` (closer with no name) closes the innermost construct, but a
+  // nameless opener `<｜｜DSML｜｜>` is not structural — inside a value it is data.
+  return closing;
+}
 
 // DeepSeek does not always write DSML attributes with ASCII punctuation. The
 // observed corruptions are full-width `＝` (U+FF1D) and typographic quotes
@@ -636,12 +662,15 @@ function normalizeAttrPunctuation(text) {
     .replace(ATTR_SQUOTE, "'");
 }
 
-const ATTR_RE = /([a-zA-Z_][\w:-]*)?\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+// Values are normally quoted, but the model also writes `name=read` or
+// `name=command string=true` while under load. Accept unquoted values instead
+// of dropping the attribute (and with it the whole call).
+const ATTR_RE = /([a-zA-Z_][\w:-]*)?\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>]+))/g;
 
 function parseAttrs(text) {
   const out = {};
   for (const m of normalizeAttrPunctuation(text).matchAll(ATTR_RE)) {
-    if (m[1]) out[m[1]] = m[2] ?? m[3] ?? '';
+    if (m[1]) out[m[1]] = m[2] ?? m[3] ?? m[4] ?? '';
   }
   return out;
 }
@@ -657,11 +686,11 @@ function parseTagSpec(raw) {
   // the quoted value is the parameter/tool name. Only accept a leading bare
   // value: a junk attribute later in the tag is not a name.
   let bare = '';
-  const leading = rest.match(/^\s*=\s*(?:"([^"]*)"|'([^']*)')/);
+  const leading = rest.match(/^\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>]+))/);
   // Only an identifier-shaped value can be a dropped attribute name; anything
   // else (`parameter="/tmp/a.js"`) is a nameless value, handled positionally.
-  if (leading && /^[A-Za-z_][\w-]*$/.test((leading[1] ?? leading[2] ?? '').trim())) {
-    bare = (leading[1] ?? leading[2] ?? '').trim();
+  if (leading && /^[A-Za-z_][\w-]*$/.test((leading[1] ?? leading[2] ?? leading[3] ?? '').trim())) {
+    bare = (leading[1] ?? leading[2] ?? leading[3] ?? '').trim();
   }
   return { name: match[1].toLowerCase(), attrs, bare };
 }
@@ -707,6 +736,47 @@ function parameterValue(param) {
   }
 }
 
+function toolEntry(index, name) {
+  const entry = name ? index?.get(name) : null;
+  if (!entry) return null;
+  // Accept a plain `Map(props)` / `Set(keys)` as well as
+  // buildParamToolIndex's object, so a hand-built index keeps working.
+  if (entry instanceof Map || entry instanceof Set) return { properties: entry, required: [] };
+  return entry.properties instanceof Map ? entry : null;
+}
+
+/**
+ * Name a call whose invoke tag lost its `name`.
+ *
+ * The old rule picked the first tool whose properties covered the arguments.
+ * `read` and `edit` both have `file_path`, and `edit` is declared first, so a
+ * nameless `read` call carrying only `file_path` was dispatched as `edit` and
+ * rejected for missing `old_string`/`new_string`. Score by required-argument
+ * satisfaction, prefer repeating the previous call's tool (that is what a
+ * parallel batch means), and never pick a tool that would still be missing a
+ * required argument.
+ */
+function inferToolName(index, args, previous = '') {
+  if (!index) return '';
+  const keys = Object.keys(args || {});
+  if (!keys.length) return '';
+  let best = '';
+  let bestScore = -1;
+  for (const tool of index.keys()) {
+    const entry = toolEntry(index, tool);
+    if (!entry) continue;
+    const required = entry.required || [];
+    if (required.some((key) => args[key] === undefined)) continue;
+    if (!keys.every((key) => entry.properties.has(key))) continue;
+    const score = required.length * 100 + (tool === previous ? 10 : 0) + keys.length;
+    if (score > bestScore) {
+      best = tool;
+      bestScore = score;
+    }
+  }
+  return best;
+}
+
 function extractDsml(text, { paramToolIndex = null } = {}) {
   const source = String(text || '');
   const calls = [];
@@ -722,6 +792,9 @@ function extractDsml(text, { paramToolIndex = null } = {}) {
   let currentParam = null;
   let callsBody = '';
   let callsAtStart = 0;
+  // Previous resolved tool in this block: the strongest hint for a nameless
+  // sibling call in the same parallel batch.
+  let lastTool = '';
 
   // Assign parameters whose name attribute could not be read at all. The
   // model emits them in schema order, so the first unused property of the
@@ -731,8 +804,8 @@ function extractDsml(text, { paramToolIndex = null } = {}) {
     if (!call.unnamed?.length) return;
     const unnamed = call.unnamed;
     call.unnamed = [];
-    const schema = name ? paramToolIndex?.get(name) : null;
-    const keys = schema ? [...schema.keys()] : [];
+    const props = toolEntry(paramToolIndex, name)?.properties || null;
+    const keys = props ? [...props.keys()] : [];
     const used = new Set(Object.keys(call.args));
     for (const value of unnamed) {
       const obj = typeof value === 'string' ? tryParseJsonObject(value) : value;
@@ -742,7 +815,7 @@ function extractDsml(text, { paramToolIndex = null } = {}) {
         repairs.push(`${name || 'call'}: unnamed parameter carried a JSON object`);
         continue;
       }
-      const next = keys.find((key) => !used.has(key) && schemaFits(schema.get(key), value));
+      const next = keys.find((key) => !used.has(key) && schemaFits(props.get(key), value));
       if (!next) {
         repairs.push(`${name || 'call'}: unnamed parameter dropped (no compatible schema slot)`);
         continue;
@@ -764,10 +837,52 @@ function extractDsml(text, { paramToolIndex = null } = {}) {
       currentCall.unnamed.push(value);
       return;
     }
+    // Keep every named parameter as an argument. The tool name is taken from
+    // the invoke tag; if that tag lost it, finishCall may still consume one of
+    // these (only when the value really is a tool). The old code turned a
+    // parameter literally named `name` into the tool name, which deleted the
+    // `skill` tool's own required `name` argument and sent `{}`.
     if (param.name === 'arguments' || param.name === 'args') currentCall.argPayload = value;
-    else if (['name', 'tool', 'tool_name'].includes(param.name)) {
-      if (!currentCall.name) currentCall.name = String(value ?? '').trim();
-    } else currentCall.args[param.name] = value;
+    else currentCall.args[param.name] = value;
+  };
+
+  const applyPayload = (call) => {
+    if (call.argPayload === undefined) return;
+    let parsed = call.argPayload;
+    if (typeof parsed === 'string') {
+      try {
+        parsed = JSON.parse(parsed);
+      } catch {
+        /* keep the string */
+      }
+    }
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      call.args = { ...parsed, ...call.args };
+    } else {
+      call.args = { ...call.args, value: parsed };
+    }
+  };
+
+  // An invoke tag with no name can still carry the tool name as a `name` (or
+  // `tool`/`tool_name`) argument. Consume it only when it names a real tool and
+  // no tool would accept it as an argument instead (`skill` has a `name` arg).
+  const consumeToolName = (call) => {
+    for (const key of ['name', 'tool', 'tool_name']) {
+      const value = call.args[key];
+      if (typeof value !== 'string') continue;
+      const candidate = value.trim();
+      if (!candidate) continue;
+      if (paramToolIndex) {
+        if (!paramToolIndex.has(candidate)) continue;
+        const asArg = inferToolName(paramToolIndex, call.args, lastTool);
+        if (asArg && toolEntry(paramToolIndex, asArg)?.properties.has(key)) continue;
+      } else if (!/^[A-Za-z_][\w:-]*$/.test(candidate)) {
+        continue;
+      }
+      delete call.args[key];
+      return candidate;
+    }
+    return '';
   };
 
   const finishCall = () => {
@@ -775,38 +890,22 @@ function extractDsml(text, { paramToolIndex = null } = {}) {
     if (!currentCall) return;
     const call = currentCall;
     currentCall = null;
-    let name = String(call.name || call.args.name || call.args.tool || call.args.tool_name || '').trim();
-    delete call.args.name;
-    delete call.args.tool;
-    delete call.args.tool_name;
-    if (!name && paramToolIndex) {
-      const keys = Object.keys(call.args);
-      if (keys.length) {
-        let best = null, bestScore = 0;
-        for (const [tool, params] of paramToolIndex) {
-          const overlap = keys.filter((k) => params.has(k)).length;
-          if (overlap === keys.length && overlap > bestScore) { best = tool; bestScore = overlap; }
-        }
-        if (best) name = best;
+    applyPayload(call);
+    // `<invoke name="x">{...json...}</invoke>`: the body is not DSML, but the
+    // model emits it under load and the arguments used to be discarded.
+    if (!Object.keys(call.args).length) {
+      const body = callsBody.trim();
+      const parsed = body ? tryParseJsonObject(body) : null;
+      if (parsed) {
+        call.args = parsed;
+        repairs.push(`${call.name || 'call'}: arguments recovered from a JSON body`);
       }
     }
+    let name = String(call.name || '').trim() || consumeToolName(call);
+    if (!name) name = inferToolName(paramToolIndex, call.args, lastTool);
     if (!name) return;
+    lastTool = name;
     resolveUnnamed(call, name);
-    if (call.argPayload !== undefined) {
-      let parsed = call.argPayload;
-      if (typeof parsed === 'string') {
-        try {
-          parsed = JSON.parse(parsed);
-        } catch {
-          /* keep the string */
-        }
-      }
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        call.args = { ...parsed, ...call.args };
-      } else {
-        call.args = { ...call.args, value: parsed };
-      }
-    }
     calls.push({ id: `call_${crypto.randomBytes(6).toString('hex')}`, name, arguments: call.args });
   };
 
@@ -830,7 +929,7 @@ function extractDsml(text, { paramToolIndex = null } = {}) {
     const segment = source.slice(cursor, start);
     if (segment) {
       if (inParam && currentParam) currentParam.value += segment;
-      else if (inCalls && !inInvoke) callsBody += segment;
+      else if (inCalls) callsBody += segment;
       else if (!inCalls && !inInvoke && !inParam) cleaned += segment;
     }
     cursor = end;
@@ -838,6 +937,13 @@ function extractDsml(text, { paramToolIndex = null } = {}) {
 
     const closing = Boolean(match[1]);
     const { name, attrs, bare } = parseTagSpec(match[2]);
+    if (inParam && !isStructuralTag(name, closing)) {
+      // Not a structural tag: this is literal text inside the value (a bash
+      // heredoc that documents the DSML marker, for example). Keep it verbatim
+      // instead of consuming it — that used to truncate the value silently.
+      if (currentParam) currentParam.value += match[0];
+      continue;
+    }
 
     if (!closing) {
       if (name === 'calls' || name === 'tool_calls') {
@@ -855,7 +961,11 @@ function extractDsml(text, { paramToolIndex = null } = {}) {
           name: attrs.name || attrs.tool || attrs.tool_name || bare || '',
           args: {},
           unnamed: [],
-          argPayload: undefined,
+          // `<invoke name="x" arguments="{...}">` is not DSML, but the model
+          // emits it under load; keep the payload instead of returning `{}`.
+          argPayload: [attrs.arguments, attrs.args, attrs.parameters].find(
+            (value) => typeof value === 'string' && tryParseJsonObject(value),
+          ),
         };
         callsBody = '';
       } else if (name === 'parameter' || name === 'param') {
@@ -1098,8 +1208,11 @@ export function buildParamToolIndex(tools) {
     const name = String(fn?.name || '').trim();
     if (!name) continue;
     const props = fn?.parameters?.properties ?? {};
+    const required = Array.isArray(fn?.parameters?.required) ? fn.parameters.required.map(String) : [];
     const entries = Object.entries(props || {});
-    if (entries.length) index.set(name, new Map(entries));
+    if (entries.length || required.length) {
+      index.set(name, { properties: new Map(entries), required });
+    }
   }
   return index;
 }
