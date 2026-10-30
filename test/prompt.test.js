@@ -911,3 +911,16 @@ test('a JSON body inside an invoke becomes the arguments', () => {
   assert.equal(out.calls.length, 1);
   assert.deepEqual(out.calls[0].arguments, { file_path: '/tmp/d.txt' });
 });
+
+test('an invoke that yields no arguments is reported for the log', () => {
+  const text = [
+    `${DSML_OPEN} calls>`,
+    `${DSML_OPEN} invoke name="skill">`,
+    `${DSML_CLOSE} invoke>`,
+    `${DSML_CLOSE} calls>`,
+  ].join('\n');
+  const out = extractToolCalls(text, { toolNames: new Set(['skill']), paramToolIndex: buildParamToolIndex(SKILL_TOOLS) });
+  assert.equal(out.calls.length, 1);
+  assert.deepEqual(out.calls[0].arguments, {});
+  assert.ok(out.repairs.some((line) => /invoke carried no readable arguments/.test(line)));
+});

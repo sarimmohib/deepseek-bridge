@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.3
+
+- **Diagnostics:** a call that still arrives with no readable arguments is now
+  logged as `tool call repaired (N): <tool>: invoke carried no readable
+  arguments` when the tool requires at least one. Before, it only surfaced as a
+  harness `missing required property` error with no trace in `bridge.log`.
+  Combine with `DS_BRIDGE_DUMP_DIR` to capture the exact raw reply next time.
+- Version 0.9.3 (package.json and extension/manifest.json).
+
 ## 0.9.2
 
 - **Fixed: `skill` (and any tool with a `name` argument) arrived with `{}`.**

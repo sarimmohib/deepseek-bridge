@@ -906,6 +906,13 @@ function extractDsml(text, { paramToolIndex = null } = {}) {
     if (!name) return;
     lastTool = name;
     resolveUnnamed(call, name);
+    // A call that still has no arguments is unactionable. Record it so the
+    // bridge log names the tool instead of the harness reporting a bare
+    // "missing required property" (and so the raw shape can be dumped next
+    // time with DS_BRIDGE_DUMP_DIR).
+    if (!Object.keys(call.args).length && toolEntry(paramToolIndex, name)?.required?.length) {
+      repairs.push(`${name}: invoke carried no readable arguments`);
+    }
     calls.push({ id: `call_${crypto.randomBytes(6).toString('hex')}`, name, arguments: call.args });
   };
 

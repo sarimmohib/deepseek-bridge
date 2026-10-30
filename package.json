@@ -1,6 +1,6 @@
 {
   "name": "deepseek-bridge",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "private": true,
   "type": "module",
   "description": "OpenAI-compatible local API for chat.deepseek.com with an unlimited account pool, automatic rotation, and a dsh-tuned system prompt with learned rules. Copies your web session once, then runs without Chrome.",
