@@ -212,6 +212,26 @@ export const dashboardHtml = `<!DOCTYPE html>
   .acct-add input#acct-label { flex: 0 1 160px; }
   .acct-note { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
 
+  /* ---------- system prompt & rules ---------- */
+  .rules-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0; }
+  .rule-row {
+    display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px;
+    border: 1px solid var(--border); border-radius: 9px; background: var(--panel2);
+    padding: 8px 10px; font-size: 12.5px;
+  }
+  .rule-row + .rule-row { margin-top: 8px; }
+  .rule-badge {
+    font-size: 10.5px; padding: 1px 7px; border-radius: 999px; white-space: nowrap;
+    border: 1px solid var(--border); color: var(--muted); flex: none;
+  }
+  .rule-badge.learned { color: var(--warn); border-color: var(--warn); }
+  .rule-badge.user { color: var(--accent); border-color: var(--accent-border); }
+  .rule-text { flex: 1 1 260px; min-width: 0; word-break: break-word; line-height: 1.45; }
+  .rule-seen { color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .rules-add { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
+  .rules-add input { flex: 1 1 240px; min-width: 160px; }
+  .rules-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+
   /* ---------- conversations ---------- */
   .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; }
   #search { flex: 1 1 170px; min-width: 150px; }
@@ -351,6 +371,25 @@ export const dashboardHtml = `<!DOCTYPE html>
     </div>
   </section>
   <section>
+    <h2>System prompt &amp; rules</h2>
+    <div class="card">
+      <div class="muted">The bridge prepends its own system message (a dsh-tuned preset plus rules) before the harness's own. Edits apply on the next request without a restart, and the stored conversation keeps going.</div>
+      <div class="rules-head">
+        <span class="chip accent" id="rules-preset">preset –</span>
+        <button class="btn sm" id="btn-rules-refresh" type="button" title="refresh rules">↻</button>
+      </div>
+      <div id="rules-list"><div class="empty">Waiting for API key…</div></div>
+      <div class="rules-add">
+        <input id="rule-text" type="text" placeholder="Add a rule the model should always follow…" autocomplete="off" maxlength="320">
+        <button class="btn primary" id="btn-rule-add" type="button">Add rule</button>
+      </div>
+      <div class="rules-foot">
+        <button class="btn" id="btn-rules-clear-learned" type="button" title="remove rules learned from past failures">Clear learned</button>
+        <span class="muted" id="rules-counts"></span>
+      </div>
+    </div>
+  </section>
+  <section>
     <h2>Conversations</h2>
     <div class="toolbar">
       <input id="search" type="search" placeholder="Search preview or model…" autocomplete="off">
@@ -445,6 +484,17 @@ export const dashboardHtml = `<!DOCTYPE html>
     ready: 0,
     cooling: 0,
     source: 'bridge',
+    err: '',
+    armed: false,
+    armTimer: null
+  };
+  var rulesState = {
+    pending: false,
+    list: [],
+    preset: '',
+    presets: [],
+    rulesOn: true,
+    summary: null,
     err: '',
     armed: false,
     armTimer: null
@@ -607,36 +657,35 @@ export const dashboardHtml = `<!DOCTYPE html>
   /* ---------------- models ---------------- */
   function buildSnippet(m) {
     var id = m && m.id ? String(m.id) : '';
-    var entry = {
-      name: MODEL_NAMES[id] || id,
-      family: 'deepseek',
-      capabilities: {
-        tools: true,
-        input: ['text', 'image'],
-        output: ['text'],
-        reasoning: { supported: true, effort: ['low', 'high', 'max'] }
-      },
-      limit: {
-        context: isFinite(Number(m && m.context_window)) ? Number(m.context_window) : 890880,
-        output: isFinite(Number(m && m.max_output_tokens)) ? Number(m.max_output_tokens) : 131072
-      }
-    };
-    var models = {};
-    if (id) models[id] = entry;
+    var name = MODEL_NAMES[id] || id;
     var c = state.status && state.status.config;
     var port = c && Number(c.port) ? Number(c.port) : (location.port ? Number(location.port) : 8787);
-    return JSON.stringify({
-      'deepseek-bridge': {
-        name: 'DeepSeek Bridge',
-        package: '@opencode/ai/providers/openai-compatible',
-        settings: {
-          baseURL: 'http://127.0.0.1:' + port + '/v1',
-          apiKey: '{file:~/.config/deepseek-bridge/opencode.key}'
-        },
-        compatibility: { reasoningField: 'reasoning_content' },
-        models: models
-      }
-    }, null, 2);
+    var ctx = isFinite(Number(m && m.context_window)) ? Number(m.context_window) : 890880;
+    var out = isFinite(Number(m && m.max_output_tokens)) ? Number(m.max_output_tokens) : 131072;
+    return [
+      '- id: llm-pi-ai',
+      '  config:',
+      '    providers:',
+      '      bridge:',
+      '        apiKeyEnv: DEEPSEEK_BRIDGE_KEY',
+      '        baseURL: http://127.0.0.1:' + port + '/v1',
+      '        api: openai-completions',
+      '        models:',
+      '          - id: ' + id,
+      '            name: ' + name,
+      '            contextWindow: ' + ctx,
+      '            maxTokens: ' + out,
+      '            reasoningEfforts:',
+      '              off:',
+      '              low: low',
+      '              high: high',
+      '              max: max',
+      '- id: agent-default-model',
+      '  config:',
+      '    provider: bridge',
+      '    model: ' + id,
+      '    reasoningEffort: high'
+    ].join(NL) + NL;
   }
   function copyText(text, btn) {
     function done() {
@@ -695,7 +744,7 @@ export const dashboardHtml = `<!DOCTYPE html>
         + '<div class="model-meta"><span>ctx ' + fmtNum(m.context_window) + '</span>'
         + '<span>out ' + fmtNum(m.max_output_tokens) + '</span>'
         + '<span>' + esc(dash(m.owned_by)) + '</span></div>'
-        + '<button class="btn" type="button" data-idx="' + i + '">Copy OpenCode config</button>'
+        + '<button class="btn" type="button" data-idx="' + i + '">Copy dsh config</button>'
         + '</div>';
     }
     host.innerHTML = html;
@@ -852,6 +901,7 @@ export const dashboardHtml = `<!DOCTYPE html>
   function refreshAccounts() {
     accountState.pending = false;
     loadAccounts();
+    loadRules();
   }
   function loadAccounts() {
     if (!state.key) {
@@ -954,6 +1004,137 @@ export const dashboardHtml = `<!DOCTYPE html>
       refreshAccounts();
     }).catch(function (err) {
       if (err && err.message !== 'unauthorized') toast('Clear failed: ' + err.message, 'error');
+    });
+  }
+
+  /* ---------------- system prompt & rules ---------------- */
+  function renderRules() {
+    var preset = $('rules-preset');
+    preset.textContent = 'preset ' + (rulesState.preset || 'none') + ' · rules ' + (rulesState.rulesOn ? 'on' : 'off');
+    var add = $('btn-rule-add');
+    if (add) add.disabled = !state.key;
+    var host = $('rules-list');
+    var list = rulesState.list || [];
+    if (!state.key) {
+      host.innerHTML = '<div class="empty">Waiting for API key…</div>';
+      $('rules-counts').textContent = '';
+      return;
+    }
+    if (!list.length) {
+      var emptyMsg = rulesState.pending ? 'Loading…' : rulesState.err ? 'Could not load rules: ' + esc(rulesState.err) : 'No rules yet.';
+      host.innerHTML = '<div class="empty">' + emptyMsg + '</div>';
+    } else {
+      var html = '';
+      for (var i = 0; i < list.length; i++) {
+        var r = list[i] || {};
+        var src = r.source === 'learned' || r.source === 'builtin' ? r.source : 'user';
+        html += '<div class="rule-row">'
+          + '<span class="rule-badge ' + src + '">' + esc(src) + '</span>'
+          + '<span class="rule-text">' + esc(r.text) + '</span>'
+          + (src === 'learned' ? '<span class="rule-seen">seen ' + fmtNum(r.count) + 'x</span>' : '')
+          + (src === 'builtin' ? '' : '<button class="del" type="button" data-rule="' + esc(r.id) + '" title="remove rule" aria-label="remove rule">✕</button>')
+          + '</div>';
+      }
+      host.innerHTML = html;
+    }
+    var s = rulesState.summary || {};
+    var bits = [];
+    if (typeof s.count === 'number') bits.push(fmtNum(s.count) + ' rules');
+    if (typeof s.learned === 'number') bits.push(fmtNum(s.learned) + ' learned');
+    $('rules-counts').textContent = bits.join(' · ');
+  }
+  function loadRules() {
+    if (!state.key) {
+      rulesState.list = [];
+      rulesState.summary = null;
+      rulesState.err = '';
+      renderRules();
+      return;
+    }
+    if (rulesState.pending) return;
+    rulesState.pending = true;
+    rulesState.err = '';
+    renderRules();
+    fetch('/v1/bridge/rules', { headers: { 'Authorization': 'Bearer ' + state.key } }).then(function (res) {
+      if (res.status === 401) {
+        var had = !!state.key;
+        clearKey();
+        if (had) toast('Unauthorized — key cleared', 'error');
+        rulesState.list = [];
+        rulesState.err = 'unauthorized';
+        return null;
+      }
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    }).then(function (d) {
+      if (!d) return;
+      rulesState.preset = typeof d.systemPreset === 'string' ? d.systemPreset : '';
+      rulesState.rulesOn = d.systemRules !== false;
+      rulesState.presets = Array.isArray(d.presets) ? d.presets : [];
+      rulesState.list = Array.isArray(d.rules) ? d.rules : [];
+      rulesState.summary = d.summary && typeof d.summary === 'object' ? d.summary : null;
+    }).catch(function (err) {
+      rulesState.err = err && err.message ? err.message : 'network error';
+    }).then(function () {
+      rulesState.pending = false;
+      renderRules();
+    });
+  }
+  function addRule() {
+    var input = $('rule-text');
+    var text = input.value.trim();
+    if (!text) { toast('Type a rule first', 'error'); return; }
+    var btn = $('btn-rule-add');
+    btn.disabled = true;
+    btn.textContent = 'Adding…';
+    apiJson('/v1/bridge/rules', 'POST', { text: text }).then(function (d) {
+      input.value = '';
+      toast(d && d.duplicate ? 'That rule is already stored' : 'Rule added', 'ok');
+      loadRules();
+    }).catch(function (err) {
+      if (err && err.message !== 'unauthorized') toast('Add rule failed: ' + err.message, 'error');
+    }).then(function () {
+      btn.disabled = !state.key;
+      btn.textContent = 'Add rule';
+    });
+  }
+  function removeRule(id) {
+    api('/v1/bridge/rules/' + encodeURIComponent(id), { method: 'DELETE' }).then(function () {
+      toast('Rule removed', 'ok');
+      loadRules();
+    }).catch(function (err) {
+      if (err && err.message !== 'unauthorized') toast('Remove rule failed: ' + err.message, 'error');
+    });
+  }
+  function disarmRules() {
+    rulesState.armed = false;
+    var b = $('btn-rules-clear-learned');
+    if (b) {
+      b.classList.remove('armed');
+      b.textContent = 'Clear learned';
+    }
+    if (rulesState.armTimer) { clearTimeout(rulesState.armTimer); rulesState.armTimer = null; }
+  }
+  function clearLearnedClick() {
+    var learned = rulesState.summary && typeof rulesState.summary.learned === 'number' ? rulesState.summary.learned : 0;
+    if (!learned) { toast('No learned rules to remove', 'error'); return; }
+    if (!rulesState.armed) {
+      rulesState.armed = true;
+      var b = $('btn-rules-clear-learned');
+      b.classList.add('armed');
+      b.textContent = 'Remove ' + learned + '?';
+      rulesState.armTimer = setTimeout(disarmRules, 4000);
+      return;
+    }
+    disarmRules();
+    fetch('/v1/bridge/rules?learned=1', { method: 'DELETE', headers: { 'Authorization': 'Bearer ' + state.key } }).then(function (res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    }).then(function (d) {
+      toast('Removed ' + num(d && d.removed) + ' learned rule(s)', 'ok');
+      loadRules();
+    }).catch(function (err) {
+      toast('Clear learned failed: ' + (err && err.message ? err.message : 'error'), 'error');
     });
   }
 
@@ -1107,6 +1288,18 @@ export const dashboardHtml = `<!DOCTYPE html>
     $('btn-account-add').addEventListener('click', addAccount);
     $('acct-token').addEventListener('keydown', function (e) { if (e.key === 'Enter') addAccount(); });
     $('btn-accounts-clear').addEventListener('click', clearAccountsClick);
+    $('btn-rules-refresh').addEventListener('click', loadRules);
+    $('btn-rule-add').addEventListener('click', addRule);
+    $('rule-text').addEventListener('keydown', function (e) { if (e.key === 'Enter') addRule(); });
+    $('btn-rules-clear-learned').addEventListener('click', clearLearnedClick);
+    $('rules-list').addEventListener('click', function (ev) {
+      var btn = ev.target && ev.target.closest ? ev.target.closest('button[data-rule]') : null;
+      if (!btn) return;
+      var id = btn.getAttribute('data-rule');
+      if (!id) return;
+      btn.disabled = true;
+      removeRule(id);
+    });
     $('accounts-list').addEventListener('click', function (ev) {
       var btn = ev.target && ev.target.closest ? ev.target.closest('button[data-acct]') : null;
       if (!btn) return;

@@ -13,6 +13,9 @@ const PID_FILE = path.join(CONFIG_DIR, 'bridge.pid');
 // accounts.json and only reads session.json once, to migrate it.
 const SESSION_FILE = path.join(CONFIG_DIR, 'session.json');
 const ACCOUNTS_FILE = path.join(CONFIG_DIR, 'accounts.json');
+// Model-facing rules (builtin/user/learned) injected into the bridge system
+// prompt. Kept beside the config so a backup of the directory carries them.
+const RULES_FILE = path.join(CONFIG_DIR, 'rules.json');
 
 function readJSON(file, fallback) {
   try {
@@ -39,11 +42,52 @@ function clampInt(v, dflt, min, max = Number.MAX_SAFE_INTEGER) {
   return Math.min(max, Math.max(min, n));
 }
 
-function writeJSON(file, value) {
+// Windows can reject a rename while another process (antivirus, a reader,
+// the previous bridge instance) still holds the target open, and a full or
+// read-only volume can fail the write outright. Retry a few times and fall
+// back to an in-place write; callers decide whether a hard failure is fatal.
+const RENAME_RETRIES = 5;
+const RENAME_BACKOFF_MS = 20;
+
+function writeFileAtomic(file, body) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
-  fs.renameSync(tmp, file);
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmp, body, { mode: 0o600 });
+  let lastErr = null;
+  for (let attempt = 0; attempt < RENAME_RETRIES; attempt++) {
+    try {
+      fs.renameSync(tmp, file);
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (!['EPERM', 'EBUSY', 'EACCES', 'EEXIST'].includes(err?.code)) break;
+      // Synchronous sleep: this runs inside a timer/request, and the write
+      // is tiny, so a short block beats dropping the update.
+      const until = Date.now() + RENAME_BACKOFF_MS * (attempt + 1);
+      while (Date.now() < until) { /* spin briefly */ }
+    }
+  }
+  // Last resort: write straight to the target. A torn file is recoverable
+  // (readJSON falls back to defaults); a killed bridge is not.
+  try {
+    fs.writeFileSync(file, body, { mode: 0o600 });
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* already gone */
+    }
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* already gone */
+    }
+    throw lastErr || err;
+  }
+}
+
+function writeJSON(file, value) {
+  writeFileAtomic(file, JSON.stringify(value, null, 2) + '\n');
 }
 
 export function loadConfig({ persist = true } = {}) {
@@ -63,7 +107,15 @@ export function loadConfig({ persist = true } = {}) {
     maxFreshTranscriptChars: clampInt(saved.maxFreshTranscriptChars, 200000, 1),
     maxUpstream: clampInt(saved.maxUpstream, 2, 1, 16),
     systemPrompt: typeof saved.systemPrompt === 'string' ? saved.systemPrompt : '',
-    systemPreset: typeof saved.systemPreset === 'string' ? saved.systemPreset : '',
+    // dsh-agent is the default because DeepSeek Harness is the supported
+    // harness; an explicit systemPrompt still wins over any preset.
+    // Empty means unset so an existing config picks up the dsh-agent default
+    // after upgrading; an explicit 'none' still disables the preset.
+    systemPreset:
+      typeof saved.systemPreset === 'string' && saved.systemPreset.trim()
+        ? saved.systemPreset.trim()
+        : 'dsh-agent',
+    systemRules: saved.systemRules !== false,
   };
   if (persist && (!saved.key || saved.defaultModel !== cfg.defaultModel)) {
     try {
@@ -115,16 +167,49 @@ export class Store {
     for (const [key] of entries.slice(0, entries.length - MAX)) delete this.data.conversations[key];
   }
 
+  // Returns true when the flush landed. A failed write keeps the store
+  // dirty so the next autosave retries it, and never throws: this runs from
+  // a timer, where an exception would terminate the whole bridge.
   flush() {
-    if (!this.dirty) return;
-    writeJSON(this.file, this.data);
-    this.dirty = false;
+    if (!this.dirty) return true;
+    try {
+      writeJSON(this.file, this.data);
+      this.dirty = false;
+      this.lastFlushError = null;
+      return true;
+    } catch (err) {
+      this.lastFlushError = err?.message || String(err);
+      try {
+        this.onFlushError?.(err);
+      } catch {
+        // A broken observer must not escalate a handled failure into a crash.
+      }
+      return false;
+    }
   }
 
   startAutosave(intervalMs = 2000) {
-    const timer = setInterval(() => this.flush(), intervalMs);
+    // flush() never throws, but keep the timer callback guarded anyway: an
+    // exception escaping a timer callback is an uncaught exception and kills
+    // the process (ERR_SOCKET_BAD_PORT-style crashes are not the only way a
+    // long-running daemon dies).
+    const timer = setInterval(() => {
+      try {
+        this.flush();
+      } catch {
+        /* flush already records lastFlushError */
+      }
+    }, intervalMs);
     timer.unref?.();
-    const flushNow = () => this.flush();
+    // Exit and signal handlers run in a fragile state: the process is going
+    // down and a file may be locked. They must never throw.
+    const flushNow = () => {
+      try {
+        return this.flush();
+      } catch {
+        return false;
+      }
+    };
     process.on('exit', flushNow);
     process.on('SIGINT', () => {
       flushNow();
@@ -134,4 +219,4 @@ export class Store {
   }
 }
 
-export const paths = { CONFIG_DIR, CONFIG_FILE, STATE_FILE, PID_FILE, SESSION_FILE, ACCOUNTS_FILE };
+export const paths = { CONFIG_DIR, CONFIG_FILE, STATE_FILE, PID_FILE, SESSION_FILE, ACCOUNTS_FILE, RULES_FILE };

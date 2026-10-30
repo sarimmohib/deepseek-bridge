@@ -8,7 +8,7 @@
  *   deepseek status          show bridge/extension status
  *   deepseek ui              open the web dashboard in a browser
  *   deepseek models          one line per model
- *   deepseek models --info   model details + pasteable harness config snippets
+ *   deepseek models --info   model details + pasteable dsh config snippet
  *   deepseek chat "hello"    send a chat message
  *   deepseek "hello"         shorthand for chat
  *   deepseek --login         copy the browser session (extension or manual)
@@ -31,11 +31,12 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig, paths, saveConfig } from '../src/config.js';
 import { MODELS } from '../src/openai.js';
 import {
+  dshProfileSnippet,
   modelDetailLines,
   modelSummaryLines,
   openaiEnvSnippet,
-  opencodeProviderSnippet,
 } from '../src/modelinfo.js';
+import * as rules from '../src/rules.js';
 import { sessionSummary } from '../src/session.js';
 import * as accounts from '../src/accounts.js';
 import {
@@ -59,7 +60,7 @@ const first = args[0];
 const known = new Set([
   'start', 'serve', 'stop', 'status', 'chat', 'key', 'extension',
   'logs', 'login', 'logout', 'session', 'version', 'update', 'help',
-  'ui', 'models', 'accounts',
+  'ui', 'models', 'accounts', 'rules',
 ]);
 const AUTO_UPDATE_INTERVAL = 6 * 60 * 60 * 1000;
 
@@ -771,8 +772,9 @@ function modelsCommand() {
     console.log('');
   }
 
-  console.log('OpenCode provider snippet (paste under "providers" in ~/.config/opencode/opencode.jsonc):');
-  console.log(opencodeProviderSnippet({ models: MODELS, port: cfg.port }));
+  console.log('DeepSeek Harness (dsh) profile patch — paste into ~/.dsh/profiles/web/cordis.patch.yml:');
+  console.log(dshProfileSnippet({ models: MODELS, port: cfg.port, model: cfg.defaultModel }));
+  console.log('  Export DEEPSEEK_BRIDGE_KEY in your shell profile, then boot `dsh web`.');
   console.log('');
   console.log('Generic OpenAI-compatible env (JSON):');
   const envJson = openaiEnvSnippet({ apiKey: cfg.key, port: cfg.port, model: cfg.defaultModel });
@@ -807,6 +809,69 @@ function writeKeyFile(destination) {
     /* ignore */
   }
   console.log(target);
+}
+
+async function rulesCommand() {
+  const wantJson = rest.includes('--json');
+  const firstWord = rest.find((arg) => !arg.startsWith('--')) || '';
+  const sub = ['add', 'remove', 'rm', 'clear-learned'].includes(firstWord) ? firstWord : '';
+  if (sub === 'add') {
+    const at = rest.indexOf('add');
+    const value = rest.slice(at + 1).filter((arg) => !arg.startsWith('--')).join(' ').trim();
+    if (!value) {
+      console.error('Usage: deepseek rules add "<text>" [--category NAME]');
+      process.exit(1);
+    }
+    const catAt = rest.indexOf('--category');
+    const category = catAt >= 0 ? rest[catAt + 1] : undefined;
+    try {
+      const added = rules.addRule({ text: value, category });
+      if (wantJson) console.log(JSON.stringify(added, null, 2));
+      else if (added.duplicate) console.log(`Already stored: ${added.rule.id}`);
+      else console.log(`Added rule ${added.rule.id} (${rules.rulesSummary().count} total)`);
+    } catch (err) {
+      console.error(err?.message || String(err));
+      process.exit(1);
+    }
+    return;
+  }
+  if (sub === 'remove' || sub === 'rm') {
+    const at = rest.findIndex((arg) => arg === 'remove' || arg === 'rm');
+    const id = rest[at + 1];
+    if (!id) {
+      console.error('Usage: deepseek rules remove <id>');
+      process.exit(1);
+    }
+    const removed = rules.removeRule(id);
+    if (!removed.removed) {
+      console.error(`No rule ${id}.`);
+      process.exit(1);
+    }
+    console.log(`Removed rule ${id} (${removed.count} left)`);
+    return;
+  }
+  if (sub === 'clear-learned') {
+    const cleared = rules.clearLearned();
+    console.log(`Removed ${cleared.removed} learned rule(s); ${cleared.count} left.`);
+    return;
+  }
+  const cfg = loadConfig();
+  const list = rules.listRules();
+  const summary = rules.rulesSummary();
+  if (wantJson) {
+    console.log(JSON.stringify({ systemPreset: cfg.systemPreset, systemRules: cfg.systemRules, summary, rules: list }, null, 2));
+    return;
+  }
+  console.log(`deepseek-bridge rules  (preset: ${cfg.systemPreset || 'none'} · rules ${cfg.systemRules ? 'on' : 'off'})`);
+  console.log(`${summary.count} total · ${summary.builtin} builtin · ${summary.user} user · ${summary.learned} learned`);
+  console.log('');
+  for (const rule of list) {
+    const seen = rule.source === 'learned' ? ` seen ${rule.count}x` : '';
+    console.log(`  ${rule.id}  [${rule.source}${seen}] ${rule.text}`);
+  }
+  console.log('');
+  console.log(`Store: ${paths.RULES_FILE}`);
+  console.log('Add one with: deepseek rules add "<text>"');
 }
 
 async function versionCommand() {
@@ -1242,7 +1307,7 @@ Usage:
   deepseek status          Show the bridge and extension status
   deepseek ui              Open the web dashboard in a browser
   deepseek models          One line per model
-  deepseek models --info   Model details + pasteable OpenCode/OpenAI config snippets
+  deepseek models --info   Model details + pasteable dsh profile patch and env JSON
   deepseek chat "hello"    Send a chat message (starts the bridge if needed)
   deepseek "hello"         Shorthand for deepseek chat "hello"
   deepseek --login         Copy the chat.deepseek.com session from Chrome once
@@ -1252,6 +1317,11 @@ Usage:
   DEEPSEEK_TOKEN=<userToken> deepseek --login --manual
   deepseek --login --manual --token <userToken> --replace   Replace the account pool
   deepseek accounts        List stored DeepSeek accounts (unlimited; automatic rotation)
+  deepseek rules           Show the system-prompt preset and every rule
+  deepseek rules --json    Machine-readable rules
+  deepseek rules add "<text>" [--category NAME]
+  deepseek rules remove <id>
+  deepseek rules clear-learned   Drop auto-learned rules, keep builtin/user
   deepseek accounts --json Machine-readable account list (no tokens)
   deepseek accounts remove <id|index>
   deepseek accounts clear --yes   Remove every account and the legacy session file
@@ -1261,7 +1331,7 @@ Usage:
   deepseek update          Update a git checkout to GitHub main
   deepseek update --check  Check for an update without installing it
   deepseek key             Print the API key
-  deepseek key --file PATH Write the API key to a file (for OpenCode)
+  deepseek key --file PATH Write the API key to a 0600 file for another client
   deepseek extension       Print the absolute extension folder
   deepseek logs            Print the log path and the last lines
   deepseek help            Show this help
@@ -1346,6 +1416,8 @@ if (command === 'help') {
   }
   console.log(`  Dashboard: ${uiUrl}`);
   console.log('  Unlock with your API key (deepseek key).');
+} else if (command === 'rules') {
+  await rulesCommand();
 } else if (command === 'models') {
   modelsCommand();
 } else if (command === 'accounts') {

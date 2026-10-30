@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  dshProfileSnippet,
   formatAge,
   modelSummaryLines,
   openaiEnvSnippet,
-  opencodeProviderSnippet,
   shortKey,
   stripAnsi,
   truncate,
@@ -77,33 +77,34 @@ test('modelSummaryLines narrow width drops the description', () => {
   assert.ok(lines[0].includes('ctx'));
 });
 
-test('opencode snippet parses as JSON and mirrors the opencode.jsonc shape', () => {
-  const parsed = JSON.parse(opencodeProviderSnippet({
+test('dsh profile snippet is a profile patch with models under the bridge provider', () => {
+  const yaml = dshProfileSnippet({
     models: [{ id: 'deepseek-reasoner', context_window: 890880, max_output_tokens: 131072 }],
     port: 8787,
-  }));
-  const provider = parsed['deepseek-bridge'];
-  assert.equal(provider.name, 'DeepSeek Bridge');
-  assert.equal(provider.package, '@opencode/ai/providers/openai-compatible');
-  assert.equal(provider.settings.baseURL, 'http://127.0.0.1:8787/v1');
-  assert.match(provider.settings.apiKey, /^\{file:~\/\.config\/deepseek-bridge\/opencode\.key\}$/);
-  assert.equal(provider.compatibility.reasoningField, 'reasoning_content');
-  const model = provider.models['deepseek-reasoner'];
-  assert.equal(model.name, 'DeepSeek V4.1 Flash Reasoner (web)');
-  assert.equal(model.family, 'deepseek');
-  assert.equal(model.capabilities.tools, true);
-  assert.deepEqual(model.capabilities.input, ['text', 'image']);
-  assert.deepEqual(model.capabilities.output, ['text']);
-  assert.deepEqual(model.capabilities.reasoning.effort, ['low', 'high', 'max']);
-  assert.deepEqual(model.limit, { context: 890880, output: 131072 });
+    model: 'deepseek-reasoner',
+  });
+  assert.match(yaml, /^- id: llm-pi-ai$/m);
+  assert.match(yaml, /apiKeyEnv: DEEPSEEK_BRIDGE_KEY/);
+  assert.match(yaml, /baseURL: http:\/\/127\.0\.0\.1:8787\/v1/);
+  assert.match(yaml, /api: openai-completions/);
+  assert.match(yaml, /- id: deepseek-reasoner/);
+  assert.match(yaml, /name: DeepSeek V4.1 Flash Reasoner \(web\)/);
+  assert.match(yaml, /contextWindow: 890880/);
+  assert.match(yaml, /maxTokens: 131072/);
+  assert.match(yaml, /reasoningEfforts:/);
+  assert.match(yaml, /^- id: agent-default-model$/m);
+  assert.match(yaml, /provider: bridge/);
+  assert.match(yaml, /model: deepseek-reasoner/);
+  assert.match(yaml, /reasoningEffort: high/);
+  assert.doesNotMatch(yaml, /opencode/i);
 });
 
-test('opencode snippet inlines an explicit API key', () => {
-  const parsed = JSON.parse(opencodeProviderSnippet({ models: [], port: 9000, apiKey: 'sk-ds-test' }));
-  assert.equal(parsed['deepseek-bridge'].settings.apiKey, 'sk-ds-test');
-  assert.equal(parsed['deepseek-bridge'].settings.baseURL, 'http://127.0.0.1:9000/v1');
+test('dsh snippet honors an explicit port and default model', () => {
+  const yaml = dshProfileSnippet({ models: [], port: 9000, model: 'deepseek-search' });
+  assert.match(yaml, /127\.0\.0\.1:9000\/v1/);
+  assert.match(yaml, /model: deepseek-search/);
+  assert.match(yaml, /- id: deepseek-reasoner/);
 });
-
 test('env snippet parses as JSON with base URL, key and model', () => {
   const parsed = JSON.parse(openaiEnvSnippet({ apiKey: 'sk-ds-abc', port: 8787, model: 'deepseek-search' }));
   assert.equal(parsed.OPENAI_BASE_URL, 'http://127.0.0.1:8787/v1');

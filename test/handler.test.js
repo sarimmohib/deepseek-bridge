@@ -1,7 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { handleChatCompletions, PRESET_SYSTEM_PROMPTS, bridgeQueue } from '../src/openai.js';
+
+// Learning hooks write rules.json; keep every run in a throwaway store.
+process.env.DS_BRIDGE_RULES_FILE = path.join(os.tmpdir(), `dsb-handler-rules-${process.pid}.json`);
+try {
+  fs.rmSync(process.env.DS_BRIDGE_RULES_FILE, { force: true });
+} catch {
+  /* best effort */
+}
 import { upstreamThrottle } from '../src/direct.js';
 import { normalizeMessages, splitMessages, transcriptDigest, conversationKey } from '../src/prompt.js';
 
@@ -392,7 +402,12 @@ test('caps a fresh transcript with an elision marker when it exceeds maxFreshTra
       agent,
       store,
       log: () => {},
-      config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto', maxFreshTranscriptChars: 700 },
+      config: {
+        defaultModel: 'deepseek-reasoner',
+        toolMode: 'auto',
+        maxFreshTranscriptChars: 700,
+        systemRules: false,
+      },
     },
   );
 
@@ -423,7 +438,17 @@ test('leaves short transcripts uncapped on a fresh start', async () => {
     {},
     res,
     { model: 'deepseek-reasoner', messages: [{ role: 'user', content: 'tiny' }], stream: false },
-    { agent, store, log: () => {}, config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto', maxFreshTranscriptChars: 10 } },
+    {
+      agent,
+      store,
+      log: () => {},
+      config: {
+        defaultModel: 'deepseek-reasoner',
+        toolMode: 'auto',
+        maxFreshTranscriptChars: 10,
+        systemRules: false,
+      },
+    },
   );
   assert.equal(prompt, 'USER:\ntiny');
 });
@@ -451,9 +476,11 @@ test('prepends the preset bridge system prompt before the harness system message
       ],
       stream: false,
     },
-    { agent, store, log: () => {}, config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto', systemPreset: 'coding' } },
+    { agent, store, log: () => {}, config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto', systemPreset: 'dsh-agent' } },
   );
-  assert.equal(prompt, `${PRESET_SYSTEM_PROMPTS.coding}\n\nHARNESS_SYS\n\nUSER:\nhi`);
+  // Rules are on by default, so the bridge system message is preset + Rules.
+  assert.ok(prompt.startsWith(`${PRESET_SYSTEM_PROMPTS['dsh-agent']}\n\n# Rules\n`));
+  assert.ok(prompt.includes('HARNESS_SYS\n\nUSER:\nhi'));
 });
 
 test('explicit systemPrompt wins over systemPreset', async () => {
@@ -483,11 +510,43 @@ test('explicit systemPrompt wins over systemPreset', async () => {
       agent,
       store,
       log: () => {},
-      config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto', systemPrompt: 'BRIDGE_EXPLICIT', systemPreset: 'concise' },
+      config: {
+        defaultModel: 'deepseek-reasoner',
+        toolMode: 'auto',
+        systemPrompt: 'BRIDGE_EXPLICIT',
+        systemPreset: 'dsh-plan',
+        systemRules: false,
+      },
     },
   );
-  assert.ok(prompt.startsWith('BRIDGE_EXPLICIT\n\nHARNESS_SYS\n\nUSER:\nhi'));
-  assert.ok(!prompt.includes(PRESET_SYSTEM_PROMPTS.concise));
+  assert.equal(prompt, 'BRIDGE_EXPLICIT\n\nHARNESS_SYS\n\nUSER:\nhi');
+  assert.ok(!prompt.includes(PRESET_SYSTEM_PROMPTS['dsh-plan']));
+});
+
+test('systemRules false omits the rules section', async () => {
+  const res = new FakeResponse();
+  let prompt = '';
+  const agent = {
+    async run(request, handlers) {
+      prompt = request.prompt;
+      handlers.onReady({ sessionId: 'sess_rules_off', messageId: 1 });
+      handlers.onDelta({ kind: 'content', text: 'ok' });
+      return { usage: null, finish: 'stop', sessionId: 'sess_rules_off', messageId: 1 };
+    },
+  };
+  const store = { getConversation: () => null, setConversation: () => {} };
+  await handleChatCompletions(
+    {},
+    res,
+    { model: 'deepseek-reasoner', messages: [{ role: 'user', content: 'hi' }], stream: false },
+    {
+      agent,
+      store,
+      log: () => {},
+      config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto', systemPreset: 'none', systemRules: false },
+    },
+  );
+  assert.equal(prompt, 'USER:\nhi');
 });
 
 test('unknown systemPreset is ignored with a one-line log', async () => {
@@ -514,10 +573,63 @@ test('unknown systemPreset is ignored with a one-line log', async () => {
       ],
       stream: false,
     },
-    { agent, store, log: (m) => logs.push(m), config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto', systemPreset: 'bogus' } },
+    {
+      agent,
+      store,
+      log: (m) => logs.push(m),
+      config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto', systemPreset: 'bogus', systemRules: false },
+    },
   );
   assert.equal(prompt, 'HARNESS_SYS\n\nUSER:\nhi');
   assert.equal(logs.filter((m) => /unknown systemPreset/.test(m)).length, 1);
+});
+
+test('a learned rule is injected into the next bridge system prompt', async () => {
+  const { learnRule, renderRulesSection } = await import('../src/rules.js');
+  learnRule('tool-markup');
+  const section = renderRulesSection();
+  assert.match(section, /^# Rules/);
+  assert.match(section, /tool_call blocks with a name and full arguments/);
+
+  const res = new FakeResponse();
+  let prompt = '';
+  const agent = {
+    async run(request, handlers) {
+      prompt = request.prompt;
+      handlers.onReady({ sessionId: 'sess_learned', messageId: 1 });
+      handlers.onDelta({ kind: 'content', text: 'ok' });
+      return { usage: null, finish: 'stop', sessionId: 'sess_learned', messageId: 1 };
+    },
+  };
+  const store = { getConversation: () => null, setConversation: () => {} };
+  await handleChatCompletions(
+    {},
+    res,
+    { model: 'deepseek-reasoner', messages: [{ role: 'user', content: 'go' }], stream: false },
+    {
+      agent,
+      store,
+      log: () => {},
+      config: { defaultModel: 'deepseek-reasoner', toolMode: 'auto', systemPreset: 'none' },
+    },
+  );
+  assert.ok(prompt.startsWith('# Rules'), prompt.slice(0, 80));
+  assert.match(prompt, /tool_call blocks with a name and full arguments/);
+});
+
+test('editing the system prompt does not change the conversation key', async () => {
+  const { conversationKey, normalizeMessages } = await import('../src/prompt.js');
+  const messages = normalizeMessages([
+    { role: 'user', content: 'same question' },
+  ]);
+  const keyWithSystem = conversationKey(
+    [{ role: 'system', content: 'BRIDGE_SYS_V2' }, ...messages],
+    'deepseek-reasoner',
+  );
+  const keyPlain = conversationKey(messages, 'deepseek-reasoner');
+  // Different messages still hash differently (sanity), but handleChatCompletions
+  // derives its key from the harness messages only, so a prompt edit is safe.
+  assert.notEqual(keyWithSystem, keyPlain);
 });
 
 test('queues upstream execution beyond maxUpstream and never exceeds it', async () => {

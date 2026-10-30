@@ -301,7 +301,7 @@ function scheduleFlush() {
   if (flushTimer) return;
   flushTimer = setTimeout(() => {
     flushTimer = null;
-    flushAccounts();
+    safeFlushAccounts();
   }, FLUSH_DELAY_MS);
   flushTimer.unref?.();
   if (!exitHandlerInstalled) {
@@ -328,6 +328,15 @@ export function flushAccounts() {
   if (!pending.size) return;
   commit(readDisk().map(effectiveAccount));
   pending.clear();
+}
+
+// Timer-safe variant: swallow failures and keep the pending set for a retry.
+function safeFlushAccounts() {
+  try {
+    flushAccounts();
+  } catch {
+    /* retried on the next scheduleFlush */
+  }
 }
 
 function withPendingWrite(mutate) {

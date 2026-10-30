@@ -2,13 +2,12 @@
  * Model catalog helpers: `deepseek models` / `deepseek models --info`.
  *
  * modelSummaryLines/modelDetailLines render the CLI table; the snippet
- * builders produce pasteable harness config that mirrors the working
- * ~/.config/opencode/opencode.jsonc entry (same key order and shape).
- * No npm packages.
+ * builders produce pasteable config for DeepSeek Harness (dsh) and for any
+ * generic OpenAI-compatible client. No npm packages.
  */
 import { MODELS } from './openai.js';
 
-const OPENCODE_MODEL_NAMES = {
+const HARNESS_MODEL_NAMES = {
   'deepseek-reasoner': 'DeepSeek V4.1 Flash Reasoner (web)',
   'deepseek-search': 'DeepSeek V4.1 Flash Search (web)',
 };
@@ -255,46 +254,49 @@ export function buildFrame(data = {}, width = 100, now = Date.now()) {
 // ------------------------------------------------------------ snippets
 
 /**
- * OpenCode provider snippet mirroring the "deepseek-bridge" entry in
- * ~/.config/opencode/opencode.jsonc exactly (same key order and shape).
- * Returns a JSON string. `apiKey` defaults to the {file:...} reference the
- * existing entry uses; pass a key to inline it.
+ * DeepSeek Harness (dsh) profile patch as YAML. This is the block a user
+ * pastes into ~/.dsh/profiles/web/cordis.patch.yml: one provider entry named
+ * "bridge" plus the default-model selection. apiKeyEnv keeps the bridge key
+ * out of the file (export DEEPSEEK_BRIDGE_KEY in the shell profile).
  */
-export function opencodeProviderSnippet({ models = MODELS, port = 8787, apiKey = null } = {}) {
-  const provider = {
-    name: 'DeepSeek Bridge',
-    package: '@opencode/ai/providers/openai-compatible',
-    settings: {
-      baseURL: `http://127.0.0.1:${port}/v1`,
-      apiKey: apiKey || '{file:~/.config/deepseek-bridge/opencode.key}',
-    },
-    compatibility: {
-      reasoningField: 'reasoning_content',
-    },
-    models: {},
-  };
-  for (const m of Array.isArray(models) ? models : []) {
-    provider.models[String(m?.id ?? '')] = {
-      name: OPENCODE_MODEL_NAMES[m?.id] || String(m?.id ?? ''),
-      family: 'deepseek',
-      capabilities: {
-        tools: true,
-        input: ['text', 'image'],
-        output: ['text'],
-        reasoning: {
-          supported: true,
-          effort: ['low', 'high', 'max'],
-        },
-      },
-      limit: {
-        context: Number.isFinite(Number(m?.context_window)) ? Number(m.context_window) : 890880,
-        output: Number.isFinite(Number(m?.max_output_tokens)) ? Number(m.max_output_tokens) : 131072,
-      },
-    };
+export function dshProfileSnippet({ models = MODELS, port = 8787, model = 'deepseek-reasoner' } = {}) {
+  const list = Array.isArray(models) && models.length ? models : MODELS;
+  const out = [
+    '- id: llm-pi-ai',
+    '  config:',
+    '    providers:',
+    '      bridge:',
+    '        apiKeyEnv: DEEPSEEK_BRIDGE_KEY',
+    '        baseURL: http://127.0.0.1:' + port + '/v1',
+    '        api: openai-completions',
+    '        models:',
+  ];
+  for (const entry of list) {
+    const id = String(entry?.id ?? '');
+    if (!id) continue;
+    out.push('          - id: ' + id);
+    out.push('            name: ' + (HARNESS_MODEL_NAMES[id] || id));
+    out.push(
+      '            contextWindow: ' +
+        (Number.isFinite(Number(entry?.context_window)) ? Number(entry.context_window) : 890880),
+    );
+    out.push(
+      '            maxTokens: ' +
+        (Number.isFinite(Number(entry?.max_output_tokens)) ? Number(entry.max_output_tokens) : 131072),
+    );
+    out.push('            reasoningEfforts:');
+    out.push('              off:');
+    out.push('              low: low');
+    out.push('              high: high');
+    out.push('              max: max');
   }
-  return JSON.stringify({ 'deepseek-bridge': provider }, null, 2);
+  out.push('- id: agent-default-model');
+  out.push('  config:');
+  out.push('    provider: bridge');
+  out.push('    model: ' + (model || 'deepseek-reasoner'));
+  out.push('    reasoningEffort: high');
+  return out.join(String.fromCharCode(10)) + String.fromCharCode(10);
 }
-
 /**
  * Generic OpenAI-compatible harness config as a JSON string — the three env
  * vars any OpenAI client needs against the bridge.

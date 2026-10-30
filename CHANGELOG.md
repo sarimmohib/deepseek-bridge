@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.9.0
+
+- **DeepSeek Harness only.** OpenCode support surfaces are gone: the
+  `opencodeProviderSnippet` export, the README OpenCode section and
+  `opencode.key` hints, and the dashboard "Copy OpenCode config" button. The
+  OpenAI-compatible Chat Completions API and the Chrome-extension fallback
+  stay. Docs now describe dsh as the supported harness (Hermes/ZCode doc
+  sections removed).
+- **System prompt focus.** `systemPreset` now defaults to `dsh-agent` and the
+  presets are dsh-tuned: `dsh-agent`, `dsh-plan`, `dsh-tool`, and `none`.
+  `systemPrompt` still wins when set.
+- **Rules with automatic learning.** New `src/rules.js` stores builtin, user,
+  and learned rules in `rules.json` (`0600`, `DS_BRIDGE_RULES_FILE` override)
+  and appends them to the bridge system message as a `# Rules` section
+  (`systemRules`, on by default, 2,400-char budget). Six builtin rules ship
+  (tool-call format, parallel calls, no invented results, no partial/empty
+  markup, complete edits, verify before claiming success). When the bridge
+  recovers from a repeatable failure — malformed tool markup with no call, a
+  degenerate DSML wall, or an empty reply — it records a learned rule (deduped
+  with a seen count) so the next turn is told not to repeat it.
+  - CLI: `deepseek rules`, `--json`, `add "<text>"`, `remove <id>`,
+    `clear-learned`.
+  - API: `GET/POST/DELETE /v1/bridge/rules`,
+    `DELETE /v1/bridge/rules/:id`, `DELETE /v1/bridge/rules?learned=1`.
+  - Dashboard: a "System prompt & rules" panel (source badges, seen counts,
+    add/remove, clear learned).
+- **Prompt edits no longer reset conversations.** The conversation key is
+  computed from the harness messages before the bridge system message is
+  prepended, so editing `systemPrompt`, switching `systemPreset`, or changing
+  a rule continues the stored DeepSeek session instead of orphaning it.
+- **`deepseek models --info`** prints the dsh profile patch
+  (`~/.dsh/profiles/web/cordis.patch.yml`) plus the generic
+  OpenAI-compatible env JSON; the dashboard model cards copy the dsh patch.
+- **Fixed: the bridge could terminate with exit 1 and no log line.**
+  `Store.flush()` runs from `setInterval`; a failed write (read-only config
+  dir, full disk, Windows `EPERM`/`EBUSY` on rename) threw inside the timer,
+  which is an uncaught exception and killed the process. Writes now retry
+  renames and fall back to an in-place write, `flush()` records
+  `lastFlushError` and stays dirty for the next tick instead of throwing,
+  account-pool flush failures are swallowed and retried, and the daemon
+  installs `uncaughtException`/`unhandledRejection` handlers that log to
+  `bridge.log` and keep serving.
+- **Fixed: startup crash from a bad port.** `--port abc` persisted
+  `Number('abc')` (= NaN, serialized as `null`) and the next start called
+  `server.listen(NaN)` -> `ERR_SOCKET_BAD_PORT`. `--port` is validated
+  (integer 1-65535, exit 2 with a clear message) and a stored invalid port
+  falls back to 8787 instead of throwing.
+- Version 0.9.0 (package.json and extension/manifest.json).
 ## 0.8.0
 
 - **Multiple DeepSeek accounts with automatic rotation.** The single

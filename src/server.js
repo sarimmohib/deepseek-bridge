@@ -5,7 +5,15 @@ import crypto from 'node:crypto';
 import { attachWebSocket, WsConnection } from './ws.js';
 import { Agent, BridgeError } from './agent.js';
 import { DirectClient } from './direct.js';
-import { handleChatCompletions, sendError, MODELS, bridgeQueue, clampMaxUpstream } from './openai.js';
+import {
+  handleChatCompletions,
+  sendError,
+  MODELS,
+  PRESET_SYSTEM_PROMPTS,
+  bridgeQueue,
+  clampMaxUpstream,
+} from './openai.js';
+import * as rules from './rules.js';
 import { dashboardHtml } from './dashboard.js';
 import { sessionSummary } from './session.js';
 import * as accounts from './accounts.js';
@@ -275,6 +283,69 @@ export function createServer({ config, store, log = () => {}, direct: directClie
         return;
       }
 
+      // ---- System prompt rules
+      // The bridge prepends a dsh-tuned preset plus a rules section to every
+      // request. Rules are builtin defaults, user additions, and learned
+      // entries recorded when a repeatable failure was detected.
+      if (url.pathname === '/v1/bridge/rules' && req.method === 'GET') {
+        json(res, 200, {
+          ok: true,
+          systemPreset: typeof config.systemPreset === 'string' ? config.systemPreset : 'dsh-agent',
+          systemRules: config.systemRules !== false,
+          systemPromptSet: typeof config.systemPrompt === 'string' && config.systemPrompt.trim().length > 0,
+          presets: Object.keys(PRESET_SYSTEM_PROMPTS),
+          summary: rules.rulesSummary(),
+          rules: rules.listRules(),
+        });
+        return;
+      }
+
+      if (url.pathname === '/v1/bridge/rules' && req.method === 'POST') {
+        let body;
+        try {
+          body = await readJsonBody(req);
+        } catch (err) {
+          sendError(res, 400, err?.message || 'Body is not valid JSON', err?.code || 'invalid_json');
+          return;
+        }
+        const ruleText = typeof body?.text === 'string' ? body.text : '';
+        try {
+          const added = rules.addRule({
+            text: ruleText,
+            category: typeof body?.category === 'string' ? body.category : 'user',
+          });
+          json(res, 200, { ok: true, rule: added.rule, duplicate: added.duplicate, count: added.count });
+        } catch (err) {
+          sendError(res, 400, err?.message || 'Could not add the rule.', 'invalid_rule');
+        }
+        return;
+      }
+
+      if (url.pathname.startsWith('/v1/bridge/rules/') && req.method === 'DELETE') {
+        const id = decodeURIComponent(url.pathname.slice('/v1/bridge/rules/'.length));
+        if (!id) {
+          sendError(res, 400, 'A rule id is required.', 'invalid_rule_id');
+          return;
+        }
+        const removed = rules.removeRule(id);
+        if (!removed.removed) {
+          sendError(res, 404, 'No rule ' + id + '.', 'not_found');
+          return;
+        }
+        json(res, 200, { ok: true, removed: id, count: removed.count });
+        return;
+      }
+
+      if (url.pathname === '/v1/bridge/rules' && req.method === 'DELETE') {
+        if (url.searchParams.get('learned') === '1') {
+          const cleared = rules.clearLearned();
+          json(res, 200, { ok: true, removed: cleared.removed, count: cleared.count });
+          return;
+        }
+        sendError(res, 400, 'Pass the learned=1 query parameter to clear learned rules, or DELETE one rule by id.', 'invalid_request');
+        return;
+      }
+
       if (url.pathname === '/v1/bridge/session/token' && req.method === 'GET') {
         // Auth-gated like every other route: hands out the primary DeepSeek
         // login token so the dashboard can copy it or another device can run
@@ -321,7 +392,13 @@ export function createServer({ config, store, log = () => {}, direct: directClie
             connections: agent.connections.size,
             lastHello: agent.lastHello,
           },
-          config: { port: config.port, host: config.host, model: config.defaultModel },
+          config: {
+            port: config.port,
+            host: config.host,
+            model: config.defaultModel,
+            systemPreset: typeof config.systemPreset === 'string' ? config.systemPreset : 'dsh-agent',
+            systemRules: config.systemRules !== false,
+          },
           capabilities: {
             vision: true,
             files: true,

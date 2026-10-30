@@ -10,7 +10,7 @@ normal requests.
 ```text
 ┌──────────────────┐   OpenAI HTTP + SSE   ┌──────────────────────┐
 │ terminal / agent │ ────────────────────► │  deepseek-bridge     │
-│ SDK / ZCode      │ ◄──────────────────── │  127.0.0.1:8787      │
+│ dsh / SDK        │ ◄──────────────────── │  127.0.0.1:8787      │
 └──────────────────┘                       └──────────┬───────────┘
                                                       │ HTTPS + cookies
                                                       │ + PoW
@@ -37,7 +37,7 @@ mode.
 - **Transient-failure recovery:** network errors, server-busy replies, WAF
   challenges, and truncated SSE streams are retried; an interrupted reply is
   resumed with DeepSeek's continue endpoint and de-duplicated.
-- **OpenCode provider:** a ready-to-use `deepseek-bridge/*` provider config.
+- **dsh-first:** a ready-to-paste DeepSeek Harness profile patch (`deepseek models --info`) plus a dsh-tuned system prompt with learned rules.
 - **Versioned self-update:** `deepseek version` checks GitHub, and
   `deepseek update` fast-forwards a clean git checkout.
 - OpenAI-compatible `POST /v1/chat/completions`, streaming and non-streaming.
@@ -411,10 +411,15 @@ Direct mode takes precedence whenever the account pool is non-empty.
 | `deepseek --repl` | Interactive chat |
 | `deepseek key` | Print the API key |
 | `deepseek key --file PATH` | Write the API key to a `0600` file for another client |
+| `deepseek rules` | Show the system-prompt preset and every rule (builtin, user, learned) |
+| `deepseek rules --json` | Machine-readable rules plus the active preset |
+| `deepseek rules add "<text>" [--category NAME]` | Add a user rule injected into every bridge prompt |
+| `deepseek rules remove <id>` | Remove one rule by id |
+| `deepseek rules clear-learned` | Drop auto-learned rules, keep builtin and user rules |
 | `deepseek extension` | Print the absolute extension folder |
 | `deepseek logs` | Print the log path and the last 40 lines |
 | `deepseek models` | One line per advertised model |
-| `deepseek models --info` | Model details plus pasteable OpenCode/OpenAI harness config |
+| `deepseek models --info` | Model details, a pasteable dsh profile patch, and generic OpenAI-compatible env JSON |
 | `deepseek help` | Show help |
 
 Start options are passed through:
@@ -446,8 +451,10 @@ your browser's localStorage and sent only to the bridge). Panels:
 - **Header** — version, mode, base URL, and the upstream queue
   (`active/queued/max`); refreshes every few seconds.
 - **Models** — the advertised models with context/output limits and a
-  "Copy OpenCode config" button that mirrors the working
-  `~/.config/opencode/opencode.jsonc` entry.
+  "Copy dsh config" button that produces the DeepSeek Harness profile patch.
+- **System prompt & rules** — the active preset, whether rules are on, every
+  builtin/user/learned rule (with a seen count for learned ones), an add-rule
+  form, and "Clear learned".
 - **Accounts** — every stored account with id, label, cookie count,
   ready/cooling state, throttle hits and last use; per-row delete, an add-token
   form (the bridge verifies the token before keeping it) and a double-confirm
@@ -512,94 +519,72 @@ restart.
 | `contextSwitchAt` | `0.8` | Fraction of the model context window after which a conversation restarts fresh |
 | `maxFreshTranscriptChars` | `200000` | Cap for transcripts replayed into a fresh session |
 | `maxUpstream` | `2` | Maximum simultaneous DeepSeek requests; extras queue FIFO. Measured: DeepSeek starts returning empty replies above ~2 parallel generations per account |
-| `systemPrompt` | empty | Bridge-provided system prompt, prepended to every request |
-| `systemPreset` | empty | Named preset instead of `systemPrompt`: `coding`, `concise`, `tutor`, `agent` |
+| `systemPrompt` | empty | Exact bridge system prompt, prepended to every request (wins over the preset) |
+| `systemPreset` | `dsh-agent` | Named preset used when `systemPrompt` is empty: `dsh-agent`, `dsh-plan`, `dsh-tool`, or `none` |
+| `systemRules` | `true` | Append the Rules section (builtin + user + learned) to the bridge system message |
 
 A running bridge is restarted only after a successful update. The command itself
 is still the old process for that invocation; the next invocation and the
 restarted bridge use the new code.
 
-## OpenCode
+## DeepSeek Harness (dsh)
 
-OpenCode V2 can use the bridge as a normal OpenAI-compatible custom provider.
-Start the bridge first, then export its key to a private file:
+DeepSeek Harness is the supported harness. Install it with
+`npm install -g @deepseek-ai/dsh` (allow its native-build scripts), start the
+bridge, and point a dsh provider at it:
 
 ```bash
 deepseek
-deepseek key --file ~/.config/deepseek-bridge/opencode.key
+export DEEPSEEK_BRIDGE_KEY="$(deepseek key)"
 ```
 
-Add this to `~/.config/opencode/opencode.jsonc` (the file is normally mode
-`0600`; never commit the key):
+Add this block to `~/.dsh/profiles/web/cordis.patch.yml` (or let
+`deepseek models --info` print it):
 
-```jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "providers": {
-    "deepseek-bridge": {
-      "name": "DeepSeek Bridge",
-      "package": "@opencode/ai/providers/openai-compatible",
-      "settings": {
-        "baseURL": "http://127.0.0.1:8787/v1",
-        "apiKey": "{file:~/.config/deepseek-bridge/opencode.key}"
-      },
-      "compatibility": {
-        "reasoningField": "reasoning_content"
-      },
-      "models": {
-        "deepseek-reasoner": {
-          "name": "DeepSeek V4.1 Flash Reasoner (web)",
-          "family": "deepseek",
-          "capabilities": {
-            "tools": true,
-            "input": ["text", "image"],
-            "output": ["text"],
-            "reasoning": {
-              "supported": true,
-              "effort": ["low", "high", "max"]
-            }
-          },
-          "limit": { "context": 890880, "output": 131072 }
-        },
-        "deepseek-search": {
-          "name": "DeepSeek V4.1 Flash Search (web)",
-          "family": "deepseek",
-          "capabilities": {
-            "tools": true,
-            "input": ["text", "image"],
-            "output": ["text"],
-            "reasoning": {
-              "supported": true,
-              "effort": ["low", "high", "max"]
-            }
-          },
-          "limit": { "context": 890880, "output": 131072 }
-        }
-      }
-    }
-  }
-}
+```yaml
+- id: llm-pi-ai
+  config:
+    providers:
+      bridge:
+        apiKeyEnv: DEEPSEEK_BRIDGE_KEY
+        baseURL: http://127.0.0.1:8787/v1
+        api: openai-completions
+        models:
+          - id: deepseek-reasoner
+            name: DeepSeek V4.1 Flash Reasoner (web)
+            contextWindow: 890880
+            maxTokens: 131072
+            reasoningEfforts:
+              off:
+              low: low
+              high: high
+              max: max
+          - id: deepseek-search
+            name: DeepSeek V4.1 Flash Search (web)
+            contextWindow: 890880
+            maxTokens: 131072
+            reasoningEfforts:
+              off:
+              low: low
+              high: high
+              max: max
+- id: agent-default-model
+  config:
+    provider: bridge
+    model: deepseek-reasoner
+    reasoningEffort: high
 ```
 
-Both models use the same provider. Verify and use it:
+`apiKeyEnv` keeps the key out of the file. The patch ids are the profile short
+slugs (`llm-pi-ai`), not package names, and `reasoningEfforts` maps each level
+to the wire spelling. Boot `dsh web` and the model picker shows the bridge
+models.
 
-```bash
-opencode models | grep deepseek-bridge
-opencode run --model deepseek-bridge/deepseek-reasoner "Reply with exactly: OK"
-```
-
-Select it for an interactive session with `/models`, or make it the default for
-new sessions:
-
-```jsonc
-{
-  "model": "deepseek-bridge/deepseek-reasoner"
-}
-```
-
-If the bridge chose a different port because 8787 was busy, change
-`settings.baseURL` to match the URL printed by `deepseek status`. The bridge
-must be running; it is not started by OpenCode automatically.
+The bridge also speaks plain OpenAI Chat Completions, so any other
+OpenAI-compatible client can point at `http://127.0.0.1:8787/v1` with the
+`deepseek key` key and model `deepseek-reasoner` or `deepseek-search`. If the
+bridge chose a different port, use the URL from `deepseek status`; dsh does not
+start the bridge for you.
 
 ## API
 
@@ -679,7 +664,7 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-Works with the OpenAI SDKs, LiteLLM, Continue, Aider, ZCode, or a local agent
+Works with DeepSeek Harness (dsh), the OpenAI SDKs, LiteLLM, or a local agent
 loop.
 
 ### Models
@@ -719,9 +704,9 @@ deepseek models --info   # details plus pasteable harness configuration
 ```
 
 `--info` prints each model's description and limits, then ready-to-paste
-configuration: an OpenCode provider JSON block that mirrors the working entry
-from the [OpenCode](#opencode) section, and a generic OpenAI-compatible env
-block for any other client. The output has this shape:
+configuration: the DeepSeek Harness profile patch from the
+[dsh section](#deepseek-harness-dsh), and a generic OpenAI-compatible env block
+for any other client. The output has this shape:
 
 ```text
 deepseek-bridge models  (default: deepseek-reasoner)
@@ -733,15 +718,22 @@ API key    sk-ds-...
     context_window     890,880
     max_output_tokens  131,072
 
-OpenCode provider snippet (paste under "providers" in ~/.config/opencode/opencode.jsonc):
-{
-  "deepseek-bridge": {
-    "name": "DeepSeek Bridge",
-    "package": "@opencode/ai/providers/openai-compatible",
-    "settings": { "baseURL": "http://127.0.0.1:8787/v1", ... },
-    "models": { "deepseek-reasoner": { ... }, "deepseek-search": { ... } }
-  }
-}
+DeepSeek Harness (dsh) profile patch (paste into ~/.dsh/profiles/web/cordis.patch.yml):
+- id: llm-pi-ai
+  config:
+    providers:
+      bridge:
+        apiKeyEnv: DEEPSEEK_BRIDGE_KEY
+        baseURL: http://127.0.0.1:8787/v1
+        api: openai-completions
+        models:
+          - id: deepseek-reasoner
+            ...
+- id: agent-default-model
+  config:
+    provider: bridge
+    model: deepseek-reasoner
+    reasoningEffort: high
 
 Generic OpenAI-compatible env (JSON):
 {
@@ -814,19 +806,72 @@ so huge histories elide instead of failing.
 turns, input/output/session token counts, a preview, and the upstream queue
 state (same auth as the other bridge endpoints).
 
-### System prompts
+### System prompts and rules
 
-The bridge can prepend its own system message to every request. Two keys in
-`~/.config/deepseek-bridge/config.json`:
+The bridge prepends its own system message to every request. It is sent as a
+separate system message before the harness's own, so dsh's prompt is kept
+verbatim — nothing is deduped or rewritten. Three keys in
+`~/.config/deepseek-bridge/config.json` control it:
 
-- `"systemPrompt": "..."` — exact text, sent verbatim.
-- `"systemPreset"` — one of `coding`, `concise`, `tutor`, or `agent`.
+- `"systemPrompt": "..."` — exact text, sent verbatim. Always wins.
+- `"systemPreset"` — used when `systemPrompt` is empty. Defaults to
+  `dsh-agent`; also `dsh-plan` (plan first, then act), `dsh-tool` (precise
+  tool use), or `none` (no preset).
+- `"systemRules": true` — append the Rules section described below. Defaults
+  to `true`.
 
-An explicit `systemPrompt` wins over a `systemPreset`; an unknown preset name
-is ignored with a one-line log. The bridge message is prepended as an extra
-system message: the harness's own system message is kept verbatim, nothing is
-deduped or rewritten. The config file is re-read per request, so edits apply on
-the next request without restarting the bridge.
+An unknown preset name is ignored with a one-line log. The config file is
+re-read per request, so edits apply on the next request without restarting the
+bridge.
+
+**Editing the prompt does not reset conversations.** The stored-conversation
+key is computed from the harness's own messages (model, harness system
+message, first user turn) *before* the bridge system message is prepended. So
+changing `systemPrompt`, switching presets, or editing a rule changes what the
+model is told on the next turn while the existing DeepSeek session continues.
+
+### Rules
+
+Rules are short, model-facing instructions kept in
+`~/.config/deepseek-bridge/rules.json` (`0600`; override the path with
+`DS_BRIDGE_RULES_FILE`). When `systemRules` is on, they are appended to the
+bridge system message under a `# Rules` heading, capped at 2,400 characters.
+The full rule text, triggers, and design constraints live in
+[RULES.md](RULES.md); `src/rules.js` holds the shipped defaults.
+Three sources share the store:
+
+- **builtin** — six shipped rules covering the bridge's repeatable failure
+  modes: the fenced `tool_call` block format, one JSON array for parallel
+  calls, never inventing a tool result, never emitting partial or empty
+  DSML/markup, complete file edits, and verifying before claiming success.
+  Seeded on first read; deleting one is respected (it is not re-seeded).
+- **user** — added by hand (320 characters max, 24 rules total).
+- **learned** — recorded automatically when the bridge detects a repeatable
+  failure it already has to recover from: tool markup that contained no
+  complete call (stripped), a degenerate DSML wall (session dropped), or an
+  empty reply. Identical failures are deduped and counted, and the least-seen
+  learned rule is evicted past 12.
+
+The point of learning is that the same mistake is not repeated on the next
+turn: the rule is injected into the prompt before the model answers again.
+
+```bash
+deepseek rules                        # table: id, source, seen count, text
+deepseek rules --json                 # machine-readable, includes the preset
+deepseek rules add "Always run the tests" --category verify
+deepseek rules remove <id>
+deepseek rules clear-learned          # drop learned, keep builtin/user
+```
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/v1/bridge/rules` | Active preset, whether rules are on, and every rule |
+| `POST` | `/v1/bridge/rules` | Add a user rule: `{text, category?}` |
+| `DELETE` | `/v1/bridge/rules/:id` | Remove one rule (builtin included) |
+| `DELETE` | `/v1/bridge/rules?learned=1` | Drop every learned rule |
+
+The web dashboard shows the same list with source badges and lets you add or
+remove rules and clear learned ones.
 
 ### Tool calling
 
@@ -857,25 +902,6 @@ tool calls out of the answer into real OpenAI `tool_calls`:
 Finish reason becomes `tool_calls`. `tool_choice: "none"` skips the preamble;
 `"required"` or a specific function adds a must-call instruction.
 
-### Using it from ZCode
-
-ZCode → **Model settings** → **Add provider**, then:
-
-| Field | Value |
-| --- | --- |
-| Base URL | `http://127.0.0.1:8787/v1` |
-| API format | **Chat completions (`/chat/completions`)** — not Anthropic |
-| API key | the `sk-ds-…` key from `deepseek key` |
-| Model ID | `deepseek-reasoner` (add `deepseek-search` as a second model) |
-| Context window | `890880` |
-| Max output tokens | `65536` (the model supports more; the web session caps it server-side) |
-| Input types | **Text + Image** (add PDF/file if your client supports it) |
-| Capabilities | leave structured output / native search / mid-conversation system messages off |
-
-Tool calls work through the emulation above (parallel calls supported), and
-multi-turn agent loops reuse the same DeepSeek session. In direct mode you no
-longer need a signed-in tab; in extension mode keep one open.
-
 ### Agent swarms
 
 Multiple harness agents can share one bridge. Each conversation key
@@ -896,61 +922,6 @@ Empty replies inside that window are retried on a dedicated 3s/9s/20s/35s
 backoff, so short windows are absorbed invisibly; a deep window surfaces a
 clean retriable `empty_reply` 502. After a heavy burst, give the account a
 few quiet minutes (or pace the swarm) before the next sustained load.
-
-## Agent harnesses
-
-The bridge speaks plain OpenAI Chat Completions, so any harness can point at
-`http://127.0.0.1:8787/v1` with the API key (`deepseek key`) and model
-`deepseek-reasoner` / `deepseek-search`.
-
-- **DeepSeek Harness (`dsh`)** — <https://github.com/deepseek-ai/deepseek-harness>.
-  Install with `npm install -g @deepseek-ai/dsh` (allow its native-build
-  scripts), then patch `~/.dsh/profiles/web/cordis.patch.yml`:
-
-  ```yaml
-  - id: llm-pi-ai
-    config:
-      providers:
-        bridge:
-          apiKeyEnv: DEEPSEEK_BRIDGE_KEY
-          baseURL: http://127.0.0.1:8787/v1
-          api: openai-completions
-          models:
-            - id: deepseek-reasoner
-              name: DeepSeek Reasoner (bridge)
-              contextWindow: 890880
-              maxTokens: 131072
-              reasoningEfforts:
-                off:
-                low: low
-                high: high
-                max: max
-  - id: agent-default-model
-    config:
-      provider: bridge
-      model: deepseek-reasoner
-      reasoningEffort: high
-  ```
-
-  Export `DEEPSEEK_BRIDGE_KEY` in your shell profile, boot `dsh web`, and the
-  model picker shows "DeepSeek Reasoner (bridge)". Note `reasoningEfforts`
-  maps each level to the wire spelling (empty strings are rejected at
-  runtime), and the patch ids are the profile's short slugs (`llm-pi-ai`),
-  not package names.
-
-- **Hermes agent** — <https://github.com/NousResearch/hermes-agent>.
-  Install with `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash`,
-  then in `~/.hermes/config.yaml`:
-
-  ```yaml
-  model:
-    default: "deepseek-reasoner"
-    provider: "custom"
-    base_url: "http://127.0.0.1:8787/v1"
-    api_key: "<bridge key>"
-  ```
-
-  `hermes -z "prompt"` sends a one-shot message; `hermes` starts the TUI.
 
 ## How it works
 
@@ -1064,7 +1035,7 @@ The suite covers the PoW vector, account-pool storage and rotation (per-account
 cool-downs, migration, redaction), the accounts REST API, session storage and
 cookie filtering, prompt/tool parsing, the streaming guard, semantic version
 comparison and the GitHub version fetch, and a full HTTP replay of every
-accepted tool-call format, including the failing ZCode rollout payloads and the
+accepted tool-call format, including the captured failing-rollout payloads and the
 empty-DSML loop.
 
 End-to-end harness (throwaway Chrome profile; it injects a token into

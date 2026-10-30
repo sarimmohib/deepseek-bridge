@@ -16,6 +16,7 @@ import {
 import { BridgeError } from './agent.js';
 import { buildParamToolIndex } from './prompt.js';
 import { noteUpstreamThrottleEvent, upstreamCooldownMs } from './direct.js';
+import { learnRule, renderRulesSection } from './rules.js';
 
 export const MODELS = [
   {
@@ -38,14 +39,13 @@ export const MODELS = [
 
 /** Bridge-provided system presets, applied when config.systemPreset names one. */
 export const PRESET_SYSTEM_PROMPTS = {
-  coding:
-    'You are a focused coding assistant. Produce concise, correct code. Prefer complete, runnable solutions over prose. State an assumption only when it changes the outcome. No filler and no restating the question.',
-  concise:
-    'Answer as briefly as possible while staying correct and complete. No preamble, no filler, no restating the question.',
-  tutor:
-    'You are a patient tutor. Explain step by step, building from what the user likely already knows. Define terms when first used, show your reasoning, and close with a short summary or a check of understanding.',
-  agent:
-    'You are an autonomous tool-using coding agent. Be decisive: pick the most reasonable approach and act on it. State your assumptions explicitly, verify your work, and never emit partial or hypothetical tool calls — only complete, executable ones.',
+  'dsh-agent':
+    'You are the model behind DeepSeek Harness (dsh), an autonomous coding agent running on the user\'s machine. Be decisive: pick the most reasonable approach and act on it, then verify the result. Use the provided tools for file, shell, and search work instead of guessing. State an assumption only when it changes the outcome; no filler and no restating the question. Never emit partial or hypothetical tool calls — only complete, executable ones.',
+  'dsh-plan':
+    'You are the planning model behind DeepSeek Harness (dsh). Think through the problem first, then return a short ordered plan: goal, steps, files or commands each step touches, and how to verify. Do not call tools unless the plan needs a fact you cannot infer; when you do, make one complete call and continue planning afterwards. No filler.',
+  'dsh-tool':
+    'You are the tool-calling model behind DeepSeek Harness (dsh). Your job is precise tool use: call exactly the tools needed, with complete arguments, and report results faithfully. One fenced tool_call block per turn, containing a JSON array of every parallel call. Never echo a result you did not receive, and never invent one.',
+  none: '',
 };
 
 /**
@@ -364,25 +364,42 @@ export async function handleChatCompletions(req, res, body, ctx) {
 
   const requestedModel = body.model || cfg.defaultModel;
   const model = normalizeModelId(requestedModel);
-  let messages = normalizeMessages(body.messages);
+  const messages = normalizeMessages(body.messages);
+
+  // The conversation key is computed from the HARNESS's own messages, before
+  // the bridge system message is prepended. Editing systemPrompt, systemPreset
+  // or the rules therefore changes what the model is told without orphaning
+  // the stored DeepSeek session (keyed on model + harness system + first user
+  // turn): the next request continues the same session with the new guidance.
+  const key = conversationKey(messages, model);
 
   // Bridge-provided system prompt: prepended as an extra system message so the
   // harness's own system message is kept verbatim (ours comes first; nothing
-  // is deduped or rewritten). An explicit systemPrompt beats a preset.
+  // is deduped or rewritten). An explicit systemPrompt beats a preset; the
+  // rules section (builtin + user + learned) is appended when enabled.
   let bridgeSystem = '';
   const explicitSystem = typeof cfg.systemPrompt === 'string' ? cfg.systemPrompt.trim() : '';
   const presetName = typeof cfg.systemPreset === 'string' ? cfg.systemPreset.trim() : '';
   if (explicitSystem) {
     bridgeSystem = explicitSystem;
-  } else if (presetName) {
+  } else if (presetName && presetName !== 'none') {
     if (Object.hasOwn(PRESET_SYSTEM_PROMPTS, presetName)) bridgeSystem = PRESET_SYSTEM_PROMPTS[presetName];
     else log(`unknown systemPreset '${presetName}' ignored; valid presets: ${Object.keys(PRESET_SYSTEM_PROMPTS).join(', ')}`);
   }
-  if (bridgeSystem) {
-    messages = [{ role: 'system', content: bridgeSystem, attachments: [] }, ...messages];
+  let rulesSection = '';
+  if (cfg.systemRules !== false) {
+    try {
+      rulesSection = renderRulesSection();
+    } catch {
+      rulesSection = '';
+    }
   }
+  if (rulesSection) bridgeSystem = bridgeSystem ? `${bridgeSystem}\n\n${rulesSection}` : rulesSection;
+  const chatMessages = bridgeSystem
+    ? [{ role: 'system', content: bridgeSystem, attachments: [] }, ...messages]
+    : messages;
 
-  const { system, rest } = splitMessages(messages);
+  const { system, rest } = splitMessages(chatMessages);
   const opts = resolveModel(model, body);
 
   const tools = Array.isArray(body.tools) ? body.tools : null;
@@ -393,7 +410,6 @@ export async function handleChatCompletions(req, res, body, ctx) {
   const preamble = toolsActive ? toolPreamble(tools, toolChoice) : '';
   const hint = opts.thinking && opts.effortExplicit ? effortHint(opts.effort) : '';
 
-  const key = conversationKey(messages, model);
   let prev = store.getConversation(key);
   const digest = transcriptDigest(rest);
 
@@ -661,6 +677,9 @@ export async function handleChatCompletions(req, res, body, ctx) {
     const usableAfterStrip = toolsActive ? toolCalls.cleaned.trim() : '';
     if (emptyTagWall > 30 && toolCalls.calls.length === 0 && !usableAfterStrip) {
       noteUpstreamThrottleEvent();
+      // Learned rules: this is a repeatable failure mode, so record it for
+      // the next turn's bridge system prompt before failing the request.
+      learnRule('degenerate-dsml');
       log(`degenerate DSML loop detected (${emptyTagWall} empty tags); dropping the session`);
       store.deleteConversation?.(key);
       throw new BridgeError(
@@ -688,6 +707,7 @@ export async function handleChatCompletions(req, res, body, ctx) {
       }
       if (!toolCalls.hadBlock) content = fullContent;
       if (toolCalls.hadBlock) {
+        learnRule('tool-markup');
         log(`tool markup without a call stripped (${Math.max(0, fullContent.length - toolCalls.cleaned.length)} chars)`);
       }
     } else {
@@ -702,6 +722,7 @@ export async function handleChatCompletions(req, res, body, ctx) {
       // in-stream error event, others a 502 they can retry).
       log(`empty completion after conversion (raw ${fullContent.length}c); failing the request`);
       noteUpstreamThrottleEvent();
+      learnRule('empty-reply');
       throw new BridgeError('The model returned no usable output.', 'empty_reply', 502);
     }
 
