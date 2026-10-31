@@ -637,6 +637,60 @@ const STRUCTURAL_TAGS = new Set([
   'param',
 ]);
 
+// Inside a parameter body a tag is literal text unless it closes the parameter,
+// or it opens a nested parameter while the body is still empty (degraded output
+// that lost the previous closer). DSML has no nested parameters, so this keeps
+// heredocs and documentation that quote a real tag intact. A closer that would
+// be swallowed as a nameless `</｜｜DSML｜｜>` also ends a parameter that already
+// has a value: `closing && !structural` is the nameless closer, which otherwise
+// stayed inside the value and turned the rest of the reply into text.
+function isBodyTag(name, closing, param) {
+  // A closer that matches a literal opener already absorbed into the value is
+  // part of that literal text: `…<marker>parameter name="x">lit<marker>/parameter>`
+  // is one value, not a value plus a real closer. `literalDepth` counts those.
+  if (closing) {
+    if (param?.literalDepth > 0) return false;
+    return isStructuralTag(name, true) || Boolean(String(param?.value ?? '').length);
+  }
+  if (!isStructuralTag(name, false)) return false;
+  return !String(param?.value ?? '').length;
+}
+
+// How many closers for `name` remain after `from`. Used to tell a quoted tag
+// (its own closer plus the parameter's closer) from a bare mention.
+function remainingClosers(source, from, name) {
+  if (!name) return 0;
+  const re = new RegExp(
+    String.raw`<\s*\/\s*(?:[\uFF5C|]+\s*DSML\s*)?[\uFF5C|]+\s*` + name + String.raw`\b[^>]*>`,
+    'gi',
+  );
+  return [...source.slice(from).matchAll(re)].length;
+}
+
+// A tag quoted inside a parameter value (a heredoc documenting the markup) has
+// a matching closer that belongs to the quote, not to the wire format. Return
+// the index just past that closer so the scan can consume the whole quoted pair
+// verbatim; return -1 when the opener is not followed by its own closer.
+function literalTagEnd(source, from, name) {
+  if (!name) return -1;
+  const tail = source.slice(from);
+  const closer = new RegExp(
+    String.raw`<\s*\/\s*(?:[\uFF5C|]+\s*DSML\s*)?[\uFF5C|]+\s*` + name + String.raw`\b[^>]*>`,
+    'i',
+  );
+  const nextOpener = new RegExp(
+    String.raw`<\s*(?!\/)\s*(?:[\uFF5C|]+\s*DSML\s*)?[\uFF5C|]+\s*(?:` +
+      [...STRUCTURAL_TAGS].join('|') +
+      String.raw`)\b[^>]*>`,
+    'i',
+  );
+  const close = closer.exec(tail);
+  if (!close) return -1;
+  const open = nextOpener.exec(tail);
+  if (open && open.index < close.index) return -1;
+  return from + close.index + close[0].length;
+}
+
 function isStructuralTag(name, closing) {
   if (name) return STRUCTURAL_TAGS.has(name);
   // `</｜｜DSML｜｜>` (closer with no name) closes the innermost construct, but a
@@ -669,9 +723,48 @@ const ATTR_RE = /([a-zA-Z_][\w:-]*)?\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>]+))/
 
 function parseAttrs(text) {
   const out = {};
-  for (const m of normalizeAttrPunctuation(text).matchAll(ATTR_RE)) {
-    if (m[1]) out[m[1]] = m[2] ?? m[3] ?? m[4] ?? '';
+  const src = normalizeAttrPunctuation(text);
+  const spans = [];
+  ATTR_RE.lastIndex = 0;
+  let m;
+  while ((m = ATTR_RE.exec(src))) {
+    if (!m[1]) continue;
+    const raw = m[0];
+    const eq = raw.indexOf('=');
+    const qm = /["']/.exec(raw.slice(eq + 1));
+    spans.push({
+      key: m[1],
+      value: m[2] ?? m[3] ?? m[4] ?? '',
+      start: m.index,
+      end: m.index + raw.length,
+      quote: qm ? qm[0] : '',
+      open: m.index + eq + 1 + (qm ? qm.index : 0),
+    });
   }
+  // Observed corruption: the model puts a JSON document in the attribute and
+  // does not escape its inner quotes -
+  // `<parameter name="arguments" string="{"nested":{"a":1}}">`. The quoted-value
+  // regex stops at the first inner quote, so the value was truncated to `{` and
+  // the call went out with garbage. When the text right after a quoted value is
+  // not another `key=` attribute, the value really runs to the last quote in the
+  // tag: extend it there and drop the spans that were carved out of its body.
+  for (let i = 0; i < spans.length; i++) {
+    const span = spans[i];
+    if (!span.quote) continue;
+    const next = spans[i + 1];
+    const between = src.slice(span.end, next ? next.start : src.length);
+    if (!between.trim()) continue;
+    if (/^\s*[a-zA-Z_][\w:-]*\s*=/.test(between)) continue;
+    if (/^\s*=/.test(between)) continue;
+    const close = src.lastIndexOf(span.quote);
+    if (close <= span.end) continue;
+    spans[i] = { ...span, value: src.slice(span.open + 1, close), end: close + 1 };
+    for (let j = spans.length - 1; j > i; j--) {
+      if (spans[j].start < close) spans.splice(j, 1);
+    }
+    break;
+  }
+  for (const span of spans) out[span.key] = span.value;
   return out;
 }
 
@@ -721,19 +814,66 @@ function tryParseJsonObject(text) {
   }
 }
 
-function parameterValue(param) {
+function parameterValue(param, expectedType = '') {
   const raw = param.value ?? '';
   const flag = String(param.string ?? '').toLowerCase();
   // Observed corruption: the value lands in the attribute list instead of the
   // element body - `<parameter name="description" string="Screenshot it">`.
   // A `string` attribute that is neither `true` nor `false` is that value.
   if (!raw && param.fallback) return param.fallback;
+  // `string="true"` is the model's claim about its own output, and it is
+  // routinely wrong: `<parameter name="count" string="true">42` against a
+  // schema that declares `count: number` used to reach a strict client as the
+  // string "42", which then rejected the call for a missing required
+  // property. When the advertised schema names a non-string type and the text
+  // really is that type, the schema wins.
+  // A declared string type is authoritative: `command` is text even when the
+  // text happens to be `42` or `{"a":1}`.
+  if (expectedType === 'string') return raw;
+  if (expectedType) {
+    const typed = coerceToSchemaType(expectedType, raw);
+    if (typed !== undefined) return typed;
+  }
+  // Without a schema the body keeps the historical rule: `string="true"` means
+  // text, otherwise the body is JSON when it parses as JSON. That ambiguity is
+  // inherent to schema-less DSML, so it is left alone here and resolved by the
+  // caller when it does have a schema.
   if (flag === 'true') return raw;
   try {
     return JSON.parse(raw);
   } catch {
     return raw;
   }
+}
+
+// Parse `raw` as the JSON type the schema asked for. Returns undefined when the
+// text does not actually hold that type, so the caller keeps its old behavior.
+function coerceToSchemaType(type, raw) {
+  const text = String(raw ?? '').trim();
+  if (!text) return undefined;
+  if (type === 'number' || type === 'integer') {
+    if (!/^-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(text)) return undefined;
+    const n = Number(text);
+    if (!Number.isFinite(n)) return undefined;
+    if (type === 'integer' && !Number.isInteger(n)) return undefined;
+    return n;
+  }
+  if (type === 'boolean') {
+    if (text === 'true') return true;
+    if (text === 'false') return false;
+    return undefined;
+  }
+  if (type === 'array' || type === 'object') {
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return undefined;
+    }
+    if (type === 'array') return Array.isArray(parsed) ? parsed : undefined;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : undefined;
+  }
+  return undefined;
 }
 
 function toolEntry(index, name) {
@@ -832,7 +972,10 @@ function extractDsml(text, { paramToolIndex = null } = {}) {
     currentParam = null;
     inParam = false;
     if (!currentCall) return;
-    const value = parameterValue(param);
+    // When the schema is known, the parameter's declared type decides how the
+    // text is parsed; without a schema this stays the old heuristic.
+    const schemaType = param.name ? toolEntry(paramToolIndex, currentCall.name)?.properties?.get(param.name)?.type : '';
+    const value = parameterValue(param, schemaType || '');
     if (!param.name) {
       currentCall.unnamed.push(value);
       return;
@@ -842,8 +985,23 @@ function extractDsml(text, { paramToolIndex = null } = {}) {
     // these (only when the value really is a tool). The old code turned a
     // parameter literally named `name` into the tool name, which deleted the
     // `skill` tool's own required `name` argument and sent `{}`.
-    if (param.name === 'arguments' || param.name === 'args') currentCall.argPayload = value;
-    else currentCall.args[param.name] = value;
+    //
+    // `args`/`arguments` is only the whole payload when the tool does not
+    // declare such a parameter itself: a workflow-style tool with an `args`
+    // object used to receive `{"depth":2}` instead of `{"name":…,"args":{…}}`.
+    const declared = toolEntry(paramToolIndex, currentCall.name)?.properties;
+    const declaredType = declared?.get(param.name)?.type;
+    if (
+      (param.name === 'arguments' || param.name === 'args') &&
+      !declared?.has(param.name) &&
+      // Without a schema, `args` is only a payload when the text really is a
+      // JSON object: a scalar such as `null`/`42` is an ordinary argument.
+      (!paramToolIndex || (value && typeof value === 'object' && !Array.isArray(value)))
+    ) {
+      currentCall.argPayload = value;
+    } else {
+      currentCall.args[param.name] = value;
+    }
   };
 
   const applyPayload = (call) => {
@@ -944,17 +1102,35 @@ function extractDsml(text, { paramToolIndex = null } = {}) {
 
     const closing = Boolean(match[1]);
     const { name, attrs, bare } = parseTagSpec(match[2]);
-    if (inParam && !isStructuralTag(name, closing)) {
-      // Not a structural tag: this is literal text inside the value (a bash
-      // heredoc that documents the DSML marker, for example). Keep it verbatim
-      // instead of consuming it — that used to truncate the value silently.
-      if (currentParam) currentParam.value += match[0];
+    if (inParam && !isBodyTag(name, closing, currentParam)) {
+      // Not a nested parameter: this is literal text inside the value (a bash
+      // heredoc that documents the DSML marker or a full parameter tag, for
+      // example). Keep it verbatim instead of consuming it. The previous rule
+      // treated every structural tag as markup even inside a parameter body, so
+      // a value containing `<marker>parameter name="x">` ended the parameter
+      // and turned the rest of the value into an extra argument.
+      if (currentParam) {
+        currentParam.value += match[0];
+        if (closing) {
+          currentParam.literalDepth = Math.max(0, (currentParam.literalDepth || 0) - 1);
+        } else if (name && remainingClosers(source, end, name) >= 2) {
+          // The value quotes a complete tag (`…<marker>parameter …>lit<marker>/parameter>`):
+          // there are two closers left, one for the quote and one for this
+          // parameter. Mark the quote so its closer is not taken for the end.
+          // With only one closer left the value merely mentions an opener, and
+          // that single closer is the real one.
+          currentParam.literalDepth = (currentParam.literalDepth || 0) + 1;
+        }
+      }
       continue;
     }
 
     if (!closing) {
       if (name === 'calls' || name === 'tool_calls') {
         if (inCalls) finishCalls();
+        // `<calls><parameter …>`: the wrapper is present but the invoke tag was
+        // lost, so the parameters after it belong to a call, not to the body
+        // text. Open the implicit call now instead of finishing it empty.
         inCalls = true;
         callsWrapper = true;
         callsBody = '';
@@ -1127,6 +1303,15 @@ export function looksLikeToolCallPayload(raw, options = {}) {
 
 const JSON_FENCE = /```json[ \t]*(?:\r?\n)?([\s\S]*?)(?:\r?\n```|```[ \t]*$)/gi;
 
+// A DSML marker that opens a *named* tag, used only to make the bare-JSON path
+// tolerant: a literal marker inside an argument string is not markup, so the
+// bare payload is parsed as JSON first and only then checked for real tags.
+const DSML_NAMED_TAG = new RegExp(
+  String.raw`<\s*(\/?)\s*(?:` +
+    String.raw`[\uFF5C|]+\s*DSML\s*)?[\uFF5C|]+\s*((?:calls|tool_calls|invoke|tool|tool_call|parameter|param)\b[^>]*)>`,
+  'i',
+);
+
 function normalizeToolNames(toolNames) {
   if (!toolNames) return null;
   const names = [...toolNames].map((name) => String(name || '').toLowerCase()).filter(Boolean);
@@ -1180,9 +1365,17 @@ export function extractToolCalls(text, { toolNames = null, paramToolIndex = null
     if (dsml.repairs?.length) repairs.push(...dsml.repairs);
   }
 
-  if (calls.length === 0 && !sawBlock) {
-    const trimmed = source.trim();
-    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+  if (calls.length === 0) {
+    // A bare JSON reply is the whole answer, so it must be inspected in its
+    // ORIGINAL form: passing it through the DSML tokenizer first (as `cleaned`
+    // has been) re-writes any literal DSML marker inside an argument string and
+    // the call is then rejected as malformed. Try the pristine text first and
+    // only fall back to the tokenized copy. `sawBlock` must not gate this: a
+    // marker inside an argument makes the tokenizer report a block even though
+    // it produced no call.
+    for (const candidate of [source, cleaned]) {
+      const trimmed = candidate.trim();
+      if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) continue;
       const bare = parseCallPayload(trimmed, {
         allowDirect: Boolean(names),
         toolNames: names,
@@ -1191,6 +1384,8 @@ export function extractToolCalls(text, { toolNames = null, paramToolIndex = null
       if (bare.length) {
         calls.push(...bare);
         cleaned = '';
+        sawBlock = true;
+        break;
       }
     }
   }

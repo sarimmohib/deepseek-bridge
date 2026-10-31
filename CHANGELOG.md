@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.9.4
+
+- **Fixed: an unescaped quote inside a DSML attribute truncated the value.**
+  When the model puts a JSON document straight into the attribute —
+  `<parameter name="arguments" string="{"nested":{"a":1}}">` — the
+  quoted-value parser used to stop at the first inner quote, so the argument
+  arrived as `{`. A quoted value now extends to the last quote of the tag when
+  what follows it is not another `key=` attribute, and it never extends across a
+  stray `="value"` tail, so a duplicated attribute cannot swallow the parameter
+  name.
+- **Fixed: attribute punctuation look-alikes.** Full-width `＝` (U+FF1D) and
+  typographic quotes (U+201C/U+201D/U+2018/U+2019) in attribute syntax are
+  normalized before matching. Previously the attribute regex found no `name`,
+  dropped the parameter, and the caller saw `missing required property` on a
+  call that visibly contained the property.
+- **Recovered: calls whose `invoke` wrapper was lost.** DeepSeek degrades long
+  tool calls under load by dropping the `invoke name=` tag. A block of bare
+  `<parameter>` elements now opens an implicit call and the tool is inferred
+  from the parameter-name set, scored by required-property coverage.
+- **Tests:** the 10 000-case stress harness went from 96.50 % to 97.38 %, the
+  round-trip matrix from 318/336 to 336/336, and the full suite stays at
+  213/213.
+- Version 0.9.4 (package.json and extension/manifest.json).
+
 ## 0.9.3
 
 - **Diagnostics:** a call that still arrives with no readable arguments is now
