@@ -1038,3 +1038,19 @@ test('issue #3: a fenced block inside a tool-call argument does not end the call
   assert.ok(String(out.calls[0].arguments.command).includes(FENCE));
   assert.ok(String(out.calls[0].arguments.command).includes(String.fromCharCode(39) + '@'));
 });
+
+
+test('issue #3: raw newlines inside a tool-call argument do not drop the call', () => {
+  const NL = String.fromCharCode(10);
+  const F = String.fromCharCode(96);
+  const FENCE = F + F + F;
+  const SQ = String.fromCharCode(39);
+  const names = new Set(['pwsh']);
+  const body = '$py = @' + SQ + NL + FENCE + NL + SQ + '@' + NL + '$py';
+  const raw = '[{"name":"pwsh","arguments":{"command":"' + body + '"}}]';
+  const text = FENCE + 'tool_call' + NL + raw + NL + FENCE;
+  const out = extractToolCalls(text, { toolNames: names });
+  assert.equal(out.calls.length, 1);
+  assert.equal(out.calls[0].name, 'pwsh');
+  assert.ok(String(out.calls[0].arguments.command).includes(FENCE));
+});

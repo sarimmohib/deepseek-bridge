@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.14
+
+- **Added the regression test that 0.9.13 claimed but did not contain.** The
+  0.9.13 changelog said a test for issue #3 was added and the suite went to
+  223; the commit (`d06f704`) actually touched four files and left
+  `test/prompt.test.js` unchanged, so the count stayed at 222. The test now
+  exists: it builds a here-string wrapping a fenced block with raw newlines
+  inside the JSON string and asserts the call still parses.
+- The parser fix itself shipped correctly in 0.9.13 and is unchanged here:
+  raw control characters inside a JSON string are escaped by
+  `repairRawControlChars`, chained as `repairJsonText` at both recovery
+  sites.
+- **Tests:** suite 222 to 223; `test/prompt.test.js` 67 to 68.
+- Version 0.9.14 (package.json and extension/manifest.json).
+
 ## 0.9.13
 
 - **Fixed: raw newlines inside a tool-call argument dropped the call.**
