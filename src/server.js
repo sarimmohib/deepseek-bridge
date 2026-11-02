@@ -143,33 +143,12 @@ export function createServer({ config, store, log = () => {}, direct: directClie
         return;
       }
 
-      if (url.pathname === '/v1/bridge/log' && req.method === 'GET') {
-        const lines = Math.min(500, Math.max(1, Number(url.searchParams.get('lines')) || 80));
-        const logFile = path.join(paths.CONFIG_DIR, 'bridge.log');
-        let out;
-        try {
-          out = fs.readFileSync(logFile, 'utf8').split('\n').slice(-lines);
-        } catch {
-          out = [`(no log file at ${logFile})`];
-        }
-        // The startup banner prints the API key; never hand it back out.
-        out = out.map((line) => line.replace(/sk-ds-[a-f0-9]+/g, 'sk-ds-…'));
-        json(res, 200, { lines: out });
-        return;
-      }
-
-      if (url.pathname.startsWith('/v1/conversations/') && req.method === 'DELETE') {
-        const key = decodeURIComponent(url.pathname.slice('/v1/conversations/'.length));
-        if (!key || !store.getConversation(key)) {
-          sendError(res, 404, 'No such conversation', 'not_found');
-          return;
-        }
-        store.deleteConversation(key);
-        store.flush();
-        json(res, 200, { ok: true, deleted: key });
-        return;
-      }
-
+      // These two routes read bridge state and mutate the conversation store,
+      // so they must sit BELOW the auth gate. They were copied above it, which
+      // served the bridge log (account ids, upstream errors) to any web page:
+      // CORS is '*', so `fetch('http://127.0.0.1:8787/v1/bridge/log')` from any
+      // origin returned 200 without a key. The authenticated copies further
+      // down are the ones that now run.
       if (url.pathname === '/' && req.method === 'GET') {
         // Static dashboard: no data embedded, all fetches are auth-gated.
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
@@ -408,33 +387,6 @@ export function createServer({ config, store, log = () => {}, direct: directClie
           },
           upstream: { active: bridgeQueue.active, queued: bridgeQueue.queued, max: bridgeQueue.max },
         });
-        return;
-      }
-
-      if (url.pathname === '/v1/bridge/log' && req.method === 'GET') {
-        const lines = Math.min(500, Math.max(1, Number(url.searchParams.get('lines')) || 80));
-        const logFile = path.join(paths.CONFIG_DIR, 'bridge.log');
-        let out;
-        try {
-          out = fs.readFileSync(logFile, 'utf8').split('\n').slice(-lines);
-        } catch {
-          out = [`(no log file at ${logFile})`];
-        }
-        // The startup banner prints the API key; never hand it back out.
-        out = out.map((line) => line.replace(/sk-ds-[a-f0-9]+/g, 'sk-ds-…'));
-        json(res, 200, { lines: out });
-        return;
-      }
-
-      if (url.pathname.startsWith('/v1/conversations/') && req.method === 'DELETE') {
-        const key = decodeURIComponent(url.pathname.slice('/v1/conversations/'.length));
-        if (!key || !store.getConversation(key)) {
-          sendError(res, 404, 'No such conversation', 'not_found');
-          return;
-        }
-        store.deleteConversation(key);
-        store.flush();
-        json(res, 200, { ok: true, deleted: key });
         return;
       }
 

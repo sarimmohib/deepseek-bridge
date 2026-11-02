@@ -1,3 +1,23 @@
+## 0.9.16
+
+- **Security: two routes were registered ABOVE the API-key gate.**
+  `/v1/bridge/log` and `DELETE /v1/conversations/:key` sat before the
+  `if (!authorized)` check, and CORS is `*`, so any web page could run
+  `fetch("http://127.0.0.1:8787/v1/bridge/log")` and read the bridge log —
+  account ids, upstream error text, session ids — with no key at all. A
+  cross-origin page could also delete stored conversations. Both routes now
+  sit below the gate; `/health` stays public so clients can probe readiness.
+- The three copy-pasted handler blocks in `server.js` had diverged: only the
+  copies below the gate were protected. Duplicates above it are removed.
+- **Removed a duplicated last-resort `jsonSpans` scan** in
+  `extractToolCalls`. Two adjacent blocks tried the same thing; the first
+  always decided, so the second was dead code.
+- **The test script is now a glob** (`node --test test/*.test.js`) instead of
+  a hardcoded 14-file chain. A new test file was silently never executed by
+  `npm test`.
+- **Tests:** new `test/auth-gate.test.js` (3 cases; 2 fail against pre-fix
+  code). Suite 228 to 231.
+- Version 0.9.16 (package.json and extension/manifest.json).
 # Changelog
 
 ## 0.9.15
