@@ -994,14 +994,14 @@ test('a bare call array after prose is recovered when tool names are known', () 
   assert.deepEqual(out.calls[0].arguments, { file_path: '/tmp/a.txt' });
 });
 
-
 test('a call array inside bracket-heavy prose is still recovered', () => {
   const names = new Set(['pwsh']);
   const arr = '[{"name":"pwsh","arguments":{"command":"adb shell uiautomator dump","timeoutMs":300000}}]';
-  // The prose contains [regex]::Match(…) and [^>]*, so the first bracket in the
-  // reply is not the payload. A scanner that starts there never reaches it.
-  const prose = 'a = Get-Content 'x.xml' -Raw; [regex]::Match(a, 'text="([^"]*)"').Groups[1].Value; [^>]*';
-  const out = extractToolCalls(prose + ' ' + arr + ' </pre>"}', { toolNames: names });
+  // The prose carries [regex]::Match(…) and [^>]*, so the first bracket in
+  // the reply is not the payload. A scanner starting there never reaches it.
+  const prose = "a = Get-Content 'x.xml' -Raw; [regex]::Match(a, 'text=\"([^\"]*)\"').Groups[1].Value; [^>]*";
+  const text = prose + ' ' + arr + ' </pre>"}';
+  const out = extractToolCalls(text, { toolNames: names });
   assert.equal(out.calls.length, 1);
   assert.equal(out.calls[0].name, 'pwsh');
   assert.equal(out.calls[0].arguments.command, 'adb shell uiautomator dump');

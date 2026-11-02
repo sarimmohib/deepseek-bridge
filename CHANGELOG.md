@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.9
+
+- **Fixed: the 0.9.8 release did not actually contain the test fix.** The edit
+  that was meant to repair the 0.9.7 regression test silently failed to match,
+  so the release commit touched only the changelog and the two version files.
+  `test/prompt.test.js` stayed broken: unescaped quotes on the `prose` line,
+  a corrupted `assert.equal(||)` call, and a file truncated mid-token. The
+  suite therefore still exited 1 with no summary in 0.8.7 and 0.9.8.
+- The corrupt tail is removed entirely and the test is rewritten cleanly. The
+  file now parses, `node test/prompt.test.js` exits 0 with 65 tests, and every
+  one of the 14 test files exits 0 (229 assertions, 0 failures).
+- Version 0.9.9 (package.json and extension/manifest.json).
+
 ## 0.9.8
 
 - **Fixed: a syntax error in the 0.9.7 regression test broke the whole test
