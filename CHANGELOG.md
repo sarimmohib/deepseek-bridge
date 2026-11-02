@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.9.8
+
+- **Fixed: a syntax error in the 0.9.7 regression test broke the whole test
+  file.** The appended test wrote `'a = Get-Content 'x.xml' -Raw; …'` — single
+  quotes nested inside a single-quoted string — plus references to undefined
+  `text` and a corrupted identifier. `test/prompt.test.js` therefore failed to
+  parse and exited 1 with no summary, so the suite silently stopped covering
+  the parser. The test now builds the prose with double quotes, defines `text`,
+  and passes a valid tool-name set. `node test/prompt.test.js` exits 0 with
+  65 tests, and the full suite is 221/221 across 15 files.
+- Version 0.9.8 (package.json and extension/manifest.json).
+
 ## 0.9.7
 
 - **Fixed: a call array was lost when the prose before it contained brackets.**
