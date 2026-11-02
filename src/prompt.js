@@ -604,6 +604,43 @@ export function toolPreamble(tools, toolChoice) {
 // A closing fence must be at the start of a line (or at the end of the text).
 // Otherwise a literal ``` inside a JSON string would end the block early.
 const FENCED_TOOL = /```(?:tool_call|json:tool_call)[ \t]*(?:\r?\n)?([\s\S]*?)(?:\r?\n```|```[ \t]*$)/gi;
+
+// Locate fenced tool blocks by parsing, not by regex termination. For each
+// opening fence, every later fence at a line start is a candidate closer, and
+// the block ends at the first candidate whose interior yields a call. A JSON
+// string argument may legitimately contain a fenced code block (issue #3: a
+// here-string wrapping Python with triple quotes and a ``` block), which the
+// non-greedy regex above ended on, truncating the payload.
+function fencedToolBlocks(source) {
+  const src = String(source || '');
+  const blocks = [];
+  const open = /```(?:tool_call|json:tool_call)[ \t]*(?:\r?\n)?/gi;
+  let m;
+  while ((m = open.exec(src))) {
+    const start = m.index;
+    const bodyStart = start + m[0].length;
+    const closer = /(?:\r?\n```|```[ \t]*$)/g;
+    closer.lastIndex = bodyStart;
+    let first = null;
+    let chosen = null;
+    let c;
+    while ((c = closer.exec(src))) {
+      const cand = { start, bodyStart, bodyEnd: c.index, end: c.index + c[0].length };
+      if (!first) first = cand;
+      const parsed = parseCallPayload(src.slice(bodyStart, c.index), { allowDirect: true });
+      if (parsed.length) {
+        chosen = { ...cand, calls: parsed };
+        break;
+      }
+    }
+    if (!chosen) {
+      chosen = first ? { ...first, calls: [] } : { start, bodyStart, bodyEnd: bodyStart, end: bodyStart, calls: [] };
+    }
+    blocks.push(chosen);
+    open.lastIndex = Math.max(chosen.end, bodyStart);
+  }
+  return blocks;
+}
 const XML_TOOL = /<(?:tool_call|tool_calls)>([\s\S]*?)<\/(?:tool_call|tool_calls)>/gi;
 
 // `<call>…</call>` is what DeepSeek emits when it degrades a real invocation

@@ -1020,3 +1020,21 @@ test('a stray </tool_call> closer and Windows paths still parse', () => {
   assert.equal(out.calls[0].name, 'pwsh');
   assert.ok(String(out.calls[0].arguments.command).includes('Sarim'));
 });
+
+
+test('issue #3: a fenced block inside a tool-call argument does not end the call', () => {
+  const NL = String.fromCharCode(10);
+  const F = String.fromCharCode(96);
+  const FENCE = F + F + F;
+  const Q3 = String.fromCharCode(39, 39, 39);
+  const names = new Set(['pwsh']);
+  const py = ['print(' + Q3 + 'a' + Q3 + ')', FENCE, 'print(' + Q3 + 'b' + Q3 + ')', FENCE].join(NL);
+  const cmd = '$py = @' + String.fromCharCode(39) + NL + py + NL + String.fromCharCode(39) + '@' + NL + '$py';
+  const payload = JSON.stringify([{ name: 'pwsh', arguments: { command: cmd } }]);
+  const text = FENCE + 'tool_call' + NL + payload + NL + FENCE;
+  const out = extractToolCalls(text, { toolNames: names });
+  assert.equal(out.calls.length, 1);
+  assert.equal(out.calls[0].name, 'pwsh');
+  assert.ok(String(out.calls[0].arguments.command).includes(FENCE));
+  assert.ok(String(out.calls[0].arguments.command).includes(String.fromCharCode(39) + '@'));
+});

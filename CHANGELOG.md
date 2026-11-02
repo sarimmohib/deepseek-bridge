@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.9.12
+
+- **Fixed: a fenced block inside a tool-call argument truncated the call.**
+  `FENCED_TOOL` used a non-greedy body and closed at the first ``` at the
+  start of a line. A JSON string argument may legitimately contain a fenced
+  block - issue #3 reports a here-string (`@' ... '@`) wrapping Python with
+  both triple-quoted strings and a ``` block. The match stopped at that inner
+  fence, the payload was truncated, parsing failed, and the call was dropped
+  as markdown.
+- Fenced blocks are now located by parsing: for each opening fence, every
+  later line-start fence is a candidate closer, and the block ends at the
+  first candidate whose interior yields a call. Removal uses those same spans
+  and still only deletes blocks that produced a call.
+- **Tests:** one regression test for the heredoc + triple-quote + fence shape.
+  Suite goes 221 to 222, all passing.
+- Version 0.9.12 (package.json and extension/manifest.json).
+
 ## 0.9.11
 
 - **Fixed: a stray `</tool_call>` closer discarded a valid call.** The residue
