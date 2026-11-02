@@ -1519,7 +1519,12 @@ export function extractToolCalls(text, { toolNames = null, paramToolIndex = null
     calls.push(...parsed);
     return '';
   });
-  cleaned = cleaned.replace(FENCED_TOOL, '').replace(XML_TOOL, '');
+  cleaned = cleaned.replace(FENCED_TOOL, (block, payload) => {
+    // Only consume a fence that actually produced a call. An unparseable
+    // fence is the model’s own text, not markup to delete.
+    return parseCallPayload(payload, { allowDirect: true }).length ? '' : block;
+  });
+  cleaned = cleaned.replace(XML_TOOL, '');
   cleaned = cleaned.replace(JSON_FENCE, (block, payload) => {
     const parsed = parseCallPayload(payload, {
       allowDirect: Boolean(names),
