@@ -1736,22 +1736,6 @@ export function extractToolCalls(text, { toolNames = null, paramToolIndex = null
     }
   }
 
-  if (calls.length === 0 && names) {
-    // Last resort: scan EVERY balanced JSON span, not just the first bracket.
-    // A command string legitimately contains `[regex]::Match(…)` and `[^>]*`,
-    // so starting at the first `[` lands inside the prose and never reaches the
-    // array. Keep the first span that parses into a real call.
-    for (const span of jsonSpans(source, 24)) {
-      const parsed = parseCallPayload(span, { allowDirect: true, toolNames: names });
-      if (parsed.length) {
-        calls.push(...parsed);
-        cleaned = '';
-        sawBlock = true;
-        break;
-      }
-    }
-  }
-
   return {
     calls,
     cleaned: cleaned.replace(/\n{3,}/g, '\n\n').trim(),
