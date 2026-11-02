@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.10
+
+- **Fixed: a `tool_call` fence that yielded no call was still deleted from the
+  reply.** 0.9.6 stopped such a fence from reporting `hadBlock`, but the removal
+  step `cleaned.replace(FENCED_TOOL, '')` kept stripping it unconditionally, so
+  the model's text vanished while `hadBlock` claimed nothing had happened — the
+  worst combination, because the turn looks like an empty reply. A fence is now
+  removed only when its payload parses into a call, the same rule already applied
+  to `<call>` wrappers. This is the case asserted by
+  `a tool_call fence that yields no call is not stripped as tool markup`, which
+  failed in 0.9.9.
+- **Tests:** all 14 files exit 0, 220 assertions, 0 failures, 0 unreadable.
+- Version 0.9.10 (package.json and extension/manifest.json).
+
 ## 0.9.9
 
 - **Fixed: the 0.9.8 release did not actually contain the test fix.** The edit
