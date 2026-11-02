@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.9.15
+
+- **Fixed: a bare-array tool call executed AND streamed to the client as
+  prose.** The model emits calls as `<[{"name":…,"arguments":{…}}]
+  </|DSML|>` — a bare JSON array inside stray DSML closers. The streaming guard
+  recognized ```tool_call fences, `<tool_calls>` and DSML `invoke`, but never a
+  bare array, so the markup was flushed to the client as content.
+  `extractToolCalls` then found the same calls in `fullContent` and executed
+  them: the GUI showed both a "Ran commands" chip and the raw JSON.
+- The guard now matches a bare array opener (including the leading `<` that made
+  it render as `<[{"name":…`), holds it until the array is balanced, and
+  releases it only when `looksLikeToolCallPayload` rejects it. Ordinary JSON in
+  prose still streams.
+- **Fixed: stray DSML markers streamed as prose.** `</|DSML|>` arriving ahead of
+  the call was emitted before the array was recognized. Every guard emit now
+  passes through `stripDsmlResidue`, so no DSML marker reaches the client
+  regardless of which branch produced it.
+- **Tests:** five guard cases (bare, `<[`, DSML-wrapped, with prose, and an
+  ordinary JSON array that must still stream). Suite 222 to 228.
+- Version 0.9.15 (package.json and extension/manifest.json).
+
 ## 0.9.14
 
 - **Added the regression test that 0.9.13 claimed but did not contain.** The

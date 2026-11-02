@@ -220,12 +220,26 @@ export function resolveModel(name = 'deepseek-reasoner', body = {}) {
   return { modelType, thinking, search, effort, effortExplicit };
 }
 
+// A stray DSML marker (`</|DSML|>`, `<|DSML| calls>`) is markup, never prose.
+// It arrives ahead of the call it wraps, so the guard flushes it as ordinary
+// text before the array is recognized. Filter it at every emit.
+const DSML_RESIDUE = /<\s*\/?\s*[\uFF5C|]+\s*DSML\s*[\uFF5C|]+\s*(?:[a-z_]+\b)?[^>]*>/gi;
+const stripDsmlResidue = (text) => String(text || '').replace(DSML_RESIDUE, '');
+
 const TOOL_FENCE_MARKERS = ['```tool_call', '```json:tool_call', '```json'];
 const TOOL_START_PATTERNS = [
   { re: /```(?:tool_call|json:tool_call)/i, kind: 'tool' },
   { re: /```json\b/i, kind: 'json' },
   { re: /<(?:tool_calls?|function_calls?)>/i, kind: 'xml' },
   { re: /<[\uFF5C|]+\s*DSML\s*[\uFF5C|]+\s*(?:calls|tool_calls|invoke)\b/i, kind: 'dsml' },
+  // A bare array of calls, e.g. `<[{"name":"pwsh","arguments":{…}}] </|DSML|>`.
+  // The model emits this shape wrapped in stray DSML closers and it executed
+  // while also streaming to the client as prose: the guard held none of the
+  // four markers above, so the markup was emitted before extraction.
+  // The leading `<` is part of the markup: the model writes `<[{…}]`, and if the
+  // pattern starts at `[` the lone `<` is flushed first and the client renders
+  // `<[{"name":…`. Match both so the whole opener is held together.
+  { re: /(?:<\s*)?\[\s*\{\s*"(?:name|tool_calls?|function|arguments)"\s*:/i, kind: 'bare' },
 ];
 
 /**
@@ -244,6 +258,14 @@ export function createToolGuard({ enabled, emit, toolNames = null, paramToolInde
   let held = '';
   let holdKind = '';
   let jsonDecided = false;
+
+  // Every emission goes through here: the guard must never hand markup to the
+  // client, whichever branch produced it.
+  function emitText(text) {
+    if (!text) return;
+    const clean = stripDsmlResidue(text);
+    if (clean) emit(clean);
+  }
 
   function partialSuffix(text) {
     const lower = text.toLowerCase();
@@ -265,6 +287,16 @@ export function createToolGuard({ enabled, emit, toolNames = null, paramToolInde
       const tail = text.slice(lt);
       if (tail.length <= 96 && !tail.includes('>')) best = Math.max(best, tail.length);
     }
+    // Hold a truncated bare-array opener (`[`, `[{`, `[{"name"`) so a call that
+    // begins with an array is not streamed as prose before it is recognized.
+    // Bounded to 40 chars, so ordinary prose ending in `[` costs nothing.
+    const lb = text.lastIndexOf('[');
+    if (lb >= 0) {
+      const tail = text.slice(lb);
+      if (tail.length <= 40 && !tail.includes(']') && /^\[\s*\{?\s*"?[a-z_]*"?\s*:?\s*$/i.test(tail)) {
+        best = Math.max(best, tail.length);
+      }
+    }
     return best;
   }
 
@@ -277,6 +309,44 @@ export function createToolGuard({ enabled, emit, toolNames = null, paramToolInde
     return out;
   }
 
+  // The first balanced `[...]` in `text`, string-aware, or null while the array
+  // is still incomplete. Used to decide whether a held bare array is a call.
+  function balancedArraySlice(text) {
+    const start = text.indexOf('[');
+    if (start < 0) return null;
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    for (let i = start; i < text.length; i++) {
+      const ch = text[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === '\\') esc = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') inStr = true;
+      else if (ch === '[' || ch === '{') depth++;
+      else if (ch === ']' || ch === '}') {
+        depth--;
+        if (depth === 0) return text.slice(start, i + 1);
+      }
+    }
+    return null;
+  }
+
+  function decideBare() {
+    if (holdKind !== 'bare') return;
+    const slice = balancedArraySlice(held);
+    if (!slice) return;
+    // A real call keeps everything held: extraction consumes it at the end and
+    // the client never sees the markup. Anything else is the model's own text
+    // (a JSON example in prose) and is released immediately.
+    if (looksLikeToolCallPayload(slice, { toolNames })) return;
+    const out = takeHeld();
+    emitText(out);
+  }
+
   function decideJson() {
     if (holdKind !== 'json' || jsonDecided) return;
     // Only decide on a fence that is followed by a newline. End-of-buffer is
@@ -287,19 +357,20 @@ export function createToolGuard({ enabled, emit, toolNames = null, paramToolInde
     jsonDecided = true;
     if (!looksLikeToolCallPayload(block[1], { toolNames })) {
       const out = takeHeld();
-      if (out) emit(out);
+      emitText(out);
     }
   }
 
   function push(text) {
     if (!text) return;
     if (!enabled) {
-      emit(text);
+      emitText(text);
       return;
     }
     if (holding) {
       held += text;
       decideJson();
+      decideBare();
       return;
     }
     pending += text;
@@ -313,19 +384,20 @@ export function createToolGuard({ enabled, emit, toolNames = null, paramToolInde
       }
     }
     if (cut >= 0) {
-      if (cut > 0) emit(pending.slice(0, cut));
+      if (cut > 0) emitText(pending.slice(0, cut));
       held = pending.slice(cut);
       pending = '';
       holding = true;
       holdKind = kind;
       jsonDecided = false;
       decideJson();
+      decideBare();
       return;
     }
     const keep = partialSuffix(pending);
     if (keep < pending.length) {
       const flush = pending.slice(0, pending.length - keep);
-      if (flush) emit(flush);
+      emitText(flush);
       pending = pending.slice(pending.length - keep);
     }
   }
@@ -554,10 +626,14 @@ export async function handleChatCompletions(req, res, body, ctx) {
   // With tools advertised, hold back only the tool_call fence. Ordinary prose
   // is streamed immediately so a text-only answer does not arrive in one burst.
   let fullContent = '';
+  // Second line of defence: the guard already filters DSML residue, but a
+  // non-streamed path can still write the model's raw tail here.
   const writeContent = (text) => {
     if (!text) return;
-    content += text;
-    if (stream) sse(res, chunk({ id, created, model, delta: { content: text } }));
+    const cleanedText = stripDsmlResidue(text);
+    if (!cleanedText) return;
+    content += cleanedText;
+    if (stream) sse(res, chunk({ id, created, model, delta: { content: cleanedText } }));
   };
   const guard = createToolGuard({ enabled: toolsActive, emit: writeContent, toolNames, paramToolIndex });
   const emitContent = (text) => {

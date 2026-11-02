@@ -88,3 +88,28 @@ test('streaming guard holds a flattened JSON call for an advertised tool', () =>
   assert.equal(calls.length, 1);
   assert.deepEqual(calls[0].arguments, { command: 'ls -la' });
 });
+
+
+// A call emitted as a bare array (optionally wrapped in stray DSML markers)
+// used to execute while ALSO streaming to the client as prose: the guard
+// matched fences, <tool_calls> and DSML invoke, but never a bare `[{…}]`.
+for (const [label, text] of Object.entries({
+  bare: '[{\"name\":\"Bash\",\"arguments\":{\"command\":\"ls\"}}]',
+  angle: '<[{\"name\":\"Bash\",\"arguments\":{\"command\":\"ls\"}}]',
+  dsml_wrapped: '</|DSML|>[{\"name\":\"Bash\",\"arguments\":{\"command\":\"ls\"}}] </|DSML|>',
+  with_prose: 'Running it now.\n[{\"name\":\"Bash\",\"arguments\":{\"command\":\"ls\"}}]',
+})) {
+  test(`guard holds a bare-array call (${label})`, () => {
+    const { emitted, all } = runGuard(text, 3);
+    assert.doesNotMatch(emitted, /"name"\s*:\s*"Bash"/);
+    assert.doesNotMatch(emitted, /DSML/);
+    const { calls } = extractToolCalls(all, { toolNames });
+    assert.deepEqual(calls.map((c) => c.name), ['Bash']);
+  });
+}
+
+test('guard still streams an ordinary JSON array in prose', () => {
+  const text = 'The config is [{"name": "x","value":1}] and done.';
+  const { all } = runGuard(text, 4);
+  assert.match(all, /The config is \[\{"name": "x","value":1\}\] and done\./);
+});
