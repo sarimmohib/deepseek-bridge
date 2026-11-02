@@ -1459,8 +1459,14 @@ export function extractToolCalls(text, { toolNames = null, paramToolIndex = null
 
   FENCED_TOOL.lastIndex = 0;
   while ((match = FENCED_TOOL.exec(source))) {
-    sawBlock = true;
-    calls.push(...parseCallPayload(match[1], { allowDirect: true }));
+    const parsed = parseCallPayload(match[1], { allowDirect: true });
+    calls.push(...parsed);
+    // A fence only proves tool markup when it yields a call. Setting this
+    // unconditionally made an unparseable fence report `hadBlock` with no
+    // calls, which the caller turns into "tool markup without a call
+    // stripped": the model's text was deleted and the learned rule fired on a
+    // turn that never had a call in it. Leave such a fence as ordinary text.
+    if (parsed.length) sawBlock = true;
   }
 
   XML_TOOL.lastIndex = 0;
@@ -1508,7 +1514,13 @@ export function extractToolCalls(text, { toolNames = null, paramToolIndex = null
     // it produced no call.
     for (const candidate of [source, cleaned]) {
       const trimmed = candidate.trim();
-      if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) continue;
+      if (!trimmed) continue;
+      // The whole reply being JSON is the common case. A reply that opens with
+      // prose and then emits the array (`Running this now.\n[{...}] </pre>"}`)
+      // is the same defect one level out: the call is intact, only the sentence
+      // in front of it is not JSON. When the tool names are known, inspect the
+      // first balanced JSON span too.
+      if (!trimmed.startsWith('{') && !trimmed.startsWith('[') && !names) continue;
       const bare = parseCallPayload(trimmed, {
         allowDirect: Boolean(names),
         toolNames: names,

@@ -972,3 +972,24 @@ test('issue #2: a <call> block that carries no call stays in the text', () => {
   assert.equal(out.calls.length, 0);
   assert.equal(out.cleaned, text);
 });
+
+
+test('a tool_call fence that yields no call is not stripped as tool markup', () => {
+  const F = String.fromCharCode(96, 96, 96);
+  const text = F + 'tool_call\nthis is not json at all\n' + F;
+  const out = extractToolCalls(text, { toolNames: new Set(['read']) });
+  assert.equal(out.calls.length, 0);
+  // Stripping it would delete the model's text and fire the learned rule on a
+  // turn that never contained a call.
+  assert.equal(out.hadBlock, false);
+  assert.ok(out.cleaned.includes('this is not json at all'));
+});
+
+test('a bare call array after prose is recovered when tool names are known', () => {
+  const arr = '[{"name":"read","arguments":{"file_path":"/tmp/a.txt"}}]';
+  const text = 'Running this now.\n' + arr + ' </pre>"}';
+  const out = extractToolCalls(text, { toolNames: new Set(['read']) });
+  assert.equal(out.calls.length, 1);
+  assert.equal(out.calls[0].name, 'read');
+  assert.deepEqual(out.calls[0].arguments, { file_path: '/tmp/a.txt' });
+});

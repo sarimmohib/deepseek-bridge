@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.9.6
+
+- **Fixed: a `tool_call` fence that yielded no call was stripped as tool
+  markup.** The fence loop set `sawBlock = true` before parsing, so a fence
+  whose payload did not parse reported `hadBlock` with zero calls. The caller
+  treats that as "tool markup without a call" — it deletes the text and fires
+  the learned `tool-markup` rule on a turn that never contained a call. The
+  flag is now set only when a fence actually produces a call, so an
+  unparseable fence stays in the reply as ordinary text.
+- **Fixed: a bare call array preceded by prose was not recovered.** When the
+  reply opened with a sentence and then emitted the array —
+  `Running this now.` followed by `[{"name":"pwsh",…}] </pre>"}` — the
+  bare-JSON fallback skipped it because the text did not start with `[` or `{`.
+  With tool names known, the first balanced JSON span is now inspected too.
+- **Tests:** two regression tests added (fence-with-no-call is not stripped;
+  prose-prefixed bare array is recovered). Suite goes 217 → 219, all passing.
+- Version 0.9.6 (package.json and extension/manifest.json).
+
 ## 0.9.5
 
 - **Fixed: a valid `tool_call` fence was discarded when its payload carried
