@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.9.13
+
+- **Fixed: raw newlines inside a tool-call argument dropped the call.**
+  Issue #3: a here-string (`@' ... '@`) wrapping Python with triple-quoted
+  strings and a fenced block was emitted as markdown. The payload was not
+  valid JSON for a second reason beyond the inner fence - the model wrote
+  real newlines and tabs inside the JSON string instead of `\n` and `\t`.
+  `JSON.parse` rejected it, and no existing recovery path escaped control
+  characters inside a string literal.
+- `repairRawControlChars` now escapes raw newlines, carriage returns and tabs
+  that appear inside a JSON string, leaving structure between values intact.
+  It is chained with the backslash repair as `repairJsonText` and applied at
+  both recovery call sites, so a Windows path and a multi-line script are
+  repaired in one pass.
+- **Tests:** one regression test for the raw-newline shape. Suite 222 to 223.
+- Version 0.9.13 (package.json and extension/manifest.json).
+
 ## 0.9.12
 
 - **Fixed: a fenced block inside a tool-call argument truncated the call.**

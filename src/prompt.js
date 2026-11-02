@@ -1363,6 +1363,48 @@ function repairJsonEscapes(text) {
   return out;
 }
 
+// A model writing a multi-line script into a JSON string emits raw newlines and
+// tabs instead of \n and \t. That is not valid JSON, so JSON.parse rejects the
+// whole call - this is the second half of issue #3 (a here-string wrapping
+// Python). Escape raw control characters that appear INSIDE a string literal;
+// structure between values is untouched.
+function repairRawControlChars(text) {
+  const src = String(text || '');
+  let out = '';
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (inStr && esc) {
+      esc = false;
+      out += ch;
+      continue;
+    }
+    if (inStr && ch === '\\') {
+      esc = true;
+      out += ch;
+      continue;
+    }
+    if (ch === '"') {
+      inStr = !inStr;
+      out += ch;
+      continue;
+    }
+    if (inStr) {
+      if (ch === '\n') { out += '\\n'; continue; }
+      if (ch === '\r') { out += '\\r'; continue; }
+      if (ch === '\t') { out += '\\t'; continue; }
+    }
+    out += ch;
+  }
+  return out;
+}
+
+// Both repairs, applied in the order the model's output needs them.
+function repairJsonText(text) {
+  return repairRawControlChars(repairJsonEscapes(text));
+}
+
 // The first JSON opener in `text` and the index just past its matching closer,
 // scanning string-aware so a bracket inside an argument string cannot end the
 // span early. Returns null when the payload is truncated (no matching closer).
@@ -1489,8 +1531,9 @@ function parseCallPayload(raw, options = {}) {
     // fall through to recovery
   }
 
-  // 1b. Same payload with lone backslashes (a Windows path) that JSON rejects.
-  const repaired = repairJsonEscapes(text);
+  // 1b. Lone backslashes (a Windows path) and raw control characters (a
+  // multi-line script) both make the payload non-JSON; repair and retry.
+  const repaired = repairJsonText(text);
   if (repaired !== text) {
     try {
       const calls = fromValue(JSON.parse(repaired));
@@ -1506,7 +1549,7 @@ function parseCallPayload(raw, options = {}) {
   // backslash tend to appear together (a stray closer plus a Windows path), so
   // try the stripped text and its repaired form.
   if (stripped && stripped !== text) {
-    for (const variant of [stripped, repairJsonEscapes(stripped)]) {
+    for (const variant of [stripped, repairJsonText(stripped)]) {
       try {
         const calls = fromValue(JSON.parse(variant));
         if (calls.length) return calls;
