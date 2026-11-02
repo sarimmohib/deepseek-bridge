@@ -1311,6 +1311,42 @@ function balancedJsonSlice(text) {
 // Parse each top-level `{…}` inside an array independently, so one malformed
 // entry cannot discard its valid neighbours. This is the partial-success path
 // promised by issue #1: a broken second call must not zero out the first.
+// Every balanced `[…]` / `{…}` span in `text`, in document order. Unlike
+// balancedJsonSlice this does not stop at the first opener: prose may contain
+// brackets (`[regex]::Match`, `[^>]*`) before the real payload.
+function jsonSpans(text, max = 16) {
+  const spans = [];
+  const src = String(text || '');
+  for (let i = 0; i < src.length && spans.length < max; i++) {
+    const open = src[i];
+    if (open !== '[' && open !== '{') continue;
+    // Start a fresh string state at every candidate opener. Carrying state in
+    // from the surrounding prose desynchronises the scan: a stray `"` in
+    // `text="([^"]*)"` leaves the scanner inside a string forever, so the
+    // real array is never seen.
+    const close = open === '[' ? ']' : '}';
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    for (let j = i; j < src.length; j++) {
+      const ch = src[j];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === '\\') esc = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') inStr = true;
+      else if (ch === open) depth++;
+      else if (ch === close && --depth === 0) {
+        spans.push(src.slice(i, j + 1));
+        break;
+      }
+    }
+  }
+  return spans;
+}
+
 function salvageArrayObjects(text) {
   const start = text.search(/\[/);
   if (start < 0) return [];
@@ -1528,6 +1564,43 @@ export function extractToolCalls(text, { toolNames = null, paramToolIndex = null
       });
       if (bare.length) {
         calls.push(...bare);
+        cleaned = '';
+        sawBlock = true;
+        break;
+      }
+    }
+  }
+
+  if (calls.length === 0 && names) {
+    // Last resort: scan EVERY balanced JSON span, not just the first bracket.
+    // A command string legitimately contains `[regex]::Match(…)` and `[^>]*`,
+    // so taking the first `[` lands inside the prose and never reaches the
+    // array. Walk each candidate opener and keep the first span that parses
+    // into a real call.
+    for (const span of jsonSpans(source, 24)) {
+      const parsed = parseCallPayload(span, {
+        allowDirect: true,
+        toolNames: names,
+        requireArgs: false,
+      });
+      if (parsed.length) {
+        calls.push(...parsed);
+        cleaned = '';
+        sawBlock = true;
+        break;
+      }
+    }
+  }
+
+  if (calls.length === 0 && names) {
+    // Last resort: scan EVERY balanced JSON span, not just the first bracket.
+    // A command string legitimately contains `[regex]::Match(…)` and `[^>]*`,
+    // so starting at the first `[` lands inside the prose and never reaches the
+    // array. Keep the first span that parses into a real call.
+    for (const span of jsonSpans(source, 24)) {
+      const parsed = parseCallPayload(span, { allowDirect: true, toolNames: names });
+      if (parsed.length) {
+        calls.push(...parsed);
         cleaned = '';
         sawBlock = true;
         break;

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.7
+
+- **Fixed: a call array was lost when the prose before it contained brackets.**
+  Recovery scanned for the first `[` and parsed the balanced span from there.
+  A command string legitimately contains `[regex]::Match(…)` and `[^>]*`, so
+  the scan landed inside the prose and never reached the payload — the turn was
+  emitted verbatim as markdown with no call. Recovery now enumerates **every**
+  balanced `[…]` / `{…}` span and keeps the first one that parses into a real
+  call. The span scanner also restarts its string state at each candidate
+  opener: carrying it in from surrounding prose left the scanner stuck inside a
+  string after a stray quote in `text="([^"]*)"`.
+- **Tests:** one regression test added (array after bracket-heavy prose). Suite
+  goes 219 → 220, all passing.
+- Version 0.9.7 (package.json and extension/manifest.json).
+
 ## 0.9.6
 
 - **Fixed: a `tool_call` fence that yielded no call was stripped as tool
