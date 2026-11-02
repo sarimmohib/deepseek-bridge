@@ -1006,3 +1006,17 @@ test('a call array inside bracket-heavy prose is still recovered', () => {
   assert.equal(out.calls[0].name, 'pwsh');
   assert.equal(out.calls[0].arguments.command, 'adb shell uiautomator dump');
 });
+
+
+test('a stray </tool_call> closer and Windows paths still parse', () => {
+  const NL = String.fromCharCode(10);
+  const BS = String.fromCharCode(92);
+  const names = new Set(['pwsh']);
+  const cmd = 'Set-Location C:' + BS + 'Users' + BS + 'Sarim';
+  const json = '[{"name":"pwsh","arguments":{"command":"' + cmd + '"}}]';
+  const text = '</tool_call>' + NL + json + NL + '</call>';
+  const out = extractToolCalls(text, { toolNames: names });
+  assert.equal(out.calls.length, 1);
+  assert.equal(out.calls[0].name, 'pwsh');
+  assert.ok(String(out.calls[0].arguments.command).includes('Sarim'));
+});

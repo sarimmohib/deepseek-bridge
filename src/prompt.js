@@ -1276,10 +1276,54 @@ function callFromItem(item, { allowDirect = true, requireArgs = false, toolNames
 // Wrapper residue left behind by an upstream HTML/markdown envelope or a
 // streaming cut: the call payload itself is intact, the fragments around it are
 // not JSON. Stripping them is safe because they are tags, never bare text.
-const ENVELOPE_RESIDUE = /<\/?(?:pre|code|invoke|calls|tool_calls|call|parameter)\b[^>]*>/gi;
+// `tool_call` (singular) is needed here too: the model sometimes emits a stray
+// `</tool_call>` closer around a bare array, and the residue then survives
+// stripping so the payload never looks like JSON.
+const ENVELOPE_RESIDUE =
+  /<\/?(?:pre|code|invoke|calls|tool_calls|tool_call|call|parameter)\b[^>]*>/gi;
 
 function stripEnvelopeResidue(text) {
   return text.replace(ENVELOPE_RESIDUE, '').trim();
+}
+
+// The model writes Windows paths (`C:\Users\Sarim`) into JSON strings without
+// doubling the backslash, which is not a valid JSON escape. JSON.parse then
+// rejects the whole payload and a readable call is lost. Walk the text as JSON
+// and double any backslash that does not begin a legal escape; quotes and
+// structure are untouched, so this cannot invent or merge tokens.
+function repairJsonEscapes(text) {
+  const src = String(text || '');
+  let out = '';
+  let inStr = false;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (!inStr) {
+      if (ch === '"') inStr = true;
+      out += ch;
+      continue;
+    }
+    if (ch === '"') {
+      inStr = false;
+      out += ch;
+      continue;
+    }
+    if (ch === '\\') {
+      const next = src[i + 1] || '';
+      if (/["\\/bfnrtu]/.test(next)) {
+        out += ch + next;
+        i++;
+        if (next === 'u') {
+          out += src.slice(i + 1, i + 5);
+          i += 4;
+        }
+      } else {
+        out += '\\\\';
+      }
+      continue;
+    }
+    out += ch;
+  }
+  return out;
 }
 
 // The first JSON opener in `text` and the index just past its matching closer,
@@ -1408,15 +1452,30 @@ function parseCallPayload(raw, options = {}) {
     // fall through to recovery
   }
 
-  const stripped = stripEnvelopeResidue(text);
-
-  // 2. Wrapper residue around an otherwise intact payload.
-  if (stripped && stripped !== text) {
+  // 1b. Same payload with lone backslashes (a Windows path) that JSON rejects.
+  const repaired = repairJsonEscapes(text);
+  if (repaired !== text) {
     try {
-      const calls = fromValue(JSON.parse(stripped));
+      const calls = fromValue(JSON.parse(repaired));
       if (calls.length) return calls;
     } catch {
       // fall through
+    }
+  }
+
+  const stripped = stripEnvelopeResidue(text);
+
+  // 2. Wrapper residue around an otherwise intact payload. Residue and a bad
+  // backslash tend to appear together (a stray closer plus a Windows path), so
+  // try the stripped text and its repaired form.
+  if (stripped && stripped !== text) {
+    for (const variant of [stripped, repairJsonEscapes(stripped)]) {
+      try {
+        const calls = fromValue(JSON.parse(variant));
+        if (calls.length) return calls;
+      } catch {
+        // fall through
+      }
     }
   }
 

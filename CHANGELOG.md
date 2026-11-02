@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.11
+
+- **Fixed: a stray `</tool_call>` closer discarded a valid call.** The residue
+  set listed `tool_calls` and `call` but not `tool_call` (singular), so the
+  closer survived stripping and the payload never looked like JSON. The call
+  was rendered as assistant text instead of executing.
+- **Fixed: Windows paths written with single backslashes were rejected.**
+  `C:\Users\Sarim` inside a JSON string is not a legal escape; JSON.parse
+  rejected the whole payload and a readable call was lost. Lone backslashes
+  inside strings are now doubled before parsing, applied to both the raw
+  payload and the residue-stripped variant.
+- **Tests:** one regression test for the closer + Windows-path shape. Suite
+  221 to 222, all passing.
+- Version 0.9.11 (package.json and extension/manifest.json).
+
 ## 0.9.10
 
 - **Fixed: a `tool_call` fence that yielded no call was still deleted from the
