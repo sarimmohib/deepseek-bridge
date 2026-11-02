@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.9.5
+
+- **Fixed: a valid `tool_call` fence was discarded when its payload carried
+  wrapper residue.** A complete array surrounded by the tail of an HTML or
+  markdown envelope — `[{"name":"pwsh",…}]\n</pre>"}` — failed
+  `JSON.parse`, and `parseCallPayload` returned `[]` on any parse error, so the
+  whole turn was reported as containing no complete call and the model had to
+  re-emit it. The payload is now parsed in four passes: as-is, after stripping
+  `</pre>`, `<pre>`, `</invoke>`, `</calls>` and similar wrapper tags, then over
+  the first bracket-balanced JSON span (string-aware), and finally entry by
+  entry. Issue #1.
+- **Fixed: one malformed entry discarded its valid siblings.** Because the
+  array was parsed as a unit, a truncated or corrupt second call zeroed out a
+  perfectly good first one. Each top-level object is now parsed independently,
+  so the calls that do parse still run.
+- **Fixed: a literal `<call>…</call>` block passed through as assistant text
+  instead of executing.** DeepSeek sometimes degrades a real invocation into
+  that wrapper; the XML path only knew `tool_call`/`tool_calls`, so the call
+  arrived as markdown and never ran. `<call>` is now parsed with the same
+  payload path. It is consumed only when its body really yields a call — a
+  prose mention of the tag stays in the reply byte for byte. Issue #2.
+- **Tests:** four regression tests added to `test/prompt.test.js` covering
+  both issues, including the prose-preservation case. Suite goes 213 → 217,
+  all passing.
+- Version 0.9.5 (package.json and extension/manifest.json).
+
 ## 0.9.4
 
 - **Fixed: an unescaped quote inside a DSML attribute truncated the value.**

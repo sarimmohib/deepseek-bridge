@@ -606,6 +606,18 @@ export function toolPreamble(tools, toolChoice) {
 const FENCED_TOOL = /```(?:tool_call|json:tool_call)[ \t]*(?:\r?\n)?([\s\S]*?)(?:\r?\n```|```[ \t]*$)/gi;
 const XML_TOOL = /<(?:tool_call|tool_calls)>([\s\S]*?)<\/(?:tool_call|tool_calls)>/gi;
 
+// `<call>…</call>` is what DeepSeek emits when it degrades a real invocation
+// into literal text (issue #2). The wrapper carries the same JSON payload as a
+// fence, so it is parsed by the same path instead of passing through as prose.
+// The tag may carry attributes (`<call name="x">`), which are ignored: the
+// payload names the tool.
+//
+// Unlike `<tool_call>`, this tag also appears in ordinary prose (documentation,
+// issue text, a model explaining the bug). So a `<call>` block is only consumed
+// when its payload really parses into a call; otherwise it is left in `cleaned`
+// byte for byte, and the caller still sees the model's text.
+const CALL_TAG = /<call\b[^>]*>([\s\S]*?)<\/call\s*>/gi;
+
 // DeepSeek's native chat template can leak DSML tags as ordinary text after a
 // tool-result turn. The emitted markup is not perfectly formed: closing tags
 // often lose their name (</｜｜DSML｜｜> instead of </｜｜DSML｜｜ invoke>),
@@ -1261,6 +1273,78 @@ function callFromItem(item, { allowDirect = true, requireArgs = false, toolNames
   };
 }
 
+// Wrapper residue left behind by an upstream HTML/markdown envelope or a
+// streaming cut: the call payload itself is intact, the fragments around it are
+// not JSON. Stripping them is safe because they are tags, never bare text.
+const ENVELOPE_RESIDUE = /<\/?(?:pre|code|invoke|calls|tool_calls|call|parameter)\b[^>]*>/gi;
+
+function stripEnvelopeResidue(text) {
+  return text.replace(ENVELOPE_RESIDUE, '').trim();
+}
+
+// The first JSON opener in `text` and the index just past its matching closer,
+// scanning string-aware so a bracket inside an argument string cannot end the
+// span early. Returns null when the payload is truncated (no matching closer).
+function balancedJsonSlice(text) {
+  const start = text.search(/[[{]/);
+  if (start < 0) return null;
+  const open = text[start];
+  const close = open === '[' ? ']' : '}';
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === open) depth++;
+    else if (ch === close && --depth === 0) return text.slice(start, i + 1);
+  }
+  return null;
+}
+
+// Parse each top-level `{…}` inside an array independently, so one malformed
+// entry cannot discard its valid neighbours. This is the partial-success path
+// promised by issue #1: a broken second call must not zero out the first.
+function salvageArrayObjects(text) {
+  const start = text.search(/\[/);
+  if (start < 0) return [];
+  const out = [];
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let objStart = -1;
+  for (let i = start + 1; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === '{') {
+      if (depth === 0) objStart = i;
+      depth++;
+    } else if (ch === '}') {
+      if (--depth === 0 && objStart >= 0) {
+        try {
+          out.push(JSON.parse(text.slice(objStart, i + 1)));
+        } catch {
+          // A genuinely malformed entry is skipped; the others still run.
+        }
+        objStart = -1;
+      }
+    } else if (ch === ']' && depth === 0) break;
+  }
+  return out;
+}
+
 function parseCallPayload(raw, options = {}) {
   const text = String(raw || '')
     .trim()
@@ -1268,21 +1352,62 @@ function parseCallPayload(raw, options = {}) {
     .replace(/```\s*$/, '')
     .trim();
   if (!text) return [];
-  let parsed;
+
+  const fromValue = (parsed) => {
+    if (Array.isArray(parsed)) return parsed.map((item) => callFromItem(item, options)).filter(Boolean);
+    if (parsed?.tool_calls && Array.isArray(parsed.tool_calls)) {
+      return parsed.tool_calls.map((item) => callFromItem(item, options)).filter(Boolean);
+    }
+    if (parsed?.calls && Array.isArray(parsed.calls)) {
+      return parsed.calls.map((item) => callFromItem(item, options)).filter(Boolean);
+    }
+    const one = callFromItem(parsed, options);
+    return one ? [one] : [];
+  };
+
+  // 1. The clean case: the payload is exactly JSON.
   try {
-    parsed = JSON.parse(text);
+    return fromValue(JSON.parse(text));
   } catch {
-    return [];
+    // fall through to recovery
   }
-  if (Array.isArray(parsed)) return parsed.map((item) => callFromItem(item, options)).filter(Boolean);
-  if (parsed?.tool_calls && Array.isArray(parsed.tool_calls)) {
-    return parsed.tool_calls.map((item) => callFromItem(item, options)).filter(Boolean);
+
+  const stripped = stripEnvelopeResidue(text);
+
+  // 2. Wrapper residue around an otherwise intact payload.
+  if (stripped && stripped !== text) {
+    try {
+      const calls = fromValue(JSON.parse(stripped));
+      if (calls.length) return calls;
+    } catch {
+      // fall through
+    }
   }
-  if (parsed?.calls && Array.isArray(parsed.calls)) {
-    return parsed.calls.map((item) => callFromItem(item, options)).filter(Boolean);
+
+  // 3. An intact array surrounded by junk: parse only the balanced span.
+  for (const candidate of [text, stripped]) {
+    if (!candidate) continue;
+    const slice = balancedJsonSlice(candidate);
+    if (!slice) continue;
+    try {
+      const calls = fromValue(JSON.parse(slice));
+      if (calls.length) return calls;
+    } catch {
+      // fall through
+    }
   }
-  const one = callFromItem(parsed, options);
-  return one ? [one] : [];
+
+  // 4. Partial success: keep every entry that does parse.
+  for (const candidate of [text, stripped]) {
+    if (!candidate) continue;
+    const calls = salvageArrayObjects(candidate).flatMap((item) => {
+      const one = callFromItem(item, options);
+      return one ? [one] : [];
+    });
+    if (calls.length) return calls;
+  }
+
+  return [];
 }
 
 /**
@@ -1344,7 +1469,15 @@ export function extractToolCalls(text, { toolNames = null, paramToolIndex = null
     calls.push(...parseCallPayload(match[1], { allowDirect: true }));
   }
 
-  let cleaned = source.replace(FENCED_TOOL, '').replace(XML_TOOL, '');
+  // A `<call>` wrapper is consumed only when it yields a real call.
+  let cleaned = source.replace(CALL_TAG, (block, payload) => {
+    const parsed = parseCallPayload(payload, { allowDirect: true });
+    if (!parsed.length) return block;
+    sawBlock = true;
+    calls.push(...parsed);
+    return '';
+  });
+  cleaned = cleaned.replace(FENCED_TOOL, '').replace(XML_TOOL, '');
   cleaned = cleaned.replace(JSON_FENCE, (block, payload) => {
     const parsed = parseCallPayload(payload, {
       allowDirect: Boolean(names),

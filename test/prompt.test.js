@@ -924,3 +924,51 @@ test('an invoke that yields no arguments is reported for the log', () => {
   assert.deepEqual(out.calls[0].arguments, {});
   assert.ok(out.repairs.some((line) => /invoke carried no readable arguments/.test(line)));
 });
+
+
+test('issue #1: wrapper residue inside a tool_call fence does not discard the call', () => {
+  const F = String.fromCharCode(96, 96, 96);
+  const arr = '[{"name":"read","arguments":{"file_path":"/tmp/a.txt"}}]';
+  const cases = [
+    arr + '\n</pre>"}',
+    arr + '\n"}',
+    arr + '\n</invoke>',
+    arr + '</pre>"}',
+    '<pre>' + arr,
+    arr + ']}',
+    '<calls>' + arr + '</calls>',
+    arr + '\n</calls>',
+  ];
+  for (const body of cases) {
+    const text = F + 'tool_call\n' + body + '\n' + F;
+    const out = extractToolCalls(text, { toolNames: new Set(['read']) });
+    assert.equal(out.calls.length, 1, JSON.stringify(body));
+    assert.equal(out.calls[0].name, 'read');
+    assert.deepEqual(out.calls[0].arguments, { file_path: '/tmp/a.txt' });
+  }
+});
+
+test('issue #1: a malformed entry does not discard its valid siblings', () => {
+  const F = String.fromCharCode(96, 96, 96);
+  const body = '[{"name":"read","arguments":{"file_path":"/tmp/a.txt"}},{"name":"read","argum';
+  const text = F + 'tool_call\n' + body + '\n' + F;
+  const out = extractToolCalls(text, { toolNames: new Set(['read']) });
+  assert.equal(out.calls.length, 1);
+  assert.equal(out.calls[0].name, 'read');
+});
+
+test('issue #2: a literal <call> block is executed, not passed through as text', () => {
+  const text = '<call>\n[{"name":"read_image","arguments":{"file_path":"/tmp/now.png"}}]\n</call>';
+  const out = extractToolCalls(text, { toolNames: new Set(['read_image']) });
+  assert.equal(out.calls.length, 1);
+  assert.equal(out.calls[0].name, 'read_image');
+  assert.deepEqual(out.calls[0].arguments, { file_path: '/tmp/now.png' });
+  assert.equal(out.cleaned, '');
+});
+
+test('issue #2: a <call> block that carries no call stays in the text', () => {
+  const text = 'Use the <call> wrapper: <call>not json</call>';
+  const out = extractToolCalls(text, { toolNames: new Set(['read']) });
+  assert.equal(out.calls.length, 0);
+  assert.equal(out.cleaned, text);
+});
