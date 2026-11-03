@@ -835,10 +835,10 @@ export const dashboardHtml = `<!DOCTYPE html>
   }
   function copySessionJson(btn) {
     if (!state.key) return;
-    fetch('/v1/bridge/session/token?full=1', { headers: { 'Authorization': 'Bearer ' + state.key } }).then(function (res) {
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      return res.json();
-    }).then(function (d) {
+    // Route through api(): the raw fetch here skipped the 401 branch that
+    // clearKey() + showUnlock() live in, so after a key rotation this button
+    // showed 'HTTP 401' while every other control self-healed.
+    api('/v1/bridge/session/token?full=1').then(function (d) {
       if (!d || d.ok === false || typeof d.token !== 'string' || !d.token) {
         toast('No session token to export', 'error');
         return;
@@ -1127,10 +1127,8 @@ export const dashboardHtml = `<!DOCTYPE html>
       return;
     }
     disarmRules();
-    fetch('/v1/bridge/rules?learned=1', { method: 'DELETE', headers: { 'Authorization': 'Bearer ' + state.key } }).then(function (res) {
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      return res.json();
-    }).then(function (d) {
+    // Same 401 handling as every other dashboard action (see copySessionJson).
+    api('/v1/bridge/rules?learned=1', { method: 'DELETE' }).then(function (d) {
       toast('Removed ' + num(d && d.removed) + ' learned rule(s)', 'ok');
       loadRules();
     }).catch(function (err) {

@@ -6,6 +6,11 @@
  * generic OpenAI-compatible client. No npm packages.
  */
 import { MODELS } from './openai.js';
+import { VERSION } from './version.js';
+
+// Preview column cap used by renderConversations. It was referenced but never
+// declared, so the wide-terminal branch threw `PREVIEW_WIDTH is not defined`.
+const PREVIEW_WIDTH = 48;
 
 const HARNESS_MODEL_NAMES = {
   'deepseek-reasoner': 'DeepSeek V4.1 Flash Reasoner (web)',

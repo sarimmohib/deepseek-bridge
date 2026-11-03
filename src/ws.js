@@ -16,6 +16,11 @@ const OP_CLOSE = 0x8;
 const OP_PING = 0x9;
 const OP_PONG = 0xa;
 
+// Reassembled size limit for a fragmented message. The per-frame 64 MB check
+// bounds one frame only; continuation frames accumulate here and need their
+// own running total, otherwise a client can grow the buffer without bound.
+const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
+
 function frame(opcode, payload) {
   const len = payload.length;
   let header;
@@ -43,6 +48,7 @@ export class WsConnection {
     this.buffer = Buffer.alloc(0);
     this.fragments = [];
     this.fragmentOpcode = 0;
+    this.fragmentBytes = 0;
     this.lastSeen = Date.now();
     this.listeners = { message: [], close: [] };
     this.meta = {};
@@ -86,6 +92,14 @@ export class WsConnection {
       let len = b1 & 0x7f;
       let offset = 2;
 
+      // RFC 6455 5.1: a client MUST mask every frame. Accepting unmasked frames
+      // served peers that were never validated as WebSocket clients, and the
+      // mask bytes were silently reinterpreted as payload.
+      if (!masked) {
+        this.close(1002, 'unmasked frame');
+        return;
+      }
+
       if (len === 126) {
         if (this.buffer.length < offset + 2) return;
         len = this.buffer.readUInt16BE(offset);
@@ -124,9 +138,20 @@ export class WsConnection {
       }
       if (opcode === OP_CONT) {
         this.fragments.push(Buffer.from(payload));
+        this.fragmentBytes += payload.length;
+        // The 64 MB cap above only bounds a SINGLE frame. Continuation frames
+        // had no running total, so one client could grow `fragments` without
+        // limit and OOM the process (every in-flight request dies).
+        if (this.fragmentBytes > MAX_MESSAGE_BYTES) {
+          this.fragments = [];
+          this.fragmentBytes = 0;
+          this.close(1009, 'message too large');
+          return;
+        }
         if (fin) {
           const whole = Buffer.concat(this.fragments);
           this.fragments = [];
+          this.fragmentBytes = 0;
           if (this.fragmentOpcode === OP_TEXT) this.#emit('message', whole.toString('utf8'));
         }
         continue;
@@ -135,6 +160,7 @@ export class WsConnection {
         if (!fin) {
           this.fragmentOpcode = opcode;
           this.fragments = [Buffer.from(payload)];
+          this.fragmentBytes = payload.length;
           continue;
         }
         if (opcode === OP_TEXT) this.#emit('message', payload.toString('utf8'));
@@ -173,7 +199,19 @@ export class WsConnection {
 
 export function attachWebSocket(server, { path = '/agent', onConnection }) {
   server.on('upgrade', (req, socket) => {
-    const url = new URL(req.url, 'http://127.0.0.1');
+    // `new URL` throws on a malformed request-target such as `GET //` and on a
+    // missing req.url. This runs BEFORE the key check, so an unauthenticated
+    // client could throw out of the listener: the socket was never answered or
+    // destroyed (leaked fd) and the daemon died without the uncaughtException
+    // guard. Answer and destroy instead.
+    let url;
+    try {
+      url = new URL(req.url || '/', 'http://127.0.0.1');
+    } catch {
+      socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+      socket.destroy();
+      return;
+    }
     if (url.pathname !== path) {
       socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
       socket.destroy();

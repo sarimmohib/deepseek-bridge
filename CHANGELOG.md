@@ -1,3 +1,37 @@
+## 0.9.17
+
+- **Fixed: `modelinfo.js` threw `ReferenceError: VERSION is not defined`.**
+  `renderHeader` used `VERSION` in a default parameter but the module only
+  imported `MODELS`, so `buildFrame()` died on its first call and the whole
+  frame render (models + conversations + health + log) was dead.
+- **Fixed: `modelinfo.js` threw `ReferenceError: PREVIEW_WIDTH is not
+  defined`.** The identifier was referenced in the wide-terminal branch of
+  `renderConversations` but never declared, so the conversation table threw
+  for every normal-width terminal; only the `width < 60` path worked.
+- **Fixed: a malformed WebSocket upgrade crashed the daemon.**
+  `new URL(req.url, ...)` ran unguarded in the `upgrade` listener, before the
+  key check. `GET // HTTP/1.1` with `Upgrade: websocket` threw out of the
+  listener: the socket was neither answered nor destroyed (leaked fd) and the
+  process exited without the `uncaughtException` guard. It now answers 400
+  and destroys the socket.
+- **Fixed: fragmented WebSocket messages had no size limit.** The 64 MB cap
+  bounded a single frame only; continuation frames were appended to
+  `fragments` with no running total, so one client could grow the buffer
+  without bound and OOM the bridge. Reassembly is now capped at 8 MB and
+  closes 1009 past it.
+- **Fixed: unmasked client frames were accepted.** RFC 6455 5.1 requires
+  every client frame to be masked; the mask bit was read but never enforced,
+  so the mask bytes were reinterpreted as payload and a non-WebSocket peer
+  was served as if it were one. Unmasked frames now close 1002.
+- **Fixed: two dashboard buttons skipped the 401 recovery path.**
+  `copySessionJson` and `clearLearned` used raw `fetch` with only
+  `if (!res.ok) throw`, missing the `clearKey()` + unlock overlay that `api()`
+  performs, so after a key rotation they showed `HTTP 401` while every other
+  control self-healed. Both now route through `api()`.
+- **Tests:** new `test/modelinfo-ws.test.js` (3 cases). The upgrade test
+  hangs against the pre-fix code, which is the defect itself. Suite 231 to
+  234.
+- Version 0.9.17 (package.json and extension/manifest.json).
 ## 0.9.16
 
 - **Security: two routes were registered ABOVE the API-key gate.**
