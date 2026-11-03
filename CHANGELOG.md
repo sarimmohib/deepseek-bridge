@@ -1,3 +1,16 @@
+## 0.9.18
+
+- **The bind address is now configurable.** `config.host` was read from
+  `config.json` but could never be set: nothing wrote it and no environment
+  variable overrode it, so the bridge was pinned to `127.0.0.1` and no phone
+  or second machine could reach it. `DS_BRIDGE_HOST` now takes precedence
+  (`DS_BRIDGE_HOST=0.0.0.0`, or a specific LAN/Tailscale IP). Loopback stays
+  the default: this is an authenticated local API and must not silently
+  become a LAN service. Every gated route still requires the API key, and
+  `/health` stays public for reachability probes.
+- Motivated by the Android companion app, which needs to reach the bridge
+  over Wi-Fi or Tailscale rather than only on the host itself.
+- Version 0.9.18.
 ## 0.9.17
 
 - **Fixed: `modelinfo.js` threw `ReferenceError: VERSION is not defined`.**

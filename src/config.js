@@ -94,7 +94,11 @@ export function loadConfig({ persist = true } = {}) {
   const saved = readJSON(CONFIG_FILE, {});
   const cfg = {
     ...saved,
-    host: saved.host || '127.0.0.1',
+    // Bind address. Loopback by default: this is an authenticated local API and
+    // must not silently become a LAN service. Set "host" in config.json (or
+    // DS_BRIDGE_HOST) to 0.0.0.0 or a specific LAN/Tailscale IP to reach the
+    // bridge from a phone. Every gated route still requires the API key.
+    host: process.env.DS_BRIDGE_HOST || saved.host || '127.0.0.1',
     port: Number(saved.port) || 8787,
     key: saved.key || `sk-ds-${crypto.randomBytes(24).toString('hex')}`,
     defaultModel: normalizeDefaultModel(saved.defaultModel),
