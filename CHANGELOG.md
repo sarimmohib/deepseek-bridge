@@ -1,3 +1,32 @@
+## 0.9.19
+
+- **Fixed: a restart could silently move the bridge off its configured port,
+  and every client that reads `config.json` was left dialling the old one.**
+  `ds-bridge.js` answered `EADDRINUSE` by binding `port + 1` and then saving the
+  new port. An update restart that raced the old listener therefore ended up on
+  8788, then a second (supervisor) instance on 8789, and the saved port became
+  8789. The bridge looked perfectly healthy (`/health`, dashboard, `deepseek
+  status` all fine) while dsh, whose provider `baseURL` is
+  `http://127.0.0.1:8787/v1`, got `Connection error` / `TRANSPORT` on every
+  turn. The saved port is now authoritative.
+- **A busy port is a loud failure, not a silent move.** Startup probes
+  `/health` on the busy port: if a bridge already answers, it logs
+  `already listening ... nothing to do` and exits 0 (idempotent start, no twin
+  process writing the same `accounts.json`/`state.json`); if some other process
+  owns the port, it logs the conflict and exits 1. It never rewrites the saved
+  port.
+- **`--port-next`** keeps the old behaviour, explicitly: fall forward to the
+  next free port for that run only. The new port is not persisted.
+- **`deepseek stop` now waits for the listener to actually close** (TCP probe,
+  up to 4 s, then SIGKILL and another 3 s) before returning. `deepseek update`
+  restarts immediately afterwards, so this closes the restart race that
+  triggered the port drift in the first place.
+- The startup line no longer claims `loopback only` when `host` is `0.0.0.0`
+  or a LAN/Tailscale address.
+- **Tests:** `test/port.test.js` (3 cases: busy port fails loudly and is not
+  saved, second bridge is an idempotent no-op, `--port-next` is not
+  persisted). Suite 234 to 237.
+- Version 0.9.19.
 ## 0.9.18
 
 - **The bind address is now configurable.** `config.host` was read from

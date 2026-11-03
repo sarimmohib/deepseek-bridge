@@ -26,6 +26,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import net from 'node:net';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, paths, saveConfig } from '../src/config.js';
@@ -92,6 +93,35 @@ async function getHealth(port, timeout = 800) {
   } catch {
     return null;
   }
+}
+
+// A TCP probe, not a fetch: it stays false while the listener is still bound
+// even if the old process no longer answers HTTP. `deepseek update` restarts
+// the bridge immediately after stopping it, and a restart that races the old
+// listener used to lose the configured port (the daemon moved to port+1 and
+// every client that reads config.json was left behind).
+function portOpen(port, host = '127.0.0.1', timeout = 400) {
+  return new Promise((resolve) => {
+    const socket = net.connect({ port, host });
+    const done = (open) => {
+      socket.destroy();
+      resolve(open);
+    };
+    socket.setTimeout(timeout);
+    socket.once('connect', () => done(true));
+    socket.once('timeout', () => done(false));
+    socket.once('error', () => done(false));
+  });
+}
+
+async function waitForPortClosed(port, ms = 6000, host = '127.0.0.1') {
+  const target = host === '0.0.0.0' || host === '::' || host === '[::]' ? '127.0.0.1' : host;
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if (!(await portOpen(port, target))) return true;
+    await sleep(120);
+  }
+  return !(await portOpen(port, target));
 }
 
 async function getStatus() {
@@ -717,15 +747,16 @@ async function stopBridge() {
     }
   }
 
-  const end = Date.now() + 4000;
-  while (Date.now() < end && (await getHealth(cfg.port))) await sleep(150);
-  if (await getHealth(cfg.port)) {
+  // Wait for the listener itself to disappear, not just for /health to stop
+  // answering: an update restarts the bridge in the next instant, and the new
+  // process must be able to bind the port saved in config.json.
+  if (!(await waitForPortClosed(cfg.port, 4000, cfg.host))) {
     try {
       process.kill(pid, 'SIGKILL');
     } catch {
       /* already gone */
     }
-    await sleep(300);
+    await waitForPortClosed(cfg.port, 3000, cfg.host);
   }
   try {
     fs.unlinkSync(paths.PID_FILE);

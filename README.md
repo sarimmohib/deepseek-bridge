@@ -425,7 +425,7 @@ Direct mode takes precedence whenever the account pool is non-empty.
 Start options are passed through:
 
 ```bash
-deepseek start --port 9000
+deepseek start --port 9000    # changes the saved port on purpose
 deepseek serve --port 9000
 deepseek start --no-update   # skip the automatic GitHub version check
 ```
@@ -435,9 +435,14 @@ GitHub before starting. The check is throttled to once every six hours and can
 be disabled with `autoUpdate: false` in the config or
 `DEEPSEEK_NO_UPDATE=1` in the environment.
 
-The bridge listens on `127.0.0.1` only. If port 8787 is busy, it picks the next
-free port and saves it in the config; update the extension popup if you use
-extension mode.
+The saved port is authoritative. The bridge binds `127.0.0.1:8787` by default,
+and if that port is busy it **refuses to start** instead of quietly moving:
+dsh (`baseURL`), the dashboard proxy, the remote stack and the extension all
+read the number from `config.json`, so a silent port change is exactly the
+"bridge is running but every client says connection refused" failure. Free the
+port (usually a stale instance: `deepseek stop`), or move it deliberately with
+`deepseek start --port 9000`. `ds-bridge --port-next` falls forward to the next
+free port for that run only and never saves it.
 
 ## Web dashboard
 
@@ -1027,7 +1032,7 @@ few quiet minutes (or pace the swarm) before the next sustained load.
 | `deepseek: command not found` | Add npm's global bin directory to `PATH` (`npm prefix -g`), or use `node bin/deepseek.js`. |
 | `EACCES` during `npm install -g .` | Use `npm install -g . --prefix "$HOME/.local"` and add `~/.local/bin` to `PATH`; do not use `sudo`. |
 | PowerShell blocks `npm.ps1` | Use `npm.cmd install -g .`, or run in `cmd.exe`. |
-| Port already in use | The bridge picks the next free port and saves it. Update the extension popup if used, or start with `deepseek start --port 9000`. |
+| Port already in use | The bridge refuses to start and says why: the port in `config.json` is the one dsh, the dashboard proxy and every other client dial, so it never switches ports behind your back. Free the port (a stale instance: `deepseek stop`), choose another deliberately with `deepseek start --port 9000`, or use `ds-bridge --port-next` for a one-off run on the next free port (not saved). |
 | Extension stops receiving jobs | MV3 workers sleep. The extension keeps a 30 s alarm and reconnects automatically; reload the extension or the tab as a last resort. |
 | `extension_outdated` or old behavior after an update | Chrome does not hot-reload unpacked extensions. Open `chrome://extensions`, press **Reload** on DeepSeek Bridge, then refresh the `chat.deepseek.com` tab once. |
 | Chrome shows `WebSocket connection ... ERR_CONNECTION_REFUSED` | The bridge was stopped while the extension was retrying. Current extension builds probe `GET /health` before opening the WebSocket, so a stopped bridge no longer creates this error. Reload the extension, press **Clear all** on the Errors page to remove old entries, then start the bridge with `deepseek`. |

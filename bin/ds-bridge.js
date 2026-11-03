@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
+import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { createServer } from '../src/server.js';
 import { loadConfig, saveConfig, Store, paths } from '../src/config.js';
@@ -22,13 +23,33 @@ const log = (msg) => {
 
 const extensionDir = fileURLToPath(new URL('../extension', import.meta.url));
 
+// A port that answers /health as a bridge is not an error: it means the
+// daemon is already running. Anything else on the port is a real conflict.
+function probeHost(host) {
+  // A wildcard bind is reachable on loopback, but "0.0.0.0" is not a target a
+  // client should dial.
+  return host === '0.0.0.0' || host === '::' || host === '[::]' ? '127.0.0.1' : host;
+}
+
+async function probeBridge(port, host = '127.0.0.1') {
+  try {
+    const res = await fetch(`http://${host}:${port}/health`, { signal: AbortSignal.timeout(1200) });
+    if (!res.ok) return null;
+    const health = await res.json();
+    return health && health.ok === true ? health : null;
+  } catch {
+    return null;
+  }
+}
+
 if (flag('--help') || flag('-h')) {
   console.log(`deepseek-bridge — OpenAI-compatible API in front of chat.deepseek.com
 
 Usage:
-  ds-bridge [--port 8787] [--reset-key] [--verbose]
+  ds-bridge [--port 8787] [--port-next] [--reset-key] [--verbose]
 
-The bridge listens on 127.0.0.1 only. Run 'deepseek --login' once to copy the
+The bridge listens on 127.0.0.1 by default (set "host" in config.json, or
+DS_BRIDGE_HOST, to expose it on a LAN/Tailscale address). Run 'deepseek --login' once to copy the
 browser session into the terminal; extension/ is the optional fallback. Add
 more accounts with 'deepseek --login --manual --token <userToken>' — the pool is
 unlimited and requests rotate automatically on per-account rate limits. Then call:
@@ -67,12 +88,20 @@ const accountInfo = accountsSummary();
 const { server, close } = createServer({ config, store, log });
 log(`deepseek-bridge ${VERSION} starting on ${config.host}:${config.port}`);
 
-const listen = (port, attempts = 10) =>
+// The saved port is a contract with every client: dsh (`baseURL`), the
+// dashboard proxy, the remote stack, the editor configs and the extension all
+// point at the number in config.json. Silently binding port+1 and persisting
+// it used to leave the bridge healthy on a port nobody was watching — the
+// "bridge is running but every other app gets connection refused" failure.
+// Moving ports is therefore opt-in (--port-next) and a one-off: the saved
+// port is never rewritten by a fallback.
+const allowPortFallback = flag('--port-next');
+const listen = (port, attempts = 0) =>
   new Promise((resolve, reject) => {
     const onError = (err) => {
       server.removeListener('error', onError);
       if (err.code === 'EADDRINUSE' && attempts > 0) {
-        log(`port ${port} is busy, trying ${port + 1}`);
+        log(`port ${port} is busy, trying ${port + 1} (--port-next)`);
         resolve(listen(port + 1, attempts - 1));
       } else reject(err);
     };
@@ -92,8 +121,29 @@ if (configuredPort !== config.port) {
   log(`stored port ${JSON.stringify(config.port)} is invalid; using ${configuredPort}`);
   config = saveConfig({ port: configuredPort });
 }
-const port = await listen(configuredPort);
-if (port !== config.port) config = saveConfig({ port });
+
+let port;
+try {
+  port = await listen(configuredPort, allowPortFallback ? 10 : 0);
+} catch (err) {
+  if (err?.code !== 'EADDRINUSE') throw err;
+  const health = await probeBridge(configuredPort, probeHost(config.host));
+  if (health) {
+    // Idempotent start: a daemon is already serving this exact port, and it is
+    // the one every client expects. Leave it alone instead of spawning a twin
+    // that writes the same accounts.json and state.json.
+    const version = typeof health.version === 'string' ? ` ${health.version}` : '';
+    log(`deepseek-bridge${version} is already listening on ${config.host}:${configuredPort}; nothing to do.`);
+    process.exit(0);
+  }
+  log(`port ${configuredPort} is already in use by another process.`);  log(`Refusing to move: clients are configured for port ${configuredPort}.`);
+  log(`Free that port, choose another deliberately with 'ds-bridge --port <n>', or use`);
+  log(`'ds-bridge --port-next' for a one-off run on the next free port (not saved).`);
+  process.exit(1);
+}
+if (port !== config.port) {
+  log(`using port ${port} for this run only; config still says ${config.port}.`);
+}
 
 fs.mkdirSync(paths.CONFIG_DIR, { recursive: true, mode: 0o700 });
 fs.writeFileSync(paths.PID_FILE, `${process.pid}\n`, { mode: 0o600 });
@@ -131,7 +181,7 @@ ${session.available ? '   1. Test:  deepseek chat "hello"' : '   1. Extension: c
   Log        ${paths.CONFIG_DIR}/bridge.log
 `);
 
-log(`listening on ${base} (loopback only)`);
+log(`listening on ${base} (bind ${config.host})`);
 
 let shuttingDown = false;
 const shutdown = () => {
