@@ -27,13 +27,55 @@ Both shapes work, and the app detects them from the URL path:
 - **Direct** — `http://host:8787` (or `http://100.x.y.z:8787`). The app sends
   `Authorization: Bearer <key>`. The bridge must be reachable on that address
   (`config.host` set to `0.0.0.0` or a Tailscale IP).
+- **Tailnet API** — `http://host/dsb`, the **default**. The same authenticated
+  API as direct mode, on port 80/443 through the tailnet router, so no port and
+  no plain-HTTP port forwarding are needed. The app still sends the key; the
+  router only strips the prefix and forwards to the loopback bridge.
 - **Proxy** — `http://host/bridge` (the remote dashboard proxy on port 80 / 49900).
   No key is stored on the phone; the proxy injects it. Tailnet-only unless the
-  proxy allowlist is widened.
+  proxy allowlist is widened. A wrong key here still looks accepted, which is
+  why it is not the default.
+
+`/dsh` is the harness UI, not the bridge API — do not point the app at it.
+
+Only `/bridge` counts as proxy mode. The check matches the path exactly, so a
+`/dsb` server keeps sending its `Authorization` header instead of being treated
+as a proxy and 401ing.
 
 Cleartext HTTP is allowed because self-hosted bridges are usually plain HTTP on a
 private network. The API is still authenticated and every token is stored
 encrypted on the device.
+
+## Official login page: viewport shim
+
+`chat.deepseek.com` sizes its shell with viewport units, and this WebView
+resolves **every** one of them (`1vh`, `100vh`, `100dvh`, `100svh`) to `0px`
+while `window.innerHeight` reports the correct height. The page therefore mounts,
+runs its JS, sets cookies — and paints nothing but its own background.
+
+`CaptureActivity` injects `JS_VH_SHIM`, which pins exactly two boxes to
+`innerHeight` in px:
+
+```css
+#root          { height: <innerHeight>px !important }
+#root > div    { height: <innerHeight>px !important }   /* the scroll container */
+#root > div > div:empty { display: none !important }    /* empty spacers */
+```
+
+`#root > div` is required: it is the page's scroll container and computes
+`height: 0` with `overflow: auto`, clipping the entire form even once `#root`
+has a height. Going one level deeper is a regression — `#root > div > div`
+matches an *empty* spacer, which then stretches to the full height and pushes
+the real form below the fold in a document that cannot scroll. If the page ever
+goes blank again, check those two boxes first:
+
+```cmd
+adb forward tcp:9222 localabstract:webview_devtools_remote_<pid>
+```
+
+then evaluate `#root`/`#root > div` heights over CDP. Compare
+`Page.captureScreenshot` unique-colour counts, not just DOM state: a correctly
+laid-out tree can still rasterise to one flat colour.
 
 ## Build
 

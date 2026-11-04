@@ -141,11 +141,29 @@ class DsbViewModel(app: Application) : AndroidViewModel(app) {
         is UnknownHostException -> "Host not found. Check the URL or tailnet connection."
         is ConnectException -> "Connection refused. Is the bridge running on that URL?"
         is SocketTimeoutException -> "Timed out. The bridge or the network did not answer."
-        is BridgeException -> error.message ?: "Bridge error"
+        is javax.net.ssl.SSLException -> "TLS failed. Use http:// for a tailnet or LAN address."
+        // A 401 is never the network: the host answered, the key did not match.
+        // Say so plainly instead of echoing the server's raw JSON envelope.
+        is BridgeException -> if (error.status == 401) {
+            "The bridge rejected the API key (401). Copy the key from `deepseek key` on the host, or use a /dsb URL."
+        } else {
+            error.message ?: "Bridge error"
+        }
         else -> error.message ?: error.javaClass.simpleName
     }
 
-    /** Probe + load everything for the active (or supplied) server. */
+    /**
+     * Probe + load everything for the active (or supplied) server.
+     *
+     * Order matters. `/health` is a PUBLIC route: it answers 200 whether or not
+     * the API key is right. Publishing that 200 as "connected" made the UI show
+     * REACHABLE and only afterwards surface the auth failure from the next call;
+     * because `health` was never cleared, the stale flag then made a second tap
+     * skip the connect path and open an empty console. So an authenticated route
+     * is probed first, and nothing is published until every call has succeeded.
+     * Any failure resets the whole view state instead of leaving a green banner
+     * over an empty list.
+     */
     suspend fun connect(rawUrl: String, apiKey: String): Boolean {
         busy = true
         error = null
@@ -154,13 +172,23 @@ class DsbViewModel(app: Application) : AndroidViewModel(app) {
             val candidate = upsertServerInternal(rawUrl, apiKey)
             val h = client.health(candidate)
             if (!h.ok) throw BridgeException("The bridge answered, but /health was not ok", null, null)
+            // Auth gate: a 401 here means the key is wrong, not the network.
+            val st = client.status(candidate)
+            val list = client.accounts(candidate)
+
             latencyMs = SystemClock.elapsedRealtime() - started
             activeId = candidate.id
             persist()
             health = h
-            refreshInternal(candidate)
+            status = st
+            accounts = list.accounts
+            lastRefreshAt = System.currentTimeMillis()
             true
         } catch (e: Exception) {
+            health = null
+            status = null
+            accounts = emptyList()
+            latencyMs = null
             error = humanError(e)
             false
         } finally {
@@ -175,6 +203,12 @@ class DsbViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 refreshInternal(server)
             } catch (e: Exception) {
+                // A failed refresh must not leave a green REACHABLE banner over
+                // an empty list; that combination is what looked like "logged in
+                // but everything is empty".
+                health = null
+                status = null
+                accounts = emptyList()
                 error = humanError(e)
             } finally {
                 refreshing = false
@@ -184,10 +218,13 @@ class DsbViewModel(app: Application) : AndroidViewModel(app) {
 
     private suspend fun refreshInternal(server: ServerConfig) {
         error = null
+        // Fetch everything before publishing anything, so a late failure cannot
+        // leave a half-updated screen.
         val h = client.health(server)
-        health = h
-        status = runCatching { client.status(server) }.getOrNull()
+        val st = runCatching { client.status(server) }.getOrNull()
         val list = client.accounts(server)
+        health = h
+        status = st
         accounts = list.accounts
         lastRefreshAt = System.currentTimeMillis()
     }

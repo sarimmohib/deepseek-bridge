@@ -170,10 +170,18 @@ data class ServerConfig(
     val label: String = "",
     val lastUsedAt: Long = 0,
 ) {
+    /**
+     * True only for the dashboard proxy (/bridge), which injects the API key
+     * itself. /dsb and /dsh must NOT count as proxy mode: they forward the
+     * caller's Authorization header untouched, so the app has to send the key.
+     * Matching every path that merely *contained* "bridge" classified /dsb as
+     * a proxy, dropped the Authorization header, and turned a working endpoint
+     * into a bare 401 — which the UI then reported as "wrong api key".
+     */
     val isProxy: Boolean
         get() = runCatching {
-            val path = java.net.URI(baseUrl.trim()).path ?: return@runCatching false
-            path.contains("bridge")
+            val path = (java.net.URI(baseUrl.trim()).path ?: return@runCatching false).trim('/')
+            path == "bridge" || path.startsWith("bridge/")
         }.getOrDefault(false)
 
     val hostLabel: String

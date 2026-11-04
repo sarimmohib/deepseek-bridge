@@ -52,6 +52,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.lifecycleScope
@@ -93,6 +94,15 @@ class CaptureActivity : ComponentActivity() {
     private var assistOpen by mutableStateOf(false)
     private var assistEmail by mutableStateOf("")
     private var assistPassword by mutableStateOf("")
+    // Sign-up needs these too: chat.deepseek.com's register form is email +
+    // password + repeat-password + verification code. Filling only the first
+    // password left the form half-complete and the submit button disabled,
+    // which looked like the assist "not working" on that page.
+    private var assistRepeat by mutableStateOf("")
+    private var assistCode by mutableStateOf("")
+
+    // Set once the WebView has a real size and the first load has been issued.
+    private var webViewLoaded = false
 
     private var baseUrl = ""
     private var apiKey = ""
@@ -145,6 +155,9 @@ class CaptureActivity : ComponentActivity() {
                 override fun onPageFinished(view: WebView?, url: String?) {
                     super.onPageFinished(view, url)
                     pageHost = runCatching { Uri.parse(url).host ?: "chat.deepseek.com" }.getOrDefault("chat.deepseek.com")
+                    // Fix the zero-height viewport-unit collapse first, then the
+                    // modal sizing; both must run on every page load.
+                    view?.evaluateJavascript(JS_VH_SHIM, null)
                     view?.evaluateJavascript(JS_MODAL_FIX, null)
                     handler.removeCallbacks(tokenWatcher)
                     handler.post(tokenWatcher)
@@ -158,7 +171,7 @@ class CaptureActivity : ComponentActivity() {
                 }
             }
             if (fresh) clearSession(view = this)
-            loadUrl(SIGN_IN_URL)
+            // NOT loaded here on purpose — see onSizeChanged in setContent.
         }
 
         if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true)
@@ -194,7 +207,30 @@ class CaptureActivity : ComponentActivity() {
                         Box(Modifier.weight(1f)) {
                             AndroidView(
                                 factory = { webView },
-                                modifier = Modifier.fillMaxSize(),
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    // Load only once the view has a real size.
+                                    //
+                                    // Chromium latches its layout viewport at the
+                                    // first layout. Created in onCreate, this
+                                    // WebView laid out at 0x0, so the page's
+                                    // initial containing block stayed zero and
+                                    // every viewport unit resolved to 0px — 1vh,
+                                    // 100vh, 100dvh and 100svh all measured 0
+                                    // while window.innerHeight correctly said
+                                    // 678. chat.deepseek.com sizes its shell with
+                                    // those units, so html/body/#root collapsed
+                                    // to 0px and the page painted nothing: the DOM
+                                    // mounted, cookies were set and the site's JS
+                                    // ran, but the screen stayed blank. Deferring
+                                    // the first load until the view is measured
+                                    // gives the page a real layout viewport.
+                                    .onSizeChanged { size ->
+                                        if (!webViewLoaded && size.width > 0 && size.height > 0) {
+                                            webViewLoaded = true
+                                            webView.loadUrl(SIGN_IN_URL)
+                                        }
+                                    },
                             )
                             RegisterFloat(
                                 captured = capturedToken != null,
@@ -207,9 +243,13 @@ class CaptureActivity : ComponentActivity() {
                             open = assistOpen,
                             email = assistEmail,
                             password = assistPassword,
+                            repeat = assistRepeat,
+                            code = assistCode,
                             onToggle = { assistOpen = !assistOpen },
                             onEmail = { assistEmail = it },
                             onPassword = { assistPassword = it },
+                            onRepeat = { assistRepeat = it },
+                            onCode = { assistCode = it },
                             onFill = { fillOfficialPage() },
                         )
                         CaptureSheet(
@@ -269,26 +309,58 @@ class CaptureActivity : ComponentActivity() {
         }
     }
 
-    /** Fill the official page's inputs without touching the buggy WebView IME path. */
+    /**
+     * Fill the official page's inputs without touching the buggy WebView IME path.
+     *
+     * Handles both shapes of the site:
+     *  - sign-in: email + password
+     *  - sign-up: email + password + repeat password + verification code
+     *
+     * The previous version took the first text/email input and the first password
+     * input only, so on the register page the repeat-password and the code box
+     * stayed empty and the submit button stayed disabled. Inputs are now matched
+     * by role, not by position: email by type/autocomplete/name, passwords by
+     * type (first = password, second = repeat), and the code box by its
+     * name/placeholder or a short maxlength. The code box only exists on the
+     * step after the email is accepted, so re-running FILL once that step
+     * appears is expected and harmless.
+     */
     private fun fillOfficialPage() {
         val email = org.json.JSONObject.quote(assistEmail.trim())
         val password = org.json.JSONObject.quote(assistPassword)
-        val js = "(function(e,p){" +
+        // Empty repeat means "same as password", which is what a sign-up form
+        // wants; an explicitly typed repeat always wins.
+        val repeat = org.json.JSONObject.quote(assistRepeat.ifBlank { assistPassword })
+        val code = org.json.JSONObject.quote(assistCode.trim())
+        val js = "(function(e,p,r,c){" +
             "function set(el,v){try{var d=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el),'value');" +
             "if(d&&d.set){d.set.call(el,v)}else{el.value=v}" +
             "el.dispatchEvent(new Event('input',{bubbles:true}));" +
             "el.dispatchEvent(new Event('change',{bubbles:true}));}catch(x){}}" +
-            "var ins=[].slice.call(document.querySelectorAll('input'));" +
-            "var em=ins.filter(function(i){return i.type==='text'||i.type==='email'})[0];" +
-            "var pw=ins.filter(function(i){return i.type==='password'})[0];" +
-            "if(em)set(em,e);if(pw)set(pw,p);return !!(em||pw);" +
-            "})($email,$password)"
-        webView.evaluateJavascript(js) { result ->
-            if (result == "true") {
+            "var ins=[].slice.call(document.querySelectorAll('input')).filter(function(i){" +
+            "return i.type!=='hidden'&&!i.disabled&&!i.readOnly;});" +
+            "function pick(fn){for(var i=0;i<ins.length;i++){if(fn(ins[i]))return ins[i]}return null}" +
+            "function hint(i){return ((i.name||'')+(i.id||'')+(i.placeholder||'')+(i.autocomplete||'')+(i.getAttribute('aria-label')||'')).toLowerCase()}" +
+            "var em=pick(function(i){return i.type==='email'||i.autocomplete==='username'||/mail|phone|user|account/.test(hint(i))});" +
+            "var pws=ins.filter(function(i){return i.type==='password'});" +
+            "var cd=pick(function(i){if(i===em||pws.indexOf(i)>=0)return false;" +
+            "var h=hint(i);if(/code|verify|verification|otp|captcha|token/.test(h))return true;" +
+            "return i.maxLength>0&&i.maxLength<=8&&i.type!=='email'&&i.type!=='password';});" +
+            "var n=0;" +
+            "if(em&&e){set(em,e);n++}" +
+            "if(pws[0]&&p){set(pws[0],p);n++}" +
+            "if(pws[1]&&r){set(pws[1],r);n++}" +
+            "if(cd&&c){set(cd,c);n++}" +
+            "return String(n);" +
+            "})($email,$password,$repeat,$code)"
+        webView.evaluateJavascript(js) { raw ->
+            val filled = raw?.trim()?.trim('"')?.toIntOrNull() ?: 0
+            if (filled > 0) {
                 assistOpen = false
                 errorMessage = null
             } else {
-                errorMessage = "No login fields found — tap the email box on the page once, then retry."
+                errorMessage =
+                    "No login or sign-up fields found — tap the email box on the page once, then retry."
             }
         }
     }
@@ -344,6 +416,50 @@ class CaptureActivity : ComponentActivity() {
          * the dialog stays open. The observer + timer re-apply the declarations
          * if React remounts the dialog; once it has height the pass is a no-op.
          */
+        /**
+         * Repairs viewport units in this WebView.
+         *
+         * Chromium here reports a correct layout viewport (411x678) yet resolves
+         * every viewport unit to zero: 100vh, 100dvh, 100svh and even 1vh all
+         * measure 0px, while percentages and px resolve fine. chat.deepseek.com
+         * sizes its shell with those units, so html/body/#root collapsed to zero
+         * height. The DOM mounted, cookies were set and the site's JS ran — but
+         * the page painted nothing, which looked like "the page never loaded".
+         *
+         * Percentages DO resolve, so the height chain is pinned in px computed
+         * from window.innerHeight, which is reported correctly. The stylesheet is
+         * rewritten only when that height actually changes, and it re-applies on
+         * rotation and on React re-renders (which replace the containers).
+         */
+        private const val JS_VH_SHIM =
+            "(function(){" +
+                "function apply(){var h=window.innerHeight||0;if(h<50)return;" +
+                "if(window.__dsbVhH===h)return;window.__dsbVhH=h;" +
+                "var s=document.getElementById('dsb-vh');" +
+                "if(!s){s=document.createElement('style');s.id='dsb-vh';" +
+                "(document.head||document.documentElement).appendChild(s);}" +
+                // Two levels must be pinned, and exactly two.
+                //
+                // #root itself, and #root>div which is the page's scroll
+                // container (c994dda2). That container carries overflow:auto
+                // and computes to height:0 because its own height comes from a
+                // viewport unit — so it clipped the entire login form to
+                // nothing. The form was laid out at correct coordinates with
+                // opacity 1 and visibility visible, yet painted zero pixels;
+                // the only way to see it was to pin this box.
+                //
+                // Going deeper is what broke this earlier: forcing
+                // #root>div>div matched an EMPTY spacer div and stretched it to
+                // a full 678px, pushing the real form below the fold. So the
+                // empty spacers are explicitly collapsed here instead.
+                "s.textContent='#root{height:'+h+'px!important;min-height:'+h+'px!important}'+" +
+                "'#root>div{height:'+h+'px!important;min-height:'+h+'px!important}'+" +
+                "'#root>div>div:empty{display:none!important;height:0!important;min-height:0!important}';}" +
+                "apply();" +
+                "window.addEventListener('resize',apply);" +
+                "setInterval(apply,700);" +
+                "})()"
+
         private const val JS_MODAL_FIX =
             "(function(){" +
                 "if(window.__dsbModalFix)return;window.__dsbModalFix=1;" +
@@ -452,9 +568,13 @@ private fun CredentialAssist(
     open: Boolean,
     email: String,
     password: String,
+    repeat: String,
+    code: String,
     onToggle: () -> Unit,
     onEmail: (String) -> Unit,
     onPassword: (String) -> Unit,
+    onRepeat: (String) -> Unit,
+    onCode: (String) -> Unit,
     onFill: () -> Unit,
 ) {
     Column(
@@ -485,15 +605,19 @@ private fun CredentialAssist(
             DsbField(email, onEmail, "Email / phone number")
             Spacer(Modifier.height(6.dp))
             DsbField(password, onPassword, "Password", password = true)
+            Spacer(Modifier.height(6.dp))
+            DsbField(repeat, onRepeat, "Repeat password (sign-up)", password = true)
+            Spacer(Modifier.height(6.dp))
+            DsbField(code, onCode, "Verification code (sign-up)", mono = true)
             Spacer(Modifier.height(8.dp))
             LimeAction(
                 "FILL THE OFFICIAL PAGE",
-                enabled = email.isNotBlank() || password.isNotBlank(),
+                enabled = email.isNotBlank() || password.isNotBlank() || code.isNotBlank(),
                 onClick = onFill,
             )
             Spacer(Modifier.height(5.dp))
             Body(
-                "This only fills the fields; the page still handles Log in, captcha and verification.",
+                "Fills sign-in and sign-up fields. Repeat password defaults to the password; the code box is filled when it appears. The page still handles Log in, captcha and sending the code.",
                 size = 9,
                 color = Dsb.Muted,
             )

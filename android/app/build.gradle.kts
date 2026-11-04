@@ -13,8 +13,8 @@ android {
         applicationId = "dev.sarim.dsbmobile"
         minSdk = 26
         targetSdk = 34
-        versionCode = 920
-        versionName = "0.9.20"
+        versionCode = 921
+        versionName = "0.9.21"
     }
 
     buildTypes {

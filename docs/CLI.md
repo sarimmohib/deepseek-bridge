@@ -89,7 +89,7 @@ before doing this.
 model ids, the API key, and every stored token grouped by health:
 
 ```text
- DEEPSEEK BRIDGE v0.9.20                          ONLINE 127.0.0.1:8787
+ DEEPSEEK BRIDGE v0.9.21                          ONLINE 127.0.0.1:8787
  started in the background
 
  ENDPOINTS

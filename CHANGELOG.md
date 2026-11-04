@@ -1,3 +1,30 @@
+## 0.9.21
+
+- **DSB Mobile renders on Android again.** Two stacked defects in the viewport
+  shim left the sign-in WebView blank while the DOM was perfectly healthy. This
+  WebView resolves every viewport unit (`1vh`, `100vh`, `100dvh`, `100svh`) to
+  `0px` even though `window.innerHeight` reports the real height, so the page
+  shell collapsed; and the auth page's scroll container (`#root > div`) computes
+  `height: 0` with `overflow: auto`, clipping the whole form. The shim now pins
+  exactly `#root` and `#root > div` to `innerHeight` and collapses empty spacer
+  divs. Forcing `#root > div > div` to full height — what the previous revision
+  did — matched an empty spacer, stretched it to the viewport height, and pushed
+  the real form below the fold.
+- **The Connect screen defaults to the port-free tailnet API.** `/dsb` forwards
+  the caller's `Authorization` header untouched, so the key you paste is the key
+  that gets checked. `/bridge` is the dashboard proxy and injects its own key,
+  which is why a wrong key there still looked accepted. `isProxy` now matches
+  only the `bridge` path instead of any URL merely containing "bridge", so
+  `/dsb` no longer drops the header and 401s.
+- **Connect reports the real failure.** A 401 says the key did not match and
+  points at `deepseek key`, TLS errors suggest `http://` for tailnet/LAN hosts,
+  and the reachability probe hits an authenticated route before publishing
+  REACHABLE — a stale green banner over an empty account list can no longer
+  happen, and a failed refresh clears the state instead of half-updating it.
+- **The screen version comes from the build.** The Connect footer prints
+  `BuildConfig.VERSION_NAME` rather than a hard-coded string.
+- Version 0.9.21.
+
 ## 0.9.20
 
 - **`deepseek install` is a real setup wizard.** It probes for Git, Tailscale,

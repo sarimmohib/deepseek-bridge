@@ -38,6 +38,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import dev.sarim.dsbmobile.BuildConfig
 import dev.sarim.dsbmobile.DsbViewModel
 import dev.sarim.dsbmobile.data.ServerConfig
 import dev.sarim.dsbmobile.ui.DsbField
@@ -54,7 +55,12 @@ import dev.sarim.dsbmobile.ui.shortTime
 import dev.sarim.dsbmobile.ui.theme.Dsb
 import kotlinx.coroutines.launch
 
-const val DEFAULT_PROXY_URL = "http://desktop-drbedno.tailce34b1.ts.net/bridge"
+// Port-free tailnet endpoint for the bridge API itself. /dsb forwards the
+// caller's Authorization header untouched, so the key you paste is the key that
+// gets checked. (/bridge is the dashboard proxy: it injects its own key, which
+// is why a wrong key there still looked accepted.)
+const val DEFAULT_PROXY_URL = "http://desktop-drbedno.tailce34b1.ts.net/dsb"
+const val TAILNET_HOST = "desktop-drbedno.tailce34b1.ts.net"
 
 @Composable
 fun ConnectScreen(
@@ -87,7 +93,7 @@ fun ConnectScreen(
         Spacer(Modifier.height(18.dp))
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Mono("DEEPSEEK BRIDGE", size = 9, letterSpacing = 2.4f)
-            Mono("v0.1.0", size = 9)
+            Mono("v" + BuildConfig.VERSION_NAME, size = 9)
         }
 
         Spacer(Modifier.height(26.dp))
@@ -101,14 +107,14 @@ fun ConnectScreen(
         DsbField(
             value = url,
             onValueChange = { url = it },
-            placeholder = "http://host:8787 or http://host/bridge",
+            placeholder = "http://host/dsb or http://host:8787",
             mono = true,
             keyboardType = KeyboardType.Uri,
         )
         Spacer(Modifier.height(8.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            QuickChip("TAILNET PROXY") { url = DEFAULT_PROXY_URL }
-            QuickChip("LOCAL 8787") { url = "http://127.0.0.1:8787" }
+            QuickChip("TAILNET /dsb") { url = DEFAULT_PROXY_URL }
+            QuickChip("TAILNET /bridge") { url = "http://$TAILNET_HOST/bridge" }
         }
 
         if (!isProxy) {
