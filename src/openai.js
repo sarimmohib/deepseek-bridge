@@ -613,7 +613,7 @@ export async function handleChatCompletions(req, res, body, ctx) {
 
   const directSession = ctx.direct?.reloadSession?.();
   const runner = directSession ? ctx.direct : agent;
-  const mode = directSession ? 'direct' : 'extension';
+  const mode = directSession ? 'direct' : 'agent';
 
   const started = Date.now();
   let content = '';
@@ -893,7 +893,7 @@ export async function handleChatCompletions(req, res, body, ctx) {
           entry.tokensOut = numOr(carried?.tokensOut, 0) + completionTokens;
         }
       } else {
-        // No usage this turn (recovered or extension-mode turn): carry the
+        // No usage this turn (recovered or agent-mode turn): carry the
         // previous counters forward instead of resetting them.
         entry.tokensIn = numOr(carried?.tokensIn, 0);
         entry.tokensOut = numOr(carried?.tokensOut, 0);

@@ -1,3 +1,38 @@
+## 0.9.20
+
+- **`deepseek install` is a real setup wizard.** It probes for Git, Tailscale,
+  DeepSeek Harness (dsh) and Node, then installs only what you select using the
+  machine's package manager (winget / Chocolatey / Scoop, Homebrew, or
+  apt / dnf / pacman / zypper / apk). Missing Tailscale falls back to the
+  official installer. `--tools`, `--autostart`, `--expose`, `--yes`,
+  `--dry-run` and `--list` make it scriptable; `npm install -g .` opens it once
+  when the install runs in an interactive terminal.
+- **Autostart is a supervised service.** Linux gets a systemd user unit with
+  linger, macOS a LaunchAgent, Windows a hidden logon task named
+  `DeepSeek Bridge` (registered with `schtasks`, run through `wscript.exe` so
+  no console flashes). `deepseek install --no-autostart` removes it.
+- **New start screen.** `deepseek`, `start` and `status` now render a panel with
+  the loopback/LAN/Tailscale URLs, both model ids and context sizes, the API
+  key, and every token grouped as working / cooling / expired with success and
+  failure counts. It respects `NO_COLOR`, truncates to the terminal width, and
+  has an ASCII mode (`DEEPSEEK_ASCII=1`).
+- `deepseek status` prints a compact queue line instead of the raw JSON blob.
+- **`deepseek login` is the canonical login.** `deepseek login` is the hidden
+  prompt, `deepseek login <token>` adds one account, and
+  `deepseek login <a> <b> ...` adds several in one run. `--token-file` accepts
+  one token per line. `--manual` and the legacy `--login` flag remain aliases.
+- **The Chrome extension is gone.** Token login is the only login path; the
+  `extension/` folder and the `deepseek extension` command were removed, and
+  the docs no longer describe a browser-side fallback.
+- **The Android app lives in this repository.** DSB Mobile moved to `android/`,
+  builds with the checked-in Gradle wrapper, and the debug APK is attached to
+  every published release by `.github/workflows/android.yml`.
+- **Lean README + docs split.** The main page covers what the bridge is, what it
+  does, install, login, and the app; architecture, API, CLI, and troubleshooting
+  moved to `docs/`.
+- Tests: `test/installer.test.js` and `test/tui.test.js` (20 cases). Suite
+  239 to 259.
+- Version 0.9.20.
 ## 0.9.19
 
 - **Fixed: a restart could silently move the bridge off its configured port,

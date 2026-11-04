@@ -1,9 +1,9 @@
 {
   "name": "deepseek-bridge",
-  "version": "0.9.19",
+  "version": "0.9.20",
   "private": true,
   "type": "module",
-  "description": "OpenAI-compatible local API for chat.deepseek.com with an unlimited account pool, automatic rotation, and a dsh-tuned system prompt with learned rules. Copies your web session once, then runs without Chrome.",
+  "description": "OpenAI-compatible local API for chat.deepseek.com with an unlimited account pool, automatic rotation, and a dsh-tuned system prompt with learned rules. Add a userToken once, then run headless.",
   "license": "Unlicense",
   "repository": {
     "type": "git",
@@ -17,24 +17,35 @@
     "deepseek",
     "openai",
     "openai-api",
-    "chrome-extension",
     "bridge",
     "llm",
     "zcode",
-    "direct"
+    "direct",
+    "android"
   ],
   "bin": {
     "deepseek": "./bin/deepseek.js",
+    "dsb": "./bin/deepseek.js",
     "deepseek-bridge": "./bin/ds-bridge.js",
     "deepseek-chat": "./bin/ds-chat.js",
     "ds": "./bin/deepseek.js",
     "ds-bridge": "./bin/ds-bridge.js",
     "ds-chat": "./bin/ds-chat.js"
   },
+  "files": [
+    "bin/",
+    "src/",
+    "RULES.md",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
   "scripts": {
     "start": "node bin/ds-bridge.js",
     "serve": "node bin/deepseek.js serve",
     "chat": "node bin/ds-chat.js",
+    "setup": "node bin/deepseek.js install",
+    "postinstall": "node bin/postinstall.js",
     "test": "node --test test/*.test.js"
   },
   "engines": {

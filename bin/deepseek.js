@@ -5,22 +5,21 @@
  *   deepseek                 start in the background (or report it is running)
  *   deepseek serve           run in the foreground
  *   deepseek stop            stop the background process
- *   deepseek status          show bridge/extension status
+ *   deepseek status          show bridge status
  *   deepseek ui              open the web dashboard in a browser
  *   deepseek models          one line per model
  *   deepseek models --info   model details + pasteable dsh config snippet
  *   deepseek chat "hello"    send a chat message
  *   deepseek "hello"         shorthand for chat
- *   deepseek --login         copy the browser session (extension or manual)
- *   deepseek --login --manual --token X   add one account to the pool
- *   deepseek --login --manual --replace   replace the whole account pool
- *   deepseek accounts         list / remove / clear the stored DeepSeek accounts
+ *   deepseek login           paste a userToken (hidden prompt)
+ *   deepseek login <token>   add one account to the pool
+ *   deepseek login <a> <b>   add several accounts in one run
+ *   deepseek accounts        list / remove / clear the stored DeepSeek accounts
  *   deepseek --logout        delete every terminal account
  *   deepseek session         show session metadata
  *   deepseek version         show local and GitHub versions
  *   deepseek update          fast-forward a git checkout
  *   deepseek key             print the API key
- *   deepseek extension       print the absolute extension folder
  *   deepseek logs            print the log path and the last lines
  */
 import fs from 'node:fs';
@@ -49,19 +48,20 @@ import {
   readLocalVersion,
   updateFromGit,
 } from '../src/version.js';
+import { autostartStatus, probeTools, runInstaller, tailscaleInfo } from '../src/installer.js';
+import { collectNetworkInfo, createStyle, printStartup } from '../src/tui.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BRIDGE = path.join(HERE, 'ds-bridge.js');
 const CHAT = path.join(HERE, 'ds-chat.js');
-const EXTENSION = path.resolve(HERE, '..', 'extension');
 const LOG = path.join(paths.CONFIG_DIR, 'bridge.log');
 
 const args = process.argv.slice(2);
 const first = args[0];
 const known = new Set([
-  'start', 'serve', 'stop', 'status', 'chat', 'key', 'extension',
+  'start', 'serve', 'stop', 'status', 'chat', 'key',
   'logs', 'login', 'logout', 'session', 'version', 'update', 'help',
-  'ui', 'models', 'accounts', 'rules',
+  'ui', 'models', 'accounts', 'rules', 'install', 'setup',
 ]);
 const AUTO_UPDATE_INTERVAL = 6 * 60 * 60 * 1000;
 
@@ -149,16 +149,6 @@ async function waitForBridge(ms = 15000, child = null) {
     await sleep(250);
   }
   return null;
-}
-
-async function waitForExtension(cfg, ms = 15000) {
-  const end = Date.now() + ms;
-  while (Date.now() < end) {
-    const health = await getHealth(cfg.port);
-    if (health?.extension) return true;
-    await sleep(300);
-  }
-  return false;
 }
 
 function cleanToken(value) {
@@ -264,32 +254,46 @@ function readHidden(question) {
   });
 }
 
-function tokenFromArgs(args) {
+function readTokenFile(file) {
+  return fs
+    .readFileSync(file, 'utf8')
+    .split(/\r?\n/)
+    .map(cleanToken)
+    .filter(Boolean);
+}
+
+function tokensFromArgs(args) {
+  const tokens = [];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
-    if (arg === '--token' || arg === '-t') return args[++i] || '';
-    if (arg.startsWith('--token=')) return arg.slice('--token='.length);
+    if (arg === '--token' || arg === '-t') {
+      const value = args[++i];
+      if (value) tokens.push(value);
+      continue;
+    }
+    if (arg.startsWith('--token=')) {
+      tokens.push(arg.slice('--token='.length));
+      continue;
+    }
     if (arg === '--token-file' || arg === '-f') {
       const file = args[++i];
       if (!file) throw new Error('--token-file needs a path');
-      return fs.readFileSync(file, 'utf8');
+      tokens.push(...readTokenFile(file));
+      continue;
     }
     if (arg.startsWith('--token-file=')) {
-      return fs.readFileSync(arg.slice('--token-file='.length), 'utf8');
+      tokens.push(...readTokenFile(arg.slice('--token-file='.length)));
+      continue;
     }
-    if (arg === '--label') i++; // the label is not a positional token
-  }
-  // Bare positional token, e.g. `deepseek --login --manual <token>`.
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
     if (arg === '--label') {
-      i++;
+      i++; // the label is not a positional token
       continue;
     }
     if (arg.startsWith('-')) continue;
-    return arg;
+    // Bare positional token, e.g. `deepseek login <token>`.
+    tokens.push(arg);
   }
-  return '';
+  return tokens.map(cleanToken).filter(Boolean);
 }
 
 function labelFromArgs(args) {
@@ -336,21 +340,24 @@ function accountStateText(account, now = Date.now()) {
   return 'ready';
 }
 
-async function readManualToken(args) {
-  const explicit = tokenFromArgs(args);
-  if (explicit) return cleanToken(explicit);
+async function readManualTokens(args) {
+  const explicit = tokensFromArgs(args);
+  if (explicit.length) return explicit;
   const envToken = process.env.DEEPSEEK_TOKEN || process.env.DEEPSEEK_USER_TOKEN;
-  if (envToken) return cleanToken(envToken);
+  if (envToken) return [cleanToken(envToken)].filter(Boolean);
   if (!process.stdin.isTTY) {
     const piped = await readAllStdin();
-    if (piped.trim()) return cleanToken(piped);
-    return '';
+    return piped
+      .split(/\r?\n/)
+      .map(cleanToken)
+      .filter(Boolean);
   }
-  return cleanToken(await readHidden('  userToken (hidden): '));
+  const token = cleanToken(await readHidden('  userToken (hidden): '));
+  return token ? [token] : [];
 }
 
 function printSessionSummary(summary, { prefix = '  ', showMode = true } = {}) {
-  if (showMode) console.log(`${prefix}Mode        direct${summary.available ? ' (Chrome not required)' : ' — run deepseek --login'}`);
+  if (showMode) console.log(`${prefix}Mode        direct${summary.available ? '' : ' - run deepseek login'}`);
   const count = Number(summary.accounts) || 0;
   if (!summary.available) {
     if (count) console.log(`${prefix}Accounts    ${count}`);
@@ -407,8 +414,8 @@ function printAccountsTable(data) {
   if (!list.length) {
     console.log('');
     console.log('  No DeepSeek accounts stored.');
-    console.log('  Add one with:  deepseek --login --manual --token <userToken>');
-    console.log('  or:            deepseek --login   (copy the browser session once)');
+    console.log('  Add one with:  deepseek login <userToken>');
+    console.log('  or:            deepseek login   (paste it at the hidden prompt)');
     console.log('');
     return;
   }
@@ -466,11 +473,12 @@ function printAccountsHelp() {
   deepseek accounts clear --yes     Remove every account and the legacy session file
 
 Add accounts:
-  deepseek --login --manual --token <userToken>            append one account
-  deepseek --login --manual --token-file token.txt         append from a file
-  DEEPSEEK_TOKEN=<userToken> deepseek --login --manual     append from the environment
-  deepseek --login --manual --token <userToken> --replace  replace the whole pool
-  deepseek --login                                         copy the browser session once
+  deepseek login <userToken>                    append one account
+  deepseek login <a> <b> <c>                    append several accounts
+  deepseek login --token-file token.txt         append from a file (one token per line)
+  DEEPSEEK_TOKEN=<userToken> deepseek login     append from the environment
+  deepseek login <userToken> --replace          replace the whole pool
+  deepseek login                                paste at the hidden prompt
 
 Accounts are verified with DeepSeek before they are kept. When one account is
 rate-limited the bridge cools it down and rotates the next request to another
@@ -602,7 +610,7 @@ async function accountsClearCommand() {
     removed = accounts.clearAccounts().removed;
   }
   console.log(`Removed ${removed} DeepSeek account(s) and the legacy session file.`);
-  console.log('The bridge will fall back to extension mode if the Chrome extension is connected.');
+  console.log('Add a fresh login with `deepseek login <userToken>`.');
 }
 
 function tailLog(lines = 30) {
@@ -646,39 +654,35 @@ async function ensureRunning(extraArgs = []) {
 function printStatus(cfg, health, started = false) {
   const session = sessionSummary();
   const accountInfo = accounts.accountsSummary();
-  const ext = health?.extension ? 'connected' : 'not connected';
-  const accountLine = accountInfo.count
-    ? `${accountInfo.count} stored · ${accountInfo.ready} ready · ${accountInfo.cooling} cooling`
-    : 'none — run `deepseek --login`';
-  console.log(`
-  deepseek-bridge ${started ? 'started in the background' : 'is running'}
-
-  Version     ${health?.version || readLocalVersion()}
-  Base URL    http://127.0.0.1:${cfg.port}/v1
-  API key     ${cfg.key}
-  Mode        ${session.available ? 'direct' : health?.extension ? 'extension' : 'not ready'}
-  Accounts    ${accountLine}
-  Extension   ${ext}${session.available ? ' (optional in direct mode)' : ''}
-  Extension folder
-              ${EXTENSION}
-  Config      ${paths.CONFIG_FILE}
-  Log         ${LOG}
-`);
+  const network = collectNetworkInfo({ tailscale: tailscaleInfo() });
+  const tools = probeTools({ skipVersion: false }).map((tool) => ({
+    id: tool.id,
+    found: tool.found,
+    version: tool.version,
+  }));
+  printStartup(
+    {
+      version: health?.version || readLocalVersion(),
+      cfg,
+      health,
+      started,
+      mode: session.available ? 'direct' : 'not ready',
+      accounts: accountInfo,
+      models: MODELS,
+      tools,
+      autostart: autostartStatus(),
+      network,
+    },
+    { style: createStyle({ ascii: process.env.DEEPSEEK_ASCII === '1' }) },
+  );
 
   if (session.available) {
     printSessionSummary(session, { showMode: false });
     return;
   }
 
-  if (health?.extension) {
-    console.log('Extension mode is ready. Run `deepseek --login` to copy the session into the terminal');
-    console.log('and stop paying the Chrome RAM cost on every request.');
-    return;
-  }
-
-  console.log('Next: load that extension folder in Chrome (chrome://extensions → Developer mode → Load unpacked),');
-  console.log('open the popup and enter the port/key above, sign in at https://chat.deepseek.com,');
-  console.log('then run `deepseek --login` to copy the session into the terminal.');
+  console.log('  Next: add a login with `deepseek login` (paste a userToken).');
+  console.log('  The bridge needs at least one account before it can answer requests.');
 }
 
 function runForeground(script, scriptArgs = []) {
@@ -1085,40 +1089,7 @@ async function maybeAutoUpdate() {
   }
 }
 
-async function manualLogin() {
-  console.log('');
-  console.log('  Manual login (no extension needed)');
-  console.log('');
-  console.log('  1. Open https://chat.deepseek.com in Chrome and sign in.');
-  console.log('  2. Open DevTools (F12) → Console, paste this and press Enter:');
-  console.log('');
-  console.log("       copy((()=>{const v=localStorage.getItem('userToken');try{const p=JSON.parse(v);return typeof p==='string'?p:p.value}catch{return v}})())");
-  console.log('');
-  console.log('  3. Paste the copied token below (input is hidden), or pass it directly.');
-  console.log('');
-  console.log('     deepseek --login --manual --token <userToken>');
-  console.log('     deepseek --login --manual --token-file token.txt');
-  console.log('     DEEPSEEK_TOKEN=<userToken> deepseek --login --manual');
-  console.log('     deepseek --login --manual --token <userToken> --replace');
-  console.log('');
-  console.log('  Each run adds one account to an unlimited pool; --replace clears the pool first.');
-  console.log('');
-  let token = '';
-  try {
-    token = await readManualToken(rest);
-  } catch (err) {
-    console.error(`Could not read the token: ${err?.message || err}`);
-    process.exit(1);
-  }
-  if (!token || token.length < 20) {
-    console.error('No usable DeepSeek user token was provided.');
-    console.error('Use --token, --token-file, DEEPSEEK_TOKEN, or paste it at the hidden prompt.');
-    process.exit(1);
-  }
-
-  const replace = rest.includes('--replace');
-  const label = labelFromArgs(rest).slice(0, 80);
-  const { cfg } = await ensureRunning();
+async function addAccountToken(cfg, token, { replace = false, label = '' } = {}) {
   let res;
   try {
     res = await fetch(`${baseUrl(cfg.port)}/v1/bridge/accounts`, {
@@ -1128,14 +1099,19 @@ async function manualLogin() {
       signal: AbortSignal.timeout(40000),
     });
   } catch (err) {
-    console.error(`Login failed: ${err?.message || err}`);
-    process.exit(1);
+    return { ok: false, error: `Login failed: ${err?.message || err}` };
   }
 
-  // A bridge from before 0.8.0 has no accounts endpoint. Add locally and tell
-  // the user to restart instead of failing the login.
+  // A bridge from before 0.8.0 has no accounts endpoint. Store the account
+  // locally and tell the user to restart instead of failing the login.
   if (res.status === 404) {
-    return manualLoginWithoutAccountsApi({ token, label, replace });
+    try {
+      if (replace) accounts.clearAccounts();
+      const result = accounts.addAccount({ token, label: label || undefined, makePrimary: Boolean(replace) });
+      return { ok: true, local: true, account: result.account, count: result.count, created: result.created };
+    } catch (err) {
+      return { ok: false, error: `Could not store the token: ${err?.message || err}` };
+    }
   }
 
   let data = null;
@@ -1145,127 +1121,157 @@ async function manualLogin() {
     data = null;
   }
   if (!res.ok) {
-    const message = data?.error?.message || `HTTP ${res.status}`;
-    if (res.status === 401) {
+    return {
+      ok: false,
+      status: res.status,
+      message: data?.error?.message || `HTTP ${res.status}`,
+    };
+  }
+  return {
+    ok: true,
+    account: data?.account || {},
+    count: data?.count,
+    ready: data?.ready,
+    cooling: data?.cooling,
+    verified: data?.verified,
+    warning: data?.warning,
+    duplicate: data?.duplicate,
+  };
+}
+
+function printLoginResult(result, { replace = false, index = 0, total = 1 } = {}) {
+  const prefix = total > 1 ? `  ${String(index + 1).padStart(2)}. ` : '  ';
+  if (!result.ok) {
+    if (result.status === 401) {
       console.log('');
       console.log('  The running bridge rejected this CLI API key.');
-      console.log(`  ${message}`);
+      console.log(`  ${result.message}`);
       console.log('  The CLI and the bridge must use the same config directory (DS_BRIDGE_HOME).');
-      process.exit(1);
+      return;
     }
-    console.log('');
-    console.log('  DeepSeek rejected that token.');
-    console.log(replace ? '  The previous account pool was restored.' : '  Your existing accounts were left unchanged.');
-    console.log(`  ${message}`);
-    console.log('  Copy a fresh userToken from chat.deepseek.com and try again.');
-    process.exit(1);
+    console.log(`${prefix}rejected: ${result.message || result.error || 'unknown error'}`);
+    return;
   }
 
-  const account = data?.account || {};
+  const account = result.account || {};
+  if (total > 1) {
+    const id = shortId(account.id);
+    const name = account.label ? ` (${account.label})` : '';
+    const state = result.local
+      ? `${result.count} stored`
+      : `${result.count} stored, ${result.ready ?? 0} ready, ${result.cooling || 0} cooling`;
+    console.log(`${prefix}${id}${name}  added  ${state}${result.duplicate ? '  (health reset)' : ''}`);
+    return;
+  }
+
   console.log('');
   console.log('  DeepSeek account added');
   console.log('');
   console.log(`  Account     ${shortId(account.id)}${account.label ? ` (${account.label})` : ''}`);
-  console.log(`  Verified    ${data.verified ? 'yes — usable for requests' : 'not confirmed'}`);
-  if (Number.isFinite(Number(data.count))) {
+  console.log(`  Verified    ${result.verified ? 'yes - usable for requests' : 'not confirmed'}`);
+  if (result.warning) console.log(`  Warning     ${result.warning}`);
+  if (Number.isFinite(Number(result.count))) {
     console.log(
-      `  Accounts    ${data.count} stored` +
-        (Number.isFinite(Number(data.ready)) ? ` · ${data.ready} ready · ${data.cooling || 0} cooling` : ''),
+      `  Accounts    ${result.count} stored` +
+        (Number.isFinite(Number(result.ready)) ? ` - ${result.ready} ready - ${result.cooling || 0} cooling` : ''),
     );
   }
   console.log('');
-  if (data.duplicate) console.log('  That token was already stored; its cooldown/health state was reset.');
-  if (replace) console.log('  The previous pool was replaced.');
-  console.log('  Chrome is not needed for requests. Add more accounts the same way any time.');
-  console.log('  Requests rotate automatically when DeepSeek throttles one account.');
-}
-
-async function manualLoginWithoutAccountsApi({ token, label, replace }) {
-  if (replace) accounts.clearAccounts();
-  let result;
-  try {
-    result = accounts.addAccount({ token, label: label || undefined, makePrimary: Boolean(replace) });
-  } catch (err) {
-    console.error(`Could not store the token: ${err?.message || err}`);
-    process.exit(1);
+  if (result.local) {
+    console.log('  The running bridge is older and has no accounts API, so it cannot use');
+    console.log('  this account yet. Restart it to load the new code and the new account:');
+    console.log('    deepseek stop && deepseek');
   }
-  console.log('');
-  console.log('  DeepSeek account stored');
-  console.log('');
-  console.log(`  Account     ${shortId(result.account.id)}${result.account.label ? ` (${result.account.label})` : ''}`);
-  console.log(`  Accounts    ${result.count} stored`);
-  console.log('');
-  console.log('  The running bridge is older and has no accounts API, so it cannot use');
-  console.log('  this account yet. Restart it to load the new code and the new account:');
-  console.log('    deepseek stop && deepseek');
-  if (!result.created) console.log('  That token was already stored; its cooldown/health state was reset.');
+  if (result.duplicate) console.log('  That token was already stored; its cooldown/health state was reset.');
+  if (replace) console.log('  The previous pool was replaced.');
+  if (!result.local) {
+    console.log('  Add more accounts the same way any time: deepseek login <token> <token>');
+    console.log('  Requests rotate automatically when DeepSeek throttles one account.');
+  }
 }
 
 async function login() {
-  if (
-    rest.includes('--manual') ||
-    rest.includes('--token') ||
-    rest.includes('-t') ||
-    rest.includes('--token-file') ||
-    rest.includes('-f') ||
-    rest.some((arg) => arg.startsWith('--token=') || arg.startsWith('--token-file=')) ||
-    process.env.DEEPSEEK_TOKEN ||
-    process.env.DEEPSEEK_USER_TOKEN
-  ) {
-    return manualLogin();
+  console.log('');
+  console.log('  DeepSeek login');
+  console.log('');
+
+  let tokens = [];
+  try {
+    tokens = tokensFromArgs(rest);
+  } catch (err) {
+    console.error(`Could not read the token: ${err?.message || err}`);
+    process.exit(1);
   }
-  const { cfg } = await ensureRunning();
-  const health = await getHealth(cfg.port);
-  if (!health?.extension) {
-    console.log('Waiting for the DeepSeek Bridge extension in Chrome...');
-    if (!(await waitForExtension(cfg, 35000))) {
-      console.error('Chrome is not connected to the bridge.');
-      console.error('Open Chrome, load the extension folder below, sign in at https://chat.deepseek.com, then retry:');
-      console.error(`  ${EXTENSION}`);
-      console.error('  deepseek --login');
-      console.error('  Or use the no-extension manual flow: deepseek --login --manual');
+  if (!tokens.length) {
+    const envToken = process.env.DEEPSEEK_TOKEN || process.env.DEEPSEEK_USER_TOKEN;
+    if (envToken) tokens = [cleanToken(envToken)].filter(Boolean);
+  }
+
+  if (!tokens.length) {
+    console.log('  1. Open https://chat.deepseek.com in a browser and sign in.');
+    console.log('  2. Open DevTools (F12) -> Console, paste this and press Enter:');
+    console.log('');
+    console.log("       copy((()=>{const v=localStorage.getItem('userToken');try{const p=JSON.parse(v);return typeof p==='string'?p:p.value}catch{return v}})())");
+    console.log('');
+    console.log('  3. Paste the token below (input is hidden), or pass it directly.');
+    console.log('');
+    console.log('     deepseek login <userToken>');
+    console.log('     deepseek login <tokenA> <tokenB> <tokenC>');
+    console.log('     deepseek login --token-file token.txt');
+    console.log('     DEEPSEEK_TOKEN=<userToken> deepseek login');
+    console.log('     deepseek login <userToken> --replace');
+    console.log('');
+    console.log('  Each token adds one account to an unlimited pool; --replace clears the pool first.');
+    console.log('');
+    try {
+      tokens = await readManualTokens([]);
+    } catch (err) {
+      console.error(`Could not read the token: ${err?.message || err}`);
       process.exit(1);
     }
   }
-
-  console.log('Copying chat.deepseek.com cookies and user token from Chrome...');
-  let res;
-  try {
-    res = await fetch(`${baseUrl(cfg.port)}/v1/bridge/session/export`, {
-      method: 'POST',
-      headers: { authorization: `Bearer ${cfg.key}` },
-      signal: AbortSignal.timeout(50000),
-    });
-  } catch (err) {
-    console.error(`Login failed: ${err?.message || err}`);
-    process.exit(1);
-  }
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    console.error(`Login failed: ${data?.error?.message || `HTTP ${res.status}`}`);
+  if (!tokens.length) {
+    console.error('No usable DeepSeek user token was provided.');
+    console.error('Use `deepseek login <token>`, --token-file, DEEPSEEK_TOKEN, or paste it at the hidden prompt.');
     process.exit(1);
   }
 
-  console.log('');
-  console.log('  DeepSeek account added to the pool');
-  console.log('');
-  printSessionSummary(data);
-  if (data.duplicate) console.log('  That browser login was already stored; its health state was refreshed.');
-  if (data.verified === false) {
-    if (data.warning) {
-      console.log('');
-      console.log(`  Warning: ${data.warning}`);
+  const replace = rest.includes('--replace');
+  const label = labelFromArgs(rest).slice(0, 80);
+  if (tokens.length > 1 && label) {
+    console.error('--label can only be used when one token is supplied.');
+    process.exit(1);
+  }
+
+  const valid = [];
+  for (const token of tokens) {
+    if (token.length < 20) {
+      if (tokens.length === 1) {
+        console.error('That does not look like a DeepSeek user token.');
+        process.exit(1);
+      }
+      console.error(`Skipping a token that is too short: ${token.slice(0, 8)}...`);
+      continue;
     }
-    console.log('');
-    console.log('  The session was saved, but DeepSeek did not confirm it yet.');
-    console.log('  If requests fail, run `deepseek --login` again.');
-  } else {
-    console.log('');
-    console.log('  Chrome and the extension are no longer needed for requests.');
-    console.log('  Add more accounts with `deepseek --login --manual --token ...`;');
-    console.log('  the bridge rotates between them when DeepSeek throttles one.');
-    console.log('  If DeepSeek asks you to sign in again, run: deepseek --login');
+    valid.push(token);
   }
+  if (!valid.length) process.exit(1);
+
+  const { cfg } = await ensureRunning();
+  if (valid.length > 1) console.log(`  Adding ${valid.length} accounts...`);
+  let failed = 0;
+  for (let i = 0; i < valid.length; i++) {
+    const useReplace = replace && i === 0;
+    const result = await addAccountToken(cfg, valid[i], { replace: useReplace, label });
+    if (!result.ok) failed++;
+    printLoginResult(result, { replace: useReplace, index: i, total: valid.length });
+  }
+
+  if (valid.length > 1) {
+    console.log('');
+    console.log(`  ${valid.length - failed} added, ${failed} failed.`);
+  }
+  if (failed) process.exitCode = 1;
 }
 
 async function logout() {
@@ -1302,11 +1308,7 @@ async function logout() {
   }
   if (removed) console.log(`Removed ${removed} DeepSeek account(s) and the legacy session file.`);
   else console.log('No stored DeepSeek accounts to remove.');
-  if (health?.extension) {
-    console.log('The bridge will fall back to extension mode (Chrome is connected).');
-  } else {
-    console.log('Load the Chrome extension for fallback mode, or run `deepseek --login` to add an account again.');
-  }
+  console.log('Add a fresh login with `deepseek login <userToken>`.');
 }
 
 function printSession() {
@@ -1314,8 +1316,8 @@ function printSession() {
   const accountInfo = accounts.accountsSummary();
   console.log('');
   if (!summary.available) {
-    console.log('  Mode        extension / not configured');
-    console.log('  Run         deepseek --login');
+    console.log('  Mode        not configured');
+    console.log('  Run         deepseek login');
     console.log('');
     return;
   }
@@ -1335,18 +1337,21 @@ Usage:
   deepseek start           Same as deepseek
   deepseek serve           Run the bridge in the foreground
   deepseek stop            Stop the background bridge
-  deepseek status          Show the bridge and extension status
+  deepseek status          Show the bridge status
   deepseek ui              Open the web dashboard in a browser
+  deepseek install         Pick optional tools (Git, Tailscale, dsh) + autostart
+  deepseek install --list  Show the tool catalog as JSON
+  deepseek install --tools git,tailscale --autostart --yes
   deepseek models          One line per model
   deepseek models --info   Model details + pasteable dsh profile patch and env JSON
   deepseek chat "hello"    Send a chat message (starts the bridge if needed)
   deepseek "hello"         Shorthand for deepseek chat "hello"
-  deepseek --login         Copy the chat.deepseek.com session from Chrome once
-  deepseek --login --manual  Paste userToken from DevTools (no extension needed)
-  deepseek --login --manual --token-file token.txt
-  deepseek --login --manual --token <userToken>
-  DEEPSEEK_TOKEN=<userToken> deepseek --login --manual
-  deepseek --login --manual --token <userToken> --replace   Replace the account pool
+  deepseek login           Paste userToken from DevTools at a hidden prompt
+  deepseek login <token>   Add one account to the pool
+  deepseek login <a> <b>   Add several accounts in one run
+  deepseek login --token-file token.txt   Add tokens from a file (one per line)
+  DEEPSEEK_TOKEN=<token> deepseek login    Add a token from the environment
+  deepseek login <token> --replace         Replace the account pool
   deepseek accounts        List stored DeepSeek accounts (unlimited; automatic rotation)
   deepseek rules           Show the system-prompt preset and every rule
   deepseek rules --json    Machine-readable rules
@@ -1356,14 +1361,13 @@ Usage:
   deepseek accounts --json Machine-readable account list (no tokens)
   deepseek accounts remove <id|index>
   deepseek accounts clear --yes   Remove every account and the legacy session file
-  deepseek --logout        Delete all terminal accounts (fall back to extension)
-  deepseek session         Show the stored terminal accounts
+  deepseek --logout        Delete all stored accounts
+  deepseek session         Show the stored account metadata
   deepseek version         Show local and GitHub versions
   deepseek update          Update a git checkout to GitHub main
   deepseek update --check  Check for an update without installing it
   deepseek key             Print the API key
   deepseek key --file PATH Write the API key to a 0600 file for another client
-  deepseek extension       Print the absolute extension folder
   deepseek logs            Print the log path and the last lines
   deepseek help            Show this help
 
@@ -1402,7 +1406,10 @@ if (command === 'help') {
     console.log(`Start it with: deepseek`);
   } else {
     printStatus(cfg, health, false);
-    if (status) console.log(`Queue: ${JSON.stringify(status)}`);
+    if (status?.upstream) {
+      console.log(`  Queue       ${status.upstream.active} active · ${status.upstream.queued} queued · max ${status.upstream.max}`);
+      console.log('');
+    }
   }
 } else if (command === 'login') {
   await login();
@@ -1431,8 +1438,6 @@ if (command === 'help') {
   } else {
     console.log(loadConfig().key);
   }
-} else if (command === 'extension') {
-  console.log(EXTENSION);
 } else if (command === 'ui') {
   const { cfg: uiCfg } = await ensureRunning();
   const uiUrl = `http://127.0.0.1:${uiCfg.port}/`;
@@ -1449,6 +1454,9 @@ if (command === 'help') {
   console.log('  Unlock with your API key (deepseek key).');
 } else if (command === 'rules') {
   await rulesCommand();
+} else if (command === 'install' || command === 'setup') {
+  const code = await runInstaller(rest);
+  process.exit(code);
 } else if (command === 'models') {
   modelsCommand();
 } else if (command === 'accounts') {

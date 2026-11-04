@@ -1,9 +1,9 @@
 /*
  * Direct chat.deepseek.com client.
  *
- * This is the same request flow the content script uses, moved into Node so
- * Chrome does not have to stay open. The session (cookies + localStorage
- * userToken) is captured once by `deepseek --login`.
+ * This is the same request flow chat.deepseek.com uses, moved into Node so no
+ * browser has to stay open. The session (cookies + userToken) is added once
+ * with `deepseek login`.
  */
 import crypto from 'node:crypto';
 import { Blob } from 'node:buffer';
@@ -674,7 +674,7 @@ export class DirectClient {
     const session = ctx?.session;
     if (!session?.token) {
       throw new BridgeError(
-        'No terminal DeepSeek session. Run `deepseek --login` in a terminal where the bridge extension can copy your browser session.',
+        'No DeepSeek account is available. Add one with `deepseek login <userToken>`.',
         'not_signed_in',
         401,
       );
@@ -1340,6 +1340,51 @@ export class DirectClient {
       // Every account already failed once in this request: after the wait the
       // next sweep may retry any of them (cooldowns are short).
       if (allExcluded) excluded.length = 0;
+    }
+  }
+
+  /**
+   * Send one small prompt with EXACTLY this account's token and never rotate.
+   *
+   * `verify()` only proves DeepSeek accepts the token for /users/current; a
+   * session captured during registration can pass that check yet still be
+   * unable to open a chat session. The mobile app's TEST MESSAGE action uses
+   * this to prove the exact stored login can really talk to the assistant.
+   */
+  async testMessage(account, prompt, { signal, timeoutMs = 90_000 } = {}) {
+    if (!account?.token) {
+      throw new BridgeError('No DeepSeek user token is stored for that account.', 'not_signed_in', 401);
+    }
+    const ctx = this.contextFor(account);
+    const emitted = { content: '', reasoning: '' };
+    const emit = (delta) => {
+      if (!delta?.text) return;
+      if (delta.kind === 'reasoning') emitted.reasoning += delta.text;
+      else emitted.content += delta.text;
+    };
+    const deadline = Date.now() + timeoutMs;
+    const started = Date.now();
+    try {
+      const result = await this.runAttempt(
+        { prompt, modelType: 'default', thinking: false, search: false },
+        {},
+        { signal, deadline, emitted, emit, debugLines: null, ctx, bound: false },
+      );
+      markAccountSuccess(ctx.accountId);
+      return {
+        accountId: ctx.accountId,
+        reply: emitted.content,
+        reasoning: emitted.reasoning,
+        sessionId: result.sessionId,
+        messageId: result.messageId,
+        usage: result.usage,
+        ms: Date.now() - started,
+      };
+    } catch (err) {
+      const failure = err instanceof BridgeError ? err : normalizeAttemptError(err, null, signal);
+      if (isAccountLevelFailure(failure)) this.recordAccountFailure(ctx.accountId, failure);
+      else markAccountFailure(ctx.accountId, failure.code || 'error');
+      throw failure;
     }
   }
 

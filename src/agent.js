@@ -1,10 +1,10 @@
 import crypto from 'node:crypto';
 
 /**
- * Bridge <-> extension link.
+ * Bridge <-> agent link.
  *
- * The extension opens a WebSocket to the bridge and announces itself. The
- * bridge pushes "job" messages and the extension streams "job.*" events back.
+ * An agent opens a WebSocket to the bridge and announces itself. The bridge
+ * pushes "job" messages and the agent streams "job.*" events back.
  * All state for a job lives here so a dropped connection fails fast instead of
  * hanging a client request.
  */
@@ -13,7 +13,6 @@ export class Agent {
     this.log = log;
     this.connections = new Set();
     this.jobs = new Map();
-    this.sessionRequests = new Map();
     this.lastHello = null;
   }
 
@@ -34,7 +33,7 @@ export class Agent {
     const expected = query.get('key');
     conn.meta.key = expected;
     this.connections.add(conn);
-    this.log('extension connected');
+    this.log('agent connected');
 
     conn.on('message', (text) => {
       let msg;
@@ -54,22 +53,12 @@ export class Agent {
           capabilities,
         };
         this.log(
-          `extension hello (v${msg.version || '?'}, user=${msg.user || '?'}, tab=${msg.tab}` +
+          `agent hello (v${msg.version || '?'}, user=${msg.user || '?'}, tab=${msg.tab}` +
             `${capabilities ? `, caps=${Object.keys(capabilities).filter((k) => capabilities[k]).join('+')}` : ', legacy'})`,
         );
         return;
       }
       if (msg.type === 'pong') return;
-      if (msg.type === 'session.exported' || msg.type === 'session.export_error') {
-        const request = this.sessionRequests.get(msg.id);
-        if (!request) return;
-        if (msg.type === 'session.exported') {
-          request.finish(null, msg);
-        } else {
-          request.finish(new BridgeError(msg.message || 'Could not export the browser session.', msg.code || 'session_export_failed'));
-        }
-        return;
-      }
       const job = msg.id ? this.jobs.get(msg.id) : null;
       if (!job) return;
       job.onEvent(msg);
@@ -77,13 +66,10 @@ export class Agent {
 
     conn.on('close', () => {
       this.connections.delete(conn);
-      if (this.connections.size === 0) this.log('extension disconnected');
-      else this.log(`extension connection closed (${this.connections.size} still open)`);
+      if (this.connections.size === 0) this.log('agent disconnected');
+      else this.log(`agent connection closed (${this.connections.size} still open)`);
       for (const job of this.jobs.values()) {
-        if (job.conn === conn) job.fail(new Error('extension disconnected'));
-      }
-      for (const request of this.sessionRequests.values()) {
-        if (request.conn === conn) request.finish(new BridgeError('Extension disconnected during session export.', 'extension_offline'));
+        if (job.conn === conn) job.fail(new Error('agent disconnected'));
       }
     });
   }
@@ -93,63 +79,15 @@ export class Agent {
   }
 
   /**
-   * Ask the extension to copy the logged-in chat.deepseek.com cookies and
-   * localStorage user token. This is the only operation that needs Chrome.
-   */
-  exportSession({ timeout = 30000, signal } = {}) {
-    if (!this.connected) {
-      return Promise.reject(
-        new BridgeError(
-          'The DeepSeek Bridge extension is not connected. Open Chrome, sign in at https://chat.deepseek.com, then retry `deepseek --login`.',
-          'extension_offline',
-        ),
-      );
-    }
-
-    const id = `session_${crypto.randomBytes(8).toString('hex')}`;
-    const conn = [...this.connections].at(-1);
-
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      const cleanup = () => {
-        settled = true;
-        clearTimeout(timer);
-        this.sessionRequests.delete(id);
-        signal?.removeEventListener?.('abort', onAbort);
-      };
-      const finish = (err, data) => {
-        if (settled) return;
-        cleanup();
-        if (err) reject(err);
-        else resolve(data);
-      };
-      const onAbort = () => finish(new BridgeError('Session export cancelled.', 'cancelled', 499));
-      const timer = setTimeout(
-        () => finish(new BridgeError('Chrome did not answer the session export request.', 'extension_timeout')),
-        timeout,
-      );
-      timer.unref?.();
-
-      this.sessionRequests.set(id, { id, conn, finish });
-      if (signal?.aborted) {
-        onAbort();
-        return;
-      }
-      signal?.addEventListener?.('abort', onAbort, { once: true });
-      conn.sendJSON({ type: 'session.export', id });
-    });
-  }
-
-  /**
-   * Run a chat job through the extension.
+   * Run a chat job through a connected agent.
    * Resolves with { sessionId, messageId, usage, finish } when the job ends.
    */
   run(payload, handlers = {}, { signal } = {}) {
     if (!this.connected) {
       return Promise.reject(
         new BridgeError(
-          'The DeepSeek Bridge extension is not connected. Open the extension popup and check the port/key, then retry.',
-          'extension_offline',
+          'No DeepSeek account is available. Add one with `deepseek login <userToken>`.',
+          'not_signed_in',
         ),
       );
     }
@@ -162,8 +100,8 @@ export class Agent {
     if (payload.attachments?.length && !conn.meta.capabilities?.files) {
       return Promise.reject(
         new BridgeError(
-          'The connected extension build cannot upload images/files. Reload the unpacked extension at chrome://extensions (Developer mode → Reload), refresh the chat.deepseek.com tab, then retry.',
-          'extension_outdated',
+          'The connected client cannot upload images/files. Update it and retry.',
+          'client_outdated',
         ),
       );
     }
@@ -174,7 +112,7 @@ export class Agent {
       let firstDelta = false;
 
       const acceptTimer = setTimeout(() => {
-        if (!accepted) fail(new BridgeError('Extension did not accept the job (timed out).', 'extension_timeout'));
+        if (!accepted) fail(new BridgeError('Agent did not accept the job (timed out).', 'agent_timeout'));
       }, 20000);
 
       const idleTimer = setInterval(() => {

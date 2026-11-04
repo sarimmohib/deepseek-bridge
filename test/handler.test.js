@@ -155,8 +155,8 @@ test('uses the direct runner when a terminal session exists', async () => {
   let used = '';
   const agent = {
     async run() {
-      used = 'extension';
-      throw new Error('extension path should not be used');
+      used = 'agent';
+      throw new Error('agent path should not be used');
     },
   };
   const direct = {

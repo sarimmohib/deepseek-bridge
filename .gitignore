@@ -8,3 +8,13 @@ Thumbs.db
 .env.*
 session.json
 accounts.json
+
+# Android build output and machine-local files
+android/.gradle/
+android/.kotlin/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+android/*.iml
+android/app/*.iml

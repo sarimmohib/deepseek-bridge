@@ -99,7 +99,7 @@ export function createServer({ config, store, log = () => {}, direct: directClie
     const url = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`);
 
     // CORS: the bridge only listens on loopback, so a permissive policy is fine
-    // and makes browser-based clients (and the extension options page) work.
+    // and makes browser-based clients work.
     res.setHeader('access-control-allow-origin', '*');
     res.setHeader('access-control-allow-headers', 'authorization, content-type, x-api-key');
     res.setHeader('access-control-allow-methods', 'GET, POST, DELETE, OPTIONS');
@@ -134,9 +134,9 @@ export function createServer({ config, store, log = () => {}, direct: directClie
         json(res, 200, {
           ok: true,
           version: VERSION,
-          extension: agent.connected,
+          agent: agent.connected,
           direct: directReady,
-          mode: directReady ? 'direct' : agent.connected ? 'extension' : 'offline',
+          mode: directReady ? 'direct' : 'offline',
           accounts: { count: accountInfo.count, ready: accountInfo.ready, cooling: accountInfo.cooling },
           upstream: { active: bridgeQueue.active, queued: bridgeQueue.queued, max: bridgeQueue.max },
         });
@@ -262,6 +262,58 @@ export function createServer({ config, store, log = () => {}, direct: directClie
         return;
       }
 
+      // Send a real message with exactly this account's token. `verify()` can
+      // pass for a registration-only session, so this is the only way for the
+      // mobile app to prove a specific stored login can actually chat.
+      const TEST_MESSAGE_SUFFIX = '/test-message';
+      if (
+        url.pathname.startsWith('/v1/bridge/accounts/') &&
+        url.pathname.endsWith(TEST_MESSAGE_SUFFIX) &&
+        req.method === 'POST'
+      ) {
+        const id = decodeURIComponent(
+          url.pathname.slice('/v1/bridge/accounts/'.length, -TEST_MESSAGE_SUFFIX.length),
+        );
+        if (!id) {
+          sendError(res, 400, 'An account id is required.', 'invalid_account_id');
+          return;
+        }
+        const account = accounts.getAccount(id);
+        if (!account) {
+          sendError(res, 404, `No account ${id}.`, 'not_found');
+          return;
+        }
+        let body;
+        try {
+          body = await readJsonBody(req);
+        } catch (err) {
+          sendError(res, 400, err?.message || 'Body is not valid JSON', err?.code || 'invalid_json');
+          return;
+        }
+        const message =
+          typeof body?.message === 'string' && body.message.trim()
+            ? body.message.trim().slice(0, 500)
+            : 'Reply with exactly: OK';
+        try {
+          const result = await direct.testMessage(account, message, {
+            signal: AbortSignal.timeout(110_000),
+          });
+          json(res, 200, {
+            ok: true,
+            accountId: result.accountId,
+            reply: result.reply,
+            reasoning: result.reasoning,
+            sessionId: result.sessionId || null,
+            messageId: result.messageId ?? null,
+            ms: result.ms,
+          });
+        } catch (err) {
+          log(`account ${id} test message failed: ${err?.message || err}`);
+          sendError(res, err?.status || 502, err?.message || 'Test message failed', err?.code || 'test_message_failed');
+        }
+        return;
+      }
+
       // ---- System prompt rules
       // The bridge prepends a dsh-tuned preset plus a rules section to every
       // request. Rules are builtin defaults, user additions, and learned
@@ -363,10 +415,10 @@ export function createServer({ config, store, log = () => {}, direct: directClie
           ok: true,
           version: VERSION,
           ...agent.status,
-          mode: session.available ? 'direct' : agent.connected ? 'extension' : 'offline',
+          mode: session.available ? 'direct' : 'offline',
           direct: session,
           accounts: { count: accountInfo.count, ready: accountInfo.ready, cooling: accountInfo.cooling },
-          extension: {
+          agent: {
             connected: agent.connected,
             connections: agent.connections.size,
             lastHello: agent.lastHello,
@@ -395,51 +447,11 @@ export function createServer({ config, store, log = () => {}, direct: directClie
         return;
       }
 
-      if (url.pathname === '/v1/bridge/session/export' && req.method === 'POST') {
-        const data = await agent.exportSession({ timeout: 45000 });
-        if (!data?.token || !Array.isArray(data.cookies)) {
-          throw new BridgeError('Chrome returned an incomplete session.', 'session_export_failed');
-        }
-        // Export upserts into the pool: logging in from the browser must never
-        // discard accounts the user added manually.
-        let added;
-        try {
-          added = accounts.addAccount({
-            token: data.token,
-            cookies: data.cookies,
-            userAgent: data.userAgent,
-            user: data.user || agent.lastHello?.user || null,
-          });
-        } catch (err) {
-          throw new BridgeError(err?.message || 'Could not store the exported session.', 'session_export_failed', 400);
-        }
-        direct.reloadSession();
-        let verified = false;
-        let warning = null;
-        try {
-          await direct.verify(null, { accountId: added.account.id });
-          verified = true;
-        } catch (err) {
-          warning = err?.message || String(err);
-          log(`session verification failed: ${warning}`);
-        }
-        json(res, 200, {
-          ok: true,
-          verified,
-          warning,
-          accountId: added.account.id,
-          created: added.created,
-          duplicate: added.duplicate,
-          ...sessionSummary(),
-        });
-        return;
-      }
-
       if (url.pathname === '/v1/bridge/session/verify' && req.method === 'POST') {
         direct.reloadSession();
         const primary = accounts.getPrimaryAccount();
         if (!primary?.token) {
-          throw new BridgeError('No terminal DeepSeek session. Run `deepseek --login` first.', 'not_signed_in', 401);
+          throw new BridgeError('No DeepSeek account is available. Add one with `deepseek login <userToken>`.', 'not_signed_in', 401);
         }
         const user = await direct.verify(null, { accountId: primary.id });
         json(res, 200, { ok: true, user, accountId: primary.id, ...sessionSummary() });
@@ -450,13 +462,6 @@ export function createServer({ config, store, log = () => {}, direct: directClie
         const { removed } = accounts.clearAccounts();
         direct.reloadSession();
         json(res, 200, { ok: true, cleared: removed > 0, removed, ...sessionSummary() });
-        return;
-      }
-
-      if (url.pathname === '/v1/bridge/reload-extension' && req.method === 'POST') {
-        const sent = agent.connections.size;
-        agent.broadcast({ type: 'reload-extension' });
-        json(res, 200, { ok: true, sent });
         return;
       }
 
@@ -570,7 +575,7 @@ export function createServer({ config, store, log = () => {}, direct: directClie
     },
   });
 
-  // Keep the extension service worker awake and detect half-open sockets.
+  // Keep the agent connection awake and detect half-open sockets.
   const heartbeat = setInterval(() => {
     agent.broadcast({ type: 'ping', at: Date.now() });
     for (const conn of agent.connections) {

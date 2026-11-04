@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import net from 'node:net';
-import { fileURLToPath } from 'node:url';
 import { createServer } from '../src/server.js';
 import { loadConfig, saveConfig, Store, paths } from '../src/config.js';
 import { sessionSummary } from '../src/session.js';
@@ -20,8 +19,6 @@ const log = (msg) => {
   const t = new Date().toTimeString().slice(0, 8);
   console.error(`\x1b[2m${t}\x1b[0m ${msg}`);
 };
-
-const extensionDir = fileURLToPath(new URL('../extension', import.meta.url));
 
 // A port that answers /health as a bridge is not an error: it means the
 // daemon is already running. Anything else on the port is a real conflict.
@@ -49,9 +46,8 @@ Usage:
   ds-bridge [--port 8787] [--port-next] [--reset-key] [--verbose]
 
 The bridge listens on 127.0.0.1 by default (set "host" in config.json, or
-DS_BRIDGE_HOST, to expose it on a LAN/Tailscale address). Run 'deepseek --login' once to copy the
-browser session into the terminal; extension/ is the optional fallback. Add
-more accounts with 'deepseek --login --manual --token <userToken>' — the pool is
+DS_BRIDGE_HOST, to expose it on a LAN/Tailscale address). Add accounts with
+'deepseek login <userToken>' — the pool is
 unlimited and requests rotate automatically on per-account rate limits. Then call:
 
   curl http://127.0.0.1:8787/v1/chat/completions \\
@@ -89,8 +85,8 @@ const { server, close } = createServer({ config, store, log });
 log(`deepseek-bridge ${VERSION} starting on ${config.host}:${config.port}`);
 
 // The saved port is a contract with every client: dsh (`baseURL`), the
-// dashboard proxy, the remote stack, the editor configs and the extension all
-// point at the number in config.json. Silently binding port+1 and persisting
+// dashboard proxy, the remote stack and the editor configs all point at the
+// number in config.json. Silently binding port+1 and persisting
 // it used to leave the bridge healthy on a port nobody was watching — the
 // "bridge is running but every other app gets connection refused" failure.
 // Moving ports is therefore opt-in (--port-next) and a one-off: the saved
@@ -166,14 +162,14 @@ console.log(`
   API key    ${config.key}
   Models     ${MODELS.map((m) => m.id).join(', ')}
 
-  Mode       ${session.available ? `direct (${accountInfo.count} account${accountInfo.count === 1 ? '' : 's'})` : 'extension / not configured'}
-  Accounts   ${accountInfo.count ? `${accountInfo.count} stored · ${accountInfo.ready} ready · ${accountInfo.cooling} cooling · unlimited pool` : 'none — run `deepseek --login` or `deepseek --login --manual`'}
-  Session    ${session.available ? session.file : 'run `deepseek --login` to copy it from Chrome'}
+  Mode       ${session.available ? `direct (${accountInfo.count} account${accountInfo.count === 1 ? '' : 's'})` : 'not configured'}
+  Accounts   ${accountInfo.count ? `${accountInfo.count} stored - ${accountInfo.ready} ready - ${accountInfo.cooling} cooling - unlimited pool` : 'none - run `deepseek login <token>`'}
+  Session    ${session.available ? session.file : 'run `deepseek login` to add one'}
 
   Next steps
-${session.available ? '   1. Test:  deepseek chat "hello"' : '   1. Extension: chrome://extensions → Developer mode → Load unpacked\n      → select ' + extensionDir + '\n   2. Open the extension popup, set port ' + config.port + ' and paste the API key.\n   3. Sign in at https://chat.deepseek.com in a normal tab.\n   4. Run:  deepseek --login'}
+${session.available ? '   1. Test:  deepseek chat "hello"' : '   1. Add a login:  deepseek login <userToken>\n   2. Test:  deepseek chat "hello"'}
 
-  Add more accounts any time:  deepseek --login --manual --token <userToken>
+  Add more accounts any time:  deepseek login <userToken>
   Inspect the pool:            deepseek accounts
 
   Config     ${paths.CONFIG_FILE}

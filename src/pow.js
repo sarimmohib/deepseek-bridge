@@ -1,9 +1,7 @@
 /*
  * DeepSeekHashV1 proof-of-work (the Node-side copy).
  *
- * Keep this file in sync with extension/pow.js. The extension cannot import
- * outside its own directory, so the browser and the terminal client each carry
- * a copy of the solver.
+ * This is a standalone port of the solver embedded in chat.deepseek.com.
  *
  * The site hashes `salt + "_" + expire_at + "_" + nonce` with a Keccak-f[1600]
  * sponge (rate 136, SHA3 padding, 32-byte output) and looks for a digest equal

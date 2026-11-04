@@ -38,6 +38,8 @@ function makeFakeDirect() {
     available: true,
     hasMultipleAccounts: true,
     verifyCalls: [],
+    testMessageCalls: [],
+    failChatTokens: new Set(),
     reloadSession() {
       return null;
     },
@@ -52,6 +54,30 @@ function makeFakeDirect() {
         throw err;
       }
       return null;
+    },
+    // Pinned chat test: never rotates, so the endpoint must pass the exact
+    // account object it looked up (id AND token).
+    async testMessage(account, message, opts = {}) {
+      this.testMessageCalls.push({
+        accountId: account.id,
+        token: account.token,
+        message,
+        hasSignal: Boolean(opts.signal),
+      });
+      if (this.failChatTokens.has(account.token)) {
+        const err = new Error('DeepSeek returned an empty reply.');
+        err.code = 'empty_reply';
+        err.status = 502;
+        throw err;
+      }
+      return {
+        accountId: account.id,
+        reply: 'OK',
+        reasoning: '',
+        sessionId: 'session-test',
+        messageId: 42,
+        ms: 7,
+      };
     },
   };
 }
@@ -259,6 +285,44 @@ test('conversation listings carry the owning accountId when present', async () =
   const plain = await request('/v1/conversations');
   assert.equal(plain.json.data[0].accountId, accountId);
   store.data.conversations = {};
+});
+
+test('POST /v1/bridge/accounts/:id/test-message chats with that exact account', async () => {
+  const id = accounts.tokenId(TOKEN_B);
+  const before = fakeDirect.testMessageCalls.length;
+  const { status, text, json } = await request(`/v1/bridge/accounts/${id}/test-message`, {
+    method: 'POST',
+    body: { message: 'ping' },
+  });
+  assert.equal(status, 200);
+  assert.equal(json.ok, true);
+  assert.equal(json.accountId, id);
+  assert.equal(json.reply, 'OK');
+  assert.equal(json.ms, 7);
+  assertNoToken(text);
+  assert.equal(fakeDirect.testMessageCalls.length, before + 1);
+  const call = fakeDirect.testMessageCalls.at(-1);
+  assert.equal(call.accountId, id);
+  assert.equal(call.token, TOKEN_B, 'the pinned token must be the one tested');
+  assert.equal(call.message, 'ping');
+  assert.equal(call.hasSignal, true, 'the test is bounded by an abort signal');
+});
+
+test('test-message rejects unknown accounts and surfaces chat failures', async () => {
+  const missing = await request('/v1/bridge/accounts/nope/test-message', { method: 'POST', body: {} });
+  assert.equal(missing.status, 404);
+  assert.equal(missing.json.error.code, 'not_found');
+
+  const id = accounts.tokenId(TOKEN_B);
+  fakeDirect.failChatTokens.add(TOKEN_B);
+  try {
+    const failed = await request(`/v1/bridge/accounts/${id}/test-message`, { method: 'POST', body: {} });
+    assert.equal(failed.status, 502);
+    assert.equal(failed.json.error.code, 'empty_reply');
+    assertNoToken(failed.text);
+  } finally {
+    fakeDirect.failChatTokens.delete(TOKEN_B);
+  }
 });
 
 test('DELETE /v1/bridge/accounts/:id removes one account', async () => {
