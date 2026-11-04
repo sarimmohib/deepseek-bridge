@@ -1,3 +1,24 @@
+## 0.9.22
+
+- **RELOGIN / REPLACE opens a signed-out page.** Tapping it used to reopen
+  `chat.deepseek.com` already authenticated as whichever account signed in
+  last, so there was no way to enter different credentials. `fresh` gated the
+  cookie clear and relogin passed `fresh = false`; because `CookieManager` is
+  app-wide, the WebView restored the previous session. The extra is now
+  ignored and every capture purges before it can navigate.
+- **The purge is proven, not assumed.** `removeAllCookies` is asynchronous, so
+  the first load is deferred until its completion callback fires; loading
+  first lets the page re-authenticate from the cookie it is about to lose. The
+  origin-level purge (localStorage, sessionStorage, `document.cookie`) runs
+  once on the first document and reports `dirty`, which triggers a bounded
+  reload rather than a hopeful continue.
+- **Stale tokens can no longer arm REGISTER.** The token watcher ignores
+  `localStorage` until a purged page is on screen, so a leftover console cannot
+  hand back the previous token and let "replace" delete the account it was
+  meant to fix. A 4s safety net re-enables capture if the probe callback never
+  arrives.
+- Version 0.9.22.
+
 ## 0.9.21
 
 - **DSB Mobile renders on Android again.** Two stacked defects in the viewport

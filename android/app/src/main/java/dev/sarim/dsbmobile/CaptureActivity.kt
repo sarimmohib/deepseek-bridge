@@ -101,18 +101,46 @@ class CaptureActivity : ComponentActivity() {
     private var assistRepeat by mutableStateOf("")
     private var assistCode by mutableStateOf("")
 
-    // Set once the WebView has a real size and the first load has been issued.
-    private var webViewLoaded = false
-
     private var baseUrl = ""
     private var apiKey = ""
     private var replaceId: String? = null
     private var label = ""
-    private var fresh = true
+
+    // Every capture must start from a SIGNED-OUT page.
+    //
+    // `fresh` used to gate the cookie clear, and relogin/replace passed
+    // fresh = false. CookieManager is app-wide, so the WebView reopened
+    // chat.deepseek.com already authenticated as whoever signed in last: the
+    // user landed in that account's console and never saw the sign-in form.
+    // Worse, REGISTER stayed armed with the OLD token, so "replace" could
+    // re-submit the stale token and then delete the very account it was
+    // meant to fix.
+    //
+    // Two things make that impossible now: the jar is purged on EVERY launch
+    // (add and relogin alike), and the first load is deferred until the purge
+    // callback reports completion — removeAllCookies is asynchronous, and a
+    // page that loads first simply re-authenticates and rewrites the cookie.
+    private var purged = false
+    private var measured = false
+    private var loaded = false
+    // Tokens are only trusted once a purged page is on screen; a console left
+    // over from a previous login would otherwise hand back the previous token.
+    private var acceptTokens = false
+    // The origin purge runs once per launch, not on every page finish, or it
+    // would wipe the token the user just created.
+    private var purgeChecked = false
+    private var purgeReloads = 0
 
     private val tokenWatcher = object : Runnable {
         override fun run() {
             if (!::webView.isInitialized) return
+            // Ignore tokens until the page is known to be a purged one; a
+            // console left over from the previous login would otherwise hand
+            // its own token straight back and re-arm REGISTER.
+            if (!acceptTokens) {
+                handler.postDelayed(this, 1400)
+                return
+            }
             webView.evaluateJavascript(JS_READ) { raw ->
                 val token = parseJsString(raw)
                 if (token != null && token != capturedToken) {
@@ -136,7 +164,8 @@ class CaptureActivity : ComponentActivity() {
         apiKey = intent.getStringExtra("api_key").orEmpty()
         replaceId = intent.getStringExtra("replace_id")
         label = intent.getStringExtra("label").orEmpty()
-        fresh = intent.getBooleanExtra("fresh", true)
+        // The "fresh" extra is deliberately ignored: both add and relogin must
+        // begin signed out, so no caller can opt out of the purge.
 
         webView = WebView(this).apply {
             settings.javaScriptEnabled = true
@@ -159,6 +188,34 @@ class CaptureActivity : ComponentActivity() {
                     // modal sizing; both must run on every page load.
                     view?.evaluateJavascript(JS_VH_SHIM, null)
                     view?.evaluateJavascript(JS_MODAL_FIX, null)
+                    // One origin-level purge per launch. CookieManager covers the
+                    // cookie jar, but the site also persists a userToken in
+                    // localStorage and IndexedDB, which is enough for it to
+                    // re-authenticate itself. A leftover console page therefore
+                    // looked like "already logged in as the last account".
+                    // Runs once, on the first document that can execute JS.
+                    if (!purgeChecked) {
+                        purgeChecked = true
+                        view?.evaluateJavascript(JS_PURGE) { raw ->
+                            val state = raw?.trim()?.trim('"').orEmpty()
+                            if (state == "dirty" && purgeReloads < 2) {
+                                // Something survived; reload so the sign-in page
+                                // is rendered against a genuinely empty origin.
+                                purgeReloads++
+                                purgeChecked = false
+                                view?.loadUrl(SIGN_IN_URL)
+                            } else {
+                                acceptTokens = true
+                            }
+                        }
+                        // Safety net: if the JS callback never arrives (a
+                        // renderer hiccup, a page that refuses script), token
+                        // capture must still work. Losing the guard is far
+                        // better than a REGISTER button that never arms.
+                        handler.postDelayed({ acceptTokens = true }, 4000)
+                    } else {
+                        acceptTokens = true
+                    }
                     handler.removeCallbacks(tokenWatcher)
                     handler.post(tokenWatcher)
                 }
@@ -170,9 +227,12 @@ class CaptureActivity : ComponentActivity() {
                     return true
                 }
             }
-            if (fresh) clearSession(view = this)
             // NOT loaded here on purpose — see onSizeChanged in setContent.
         }
+        // Purge before anything can navigate. The callback is the only proof
+        // the jar is empty; loading earlier lets the page re-authenticate from
+        // the cookie it is about to be asked to forget.
+        purgeSession { purged = true; maybeLoad() }
 
         if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true)
 
@@ -200,8 +260,13 @@ class CaptureActivity : ComponentActivity() {
                             onClose = { finish() },
                             onReload = { webView.reload() },
                             onNewSession = {
-                                clearSession(view = webView)
-                                webView.loadUrl(SIGN_IN_URL)
+                                // Purge first, navigate from the callback: the
+                                // old order reloaded before the jar was empty
+                                // and the site silently re-authenticated.
+                                purgeSession {
+                                    acceptTokens = false
+                                    webView.loadUrl(SIGN_IN_URL)
+                                }
                             },
                         )
                         Box(Modifier.weight(1f)) {
@@ -226,9 +291,9 @@ class CaptureActivity : ComponentActivity() {
                                     // the first load until the view is measured
                                     // gives the page a real layout viewport.
                                     .onSizeChanged { size ->
-                                        if (!webViewLoaded && size.width > 0 && size.height > 0) {
-                                            webViewLoaded = true
-                                            webView.loadUrl(SIGN_IN_URL)
+                                        if (size.width > 0 && size.height > 0) {
+                                            measured = true
+                                            maybeLoad()
                                         }
                                     },
                             )
@@ -266,14 +331,40 @@ class CaptureActivity : ComponentActivity() {
         }
     }
 
-    private fun clearSession(view: WebView) {
-        CookieManager.getInstance().removeAllCookies(null)
-        CookieManager.getInstance().flush()
-        WebStorage.getInstance().deleteAllData()
-        view.clearCache(true)
-        view.clearHistory()
+    /**
+     * Empty the WebView's authenticated state, then run [done].
+     *
+     * `removeAllCookies` is asynchronous, so the completion callback — not the
+     * call itself — is what marks the session gone. Flushing immediately after
+     * the callback persists the removal instead of letting a pending write
+     * resurrect the cookie on the next process start.
+     */
+    private fun purgeSession(done: () -> Unit) {
+        val cookies = CookieManager.getInstance()
+        // Mark the state untrusted first: the token watcher polls every 1.4s
+        // and would otherwise re-capture the old token mid-purge.
+        acceptTokens = false
         capturedToken = null
         errorMessage = null
+        purgeChecked = false
+        purgeReloads = 0
+        cookies.removeAllCookies {
+            cookies.flush()
+            WebStorage.getInstance().deleteAllData()
+            if (::webView.isInitialized) {
+                webView.clearCache(true)
+                webView.clearHistory()
+                webView.clearFormData()
+            }
+            done()
+        }
+    }
+
+    /** Issue the first load once both the purge and the first layout are done. */
+    private fun maybeLoad() {
+        if (!purged || !measured || loaded) return
+        loaded = true
+        webView.loadUrl(SIGN_IN_URL)
     }
 
     private fun register() {
@@ -402,6 +493,26 @@ class CaptureActivity : ComponentActivity() {
         private const val SIGN_IN_URL = "https://chat.deepseek.com/sign_in"
         private const val JS_READ =
             "(function(){try{var v=localStorage.getItem('userToken');if(!v)return null;var t=String(v).trim();if(t.charAt(0)==='{'){try{var p=JSON.parse(t);t=p&&typeof p.value==='string'?p.value:''}catch(e){return null}}if(!t||t.length<20||/[\\s{}\"]/.test(t))return null;return t}catch(e){return null}})()"
+
+        /**
+         * Wipe this origin's persisted login and report whether it was dirty.
+         *
+         * CookieManager only clears cookies. The site also stores `userToken`
+         * in localStorage, and a surviving token is enough for it to sign
+         * itself back in and rewrite the session cookie — which is why
+         * relogin/replace reopened chat.deepseek.com as the previous account
+         * even after a cookie clear. Returns "dirty" when anything was found,
+         * so the caller can reload against a clean origin instead of assuming.
+         */
+        private const val JS_PURGE =
+            "(function(){try{var dirty=false;" +
+                "if(localStorage.length){dirty=true;localStorage.clear()}" +
+                "if(sessionStorage.length){dirty=true;sessionStorage.clear()}" +
+                "try{var c=document.cookie;if(c&&c.length){dirty=true;" +
+                "c.split(';').forEach(function(p){var n=p.split('=')[0].trim();" +
+                "document.cookie=n+'=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/';" +
+                "document.cookie=n+'=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/; domain=.deepseek.com';})}}catch(e){}" +
+                "return dirty?'dirty':'clean'}catch(e){return 'clean'}})()"
 
         /**
          * DeepSeek's verification modal relies on an entry animation that leaves
